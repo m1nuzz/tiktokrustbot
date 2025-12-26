@@ -5,12 +5,17 @@ use anyhow::Error;
 use crate::commands::Command;
 use crate::database::DatabasePool;
 use crate::handlers::{
-    admin_command_handler, callback_handler, command_handler, link_handler,
+    admin_command_handler, command_handler, link_handler,
+    settings_text_handler, format_text_handler, back_text_handler, admin_panel_text_handler,
+    stats_text_handler, top10_text_handler, all_users_text_handler,
 };
+use crate::handlers::ui::{BTN_SETTINGS, BTN_FORMAT, BTN_ADMIN_PANEL, BTN_BACK};
 use crate::yt_dlp_interface::{YoutubeFetcher, is_executable_present, ensure_binaries};
 use crate::mtproto_uploader::MTProtoUploader;
 use crate::utils::task_manager::TaskManager;
 use teloxide::dptree;
+
+
 
 
 #[cfg(not(target_os = "android"))]
@@ -200,8 +205,56 @@ async fn main() -> Result<(), Error> {
             .endpoint(admin_command_handler)
         )
         .branch(Update::filter_message().filter_command::<Command>().endpoint(command_handler))
-        .branch(Update::filter_message().endpoint(link_handler))
-        .branch(Update::filter_callback_query().endpoint(callback_handler));
+        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_SETTINGS)).endpoint(settings_text_handler))
+        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_FORMAT)).endpoint(format_text_handler))
+        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_ADMIN_PANEL)).endpoint(admin_panel_text_handler))
+        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("Stats")).endpoint(stats_text_handler))
+        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("Top 10")).endpoint(top10_text_handler))
+        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("All users")).endpoint(all_users_text_handler))
+        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_BACK)).endpoint(back_text_handler))
+        .branch(Update::filter_message()
+            .filter(|msg: Message| msg.text() == Some("h265"))
+            .endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+                let user_id = msg.chat.id.0;
+                db_pool.execute_with_timeout(move |conn| {
+                    conn.execute("UPDATE users SET quality_preference = 'h265' WHERE telegram_id = ?1", &[&user_id])
+                }).await?;
+                db_pool.invalidate_user_quality_cache(user_id).await;
+                
+                bot.send_message(msg.chat.id, "Quality set to h265")
+                    .reply_markup(crate::handlers::command::get_main_reply_keyboard())
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            }))
+        .branch(Update::filter_message()
+            .filter(|msg: Message| msg.text() == Some("h264"))
+            .endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+                let user_id = msg.chat.id.0;
+                db_pool.execute_with_timeout(move |conn| {
+                    conn.execute("UPDATE users SET quality_preference = 'h264' WHERE telegram_id = ?1", &[&user_id])
+                }).await?;
+                db_pool.invalidate_user_quality_cache(user_id).await;
+                
+                bot.send_message(msg.chat.id, "Quality set to h264")
+                    .reply_markup(crate::handlers::command::get_main_reply_keyboard())
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            }))
+        .branch(Update::filter_message()
+            .filter(|msg: Message| msg.text() == Some("audio"))
+            .endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+                let user_id = msg.chat.id.0;
+                db_pool.execute_with_timeout(move |conn| {
+                    conn.execute("UPDATE users SET quality_preference = 'audio' WHERE telegram_id = ?1", &[&user_id])
+                }).await?;
+                db_pool.invalidate_user_quality_cache(user_id).await;
+                
+                bot.send_message(msg.chat.id, "Quality set to audio")
+                    .reply_markup(crate::handlers::command::get_main_reply_keyboard())
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            }))
+        .branch(Update::filter_message().endpoint(link_handler));
 
     log::info!("Bot initialization completed in {:.2?}", start_time.elapsed());
     log::info!("Starting to dispatch updates...");

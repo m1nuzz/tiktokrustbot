@@ -1,11 +1,17 @@
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardMarkup, InlineKeyboardButton};
+use teloxide::types::{KeyboardMarkup, KeyboardButton};
 use teloxide::utils::command::BotCommands;
 
 use crate::commands::Command;
 use crate::database::DatabasePool;
 use std::sync::Arc;
-use crate::handlers::ui::BTN_SETTINGS;
+
+pub fn get_main_reply_keyboard() -> KeyboardMarkup {
+    KeyboardMarkup::new(vec![vec![
+        KeyboardButton::new("⚙️ Settings"),
+    ]])
+    .resize_keyboard()
+}
 
 
 pub async fn command_handler(bot: Bot, msg: Message, cmd: Command, db_pool: Arc<DatabasePool>) -> Result<(), anyhow::Error> {
@@ -22,10 +28,7 @@ pub async fn command_handler(bot: Bot, msg: Message, cmd: Command, db_pool: Arc<
     
     match cmd {
         Command::Start => {
-            let keyboard = InlineKeyboardMarkup::new(vec![vec![
-                InlineKeyboardButton::callback(BTN_SETTINGS, "settings"),
-            ]]);
-            bot.send_message(msg.chat.id, "Welcome! Send me a TikTok link.").reply_markup(keyboard).await?;
+            bot.send_message(msg.chat.id, "Welcome! Send me a TikTok link.").reply_markup(get_main_reply_keyboard()).await?;
         }
         Command::Help => {
             bot.send_message(msg.chat.id, Command::descriptions().to_string()).await?;
