@@ -1,6 +1,8 @@
 use teloxide::prelude::*;
 use std::sync::Arc;
 use anyhow::Error;
+use tokio::sync::Mutex;
+use std::collections::HashSet;
 
 use crate::commands::Command;
 use crate::database::DatabasePool;
@@ -15,8 +17,10 @@ use crate::mtproto_uploader::MTProtoUploader;
 use crate::utils::task_manager::TaskManager;
 use teloxide::dptree;
 
-
-
+// For deduplication
+lazy_static::lazy_static! {
+    static ref PROCESSING: Arc<Mutex<HashSet<i32>>> = Arc::new(Mutex::new(HashSet::new()));
+}
 
 #[cfg(not(target_os = "android"))]
 
@@ -38,7 +42,7 @@ mod auto_update;
 async fn main() -> Result<(), Error> {
     // --- Logging Setup ---
     use log::LevelFilter;
-    use std::sync::Mutex;
+    use std::sync::Mutex as StdMutex; // Renamed to avoid conflict with tokio::sync::Mutex
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::env;
@@ -67,7 +71,7 @@ async fn main() -> Result<(), Error> {
     // 4. Setup file handle if needed
     let log_file = if file_level_config.is_some() {
         let file = OpenOptions::new().create(true).write(true).append(true).open("bot_errors.log")?;
-        Some(Arc::new(Mutex::new(file)))
+        Some(Arc::new(StdMutex::new(file))) // Use StdMutex here
     } else {
         None
     };
@@ -254,7 +258,48 @@ async fn main() -> Result<(), Error> {
                     .await?;
                 Ok::<_, anyhow::Error>(())
             }))
-        .branch(Update::filter_message().endpoint(link_handler));
+        .branch(Update::filter_message()
+            .endpoint(|bot: Bot, msg: Message, fetcher: Arc<YoutubeFetcher>, mtproto_uploader: Arc<MTProtoUploader>, db_pool: Arc<DatabasePool>, task_manager: Arc<tokio::sync::Mutex<TaskManager>>, upload_semaphore: Arc<tokio::sync::Semaphore>| async move {
+                let message_id = msg.id.0;
+                
+                // Проверка, не обрабатывается ли уже
+                {
+                    let mut processing = PROCESSING.lock().await;
+                    if processing.contains(&message_id) {
+                        log::debug!("Skipping duplicate message {}", message_id);
+                        return Ok(());
+                    }
+                    processing.insert(message_id);
+                }
+                
+                tokio::spawn(async move {
+                    let result = link_handler(
+                        bot.clone(),
+                        msg.clone(),
+                        fetcher,
+                        mtproto_uploader,
+                        db_pool,
+                        task_manager,
+                        upload_semaphore,
+                    ).await;
+                    
+                    // Убрать из processing после завершения
+                    {
+                        let mut processing = PROCESSING.lock().await;
+                        processing.remove(&message_id);
+                    }
+                    
+                    if let Err(e) = result {
+                        log::error!("Link handler error: {}", e);
+                        // Опционально: отправить сообщение об ошибке пользователю
+                        let _ = bot.send_message(msg.chat.id, "Failed to process video").await;
+                    }
+                });
+                
+                // НЕМЕДЛЕННО вернуть Ok(), чтобы Telegram не ретраил update
+                Ok::<(), anyhow::Error>(())
+            })
+        );
 
     log::info!("Bot initialization completed in {:.2?}", start_time.elapsed());
     log::info!("Starting to dispatch updates...");
