@@ -1,16 +1,13 @@
-use anyhow::Result; 
-use teloxide::{
-    prelude::*,
-    requests::Requester,
-    types::{ChatId, MessageId},
-};
+use anyhow::Result;
+use teloxide::{prelude::*, requests::Requester, types::{ChatId, MessageId}};
 
 #[derive(Clone)]
 pub struct ProgressBar {
     bot: Bot,
     chat_id: ChatId,
     message_id: Option<MessageId>,
-    last_update: Option<tokio::time::Instant>, // Track last update time for throttling
+    last_update: Option<tokio::time::Instant>,
+    last_percentage: u8,  // Добавить для отслеживания
 }
 
 impl ProgressBar {
@@ -20,6 +17,7 @@ impl ProgressBar {
             chat_id,
             message_id: None,
             last_update: None,
+            last_percentage: 0,
         }
     }
 
@@ -34,62 +32,77 @@ impl ProgressBar {
         Ok(())
     }
 
-    pub async fn update(
-        &mut self,
-        percentage: u8,
-        extra_info: Option<&str>,
-    ) -> Result<(), anyhow::Error> {
-        // Throttling: minimum 1000ms between updates to reduce API rate limiting
-        const MIN_UPDATE_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(1000);
-
+    pub async fn update(&mut self, percentage: u8, extrainfo: Option<&str>) -> Result<(), anyhow::Error> {
+        // Увеличенный интервал - минимум 3 секунды между обновлениями
+        const MIN_UPDATE_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(3);
         let now = tokio::time::Instant::now();
 
-        // Check if enough time has passed since last update
-        if let Some(last) = self.last_update {
-            if now.duration_since(last) < MIN_UPDATE_INTERVAL && percentage < 100 {
-                // Skip update if not enough time passed (except for 100% completion)
-                // Additionally, skip updates that don't represent meaningful progress (at least 5% change)
-                if percentage < 100 {
-                    return Ok(());
-                }
-            }
+        // Проверяем, нужно ли обновление
+        let should_update = if let Some(last) = self.last_update {
+            let time_passed = now.duration_since(last) >= MIN_UPDATE_INTERVAL;
+            let significant_change = percentage.saturating_sub(self.last_percentage) >= 5; // Минимум 5% изменения
+            let is_completion = percentage == 100;
+            
+            time_passed && (significant_change || is_completion) || is_completion
+        } else {
+            true
+        };
+
+        if !should_update {
+            return Ok(());
         }
 
-        // Update the time of last update
         self.last_update = Some(now);
+        self.last_percentage = percentage;
 
         if let Some(message_id) = self.message_id {
-            let progress_text = self.create_progress_bar(percentage, extra_info);
+            let progresstext = self.create_progressbar(percentage, extrainfo);
             let result = self
                 .bot
-                .edit_message_text(self.chat_id, message_id, progress_text)
+                .edit_message_text(self.chat_id, message_id, progresstext)
                 .await;
 
-            // Handle API errors gracefully
-            if let Err(e) = result {
-                if !e.to_string().contains("message is not modified") {
-                    log::warn!("Failed to update progress bar: {}", e);
+            match result {
+                Ok(_) => {},
+                Err(e) => {
+                    let error_str = e.to_string();
+                    
+                    // Сброс при инвалидном ID
+                    if error_str.contains("MESSAGE_ID_INVALID") 
+                        || error_str.contains("message to edit not found")
+                        || error_str.contains("message can't be edited") {
+                        log::warn!("Progress message invalidated, creating new one");
+                        self.message_id = None;
+                        
+                        // Создать новое сообщение только если не завершено
+                        if percentage < 100 {
+                            if let Ok(msg) = self.bot.send_message(self.chat_id, self.create_progressbar(percentage, extrainfo)).await {
+                                self.message_id = Some(msg.id);
+                            }
+                        }
+                    } else if !error_str.contains("message is not modified") {
+                        // Логируем только реальные ошибки
+                        log::debug!("Progress update skipped: {}", e);
+                    }
                 }
             }
         } else {
-            // If there's no message ID yet, send a new message
-            let progress_text = self.create_progress_bar(percentage, extra_info);
-            let result = self.bot.send_message(self.chat_id, progress_text).await;
-            if let Ok(msg) = result {
+            // Создать новое сообщение
+            let progresstext = self.create_progressbar(percentage, extrainfo);
+            if let Ok(msg) = self.bot.send_message(self.chat_id, progresstext).await {
                 self.message_id = Some(msg.id);
-            } else {
-                log::error!("Failed to send progress bar: {:?}", result.err());
             }
         }
 
         Ok(())
     }
 
-    fn create_progress_bar(&self, percentage: u8, extra_info: Option<&str>) -> String {
+    fn create_progressbar(&self, percentage: u8, extrainfo: Option<&str>) -> String {
         let bar_length = 20;
-        let filled_length = (percentage as f32 / 100.0 * bar_length as f32) as usize;
+        let filled_length = ((percentage as f32 / 100.0) * bar_length as f32) as usize;
+
         let mut bar = String::new();
-        bar.push('[');
+        bar.push('▓');
         for i in 0..bar_length {
             if i < filled_length {
                 bar.push('█');
@@ -97,9 +110,10 @@ impl ProgressBar {
                 bar.push('░');
             }
         }
-        bar.push(']');
-        let mut result = format!("🎬 Processing: {}%\n{}", percentage, bar);
-        if let Some(info) = extra_info {
+        bar.push('▓');
+
+        let mut result = format!("🔄 Processing {}% {}", percentage, bar);
+        if let Some(info) = extrainfo {
             result.push_str(&format!("\n{}", info));
         }
         result
@@ -107,7 +121,13 @@ impl ProgressBar {
 
     pub async fn delete(&mut self) -> Result<(), anyhow::Error> {
         if let Some(message_id) = self.message_id {
-            let _ = self.bot.delete_message(self.chat_id, message_id).await;
+            if let Err(e) = self.bot.delete_message(self.chat_id, message_id).await {
+                let error_str = e.to_string();
+                if !error_str.contains("MESSAGE_ID_INVALID") 
+                    && !error_str.contains("message to delete not found") {
+                    log::debug!("Failed to delete progress message: {}", e);
+                }
+            }
             self.message_id = None;
         }
         Ok(())
