@@ -1,7 +1,7 @@
 use teloxide::prelude::*;
 use std::sync::Arc;
 use anyhow::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore}; // Keep Semaphore here as it's used in endpoint arguments
 use std::collections::HashSet;
 
 use crate::commands::Command;
@@ -19,7 +19,7 @@ use teloxide::dptree;
 
 // For deduplication
 lazy_static::lazy_static! {
-    static ref PROCESSING: Arc<Mutex<HashSet<i32>>> = Arc::new(Mutex::new(HashSet::new()));
+    static ref PROCESSING: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 }
 
 #[cfg(not(target_os = "android"))]
@@ -260,16 +260,20 @@ async fn main() -> Result<(), Error> {
             }))
         .branch(Update::filter_message()
             .endpoint(|bot: Bot, msg: Message, fetcher: Arc<YoutubeFetcher>, mtproto_uploader: Arc<MTProtoUploader>, db_pool: Arc<DatabasePool>, task_manager: Arc<tokio::sync::Mutex<TaskManager>>, upload_semaphore: Arc<tokio::sync::Semaphore>| async move {
-                let message_id = msg.id.0;
+                let message_key = format!("{}:{}:{}", 
+                    msg.chat.id.0, 
+                    msg.id.0, 
+                    msg.text().unwrap_or("")
+                );
                 
                 // Проверка, не обрабатывается ли уже
                 {
                     let mut processing = PROCESSING.lock().await;
-                    if processing.contains(&message_id) {
-                        log::debug!("Skipping duplicate message {}", message_id);
+                    if processing.contains(&message_key) {
+                        log::debug!("Skipping duplicate message {}", message_key);
                         return Ok(());
                     }
-                    processing.insert(message_id);
+                    processing.insert(message_key.clone());
                 }
                 
                 tokio::spawn(async move {
@@ -286,7 +290,7 @@ async fn main() -> Result<(), Error> {
                     // Убрать из processing после завершения
                     {
                         let mut processing = PROCESSING.lock().await;
-                        processing.remove(&message_id);
+                        processing.remove(&message_key);
                     }
                     
                     if let Err(e) = result {

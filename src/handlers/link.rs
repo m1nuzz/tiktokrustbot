@@ -8,6 +8,8 @@ use tokio::time::{Duration, timeout};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::future::Future;
+use tokio::time::{Instant}; // Import Instant and Duration here
+use std::collections::HashMap; // Import HashMap here
 
 use crate::database::DatabasePool;
 use crate::mtproto_uploader::MTProtoUploader;
@@ -18,6 +20,12 @@ use crate::utils::progress_bar::ProgressBar;
 use crate::utils::{task_manager::TaskManager};
 use crate::handlers::ui::{is_menu_button, BTN_SETTINGS};
 use crate::telegram_bot_api_uploader::{send_video_with_progress_botapi, send_audio_with_progress_botapi};
+
+// For rate limiting per chat
+lazy_static::lazy_static! {
+    static ref LAST_SEND: Arc<tokio::sync::Mutex<HashMap<i64, Instant>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    static ref URL_PROCESSING: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+}
 
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);   // 10 minutes
@@ -77,6 +85,32 @@ pub async fn link_handler(
     }
 
     if text.contains("tiktok.com") {
+        let url = text.to_string(); // Capture URL for deduplication
+
+        // URL Deduplication
+        {
+            let mut urls = URL_PROCESSING.lock().await;
+            if urls.contains(&url) {
+                bot.send_message(msg.chat.id, "This video is already being processed.").await?;
+                return Ok(());
+            }
+            urls.insert(url.clone());
+        }
+
+        // Rate Limiting per chat
+        {
+            let mut last_send = LAST_SEND.lock().await;
+            if let Some(last_time) = last_send.get(&user_id) {
+                let elapsed = last_time.elapsed();
+                if elapsed < Duration::from_secs(2) {
+                    let wait_time = Duration::from_secs(2) - elapsed;
+                    log::info!("Rate limiting: waiting {:?} for chat {}", wait_time, user_id);
+                    tokio::time::sleep(wait_time).await;
+                }
+            }
+            last_send.insert(user_id, Instant::now());
+        }
+
         let username: Option<String> = match msg.chat.username() {
             Some(un) => Some(un.to_string()),
             None => msg.from.clone().and_then(|u| u.username.clone()),
@@ -108,6 +142,12 @@ pub async fn link_handler(
             if !is_user_admin && !check_subscription(&bot, msg.chat.id.0).await.unwrap_or(false) {
                 bot.send_message(msg.chat.id, "To use the bot, please subscribe to our channels.")
                     .await?;
+                
+                // Cleanup URL_PROCESSING on early exit
+                {
+                    let mut urls = URL_PROCESSING.lock().await;
+                    urls.remove(&url);
+                }
                 return Ok(());
             }
         }
@@ -184,6 +224,11 @@ pub async fn link_handler(
                 };
 
                 bot.send_message(msg.chat.id, error_message).await?;
+                // Cleanup URL_PROCESSING on early exit
+                {
+                    let mut urls = URL_PROCESSING.lock().await;
+                    urls.remove(&url);
+                }
                 return Ok(());
             }
         };
@@ -335,6 +380,12 @@ pub async fn link_handler(
 
         if let Err(_e) = result {
             log::error!("Failed to log download: {}", _e);
+        }
+
+        // Cleanup URL_PROCESSING after successful processing
+        {
+            let mut urls = URL_PROCESSING.lock().await;
+            urls.remove(&url);
         }
     } else {
         let keyboard = InlineKeyboardMarkup::new(vec![vec![
