@@ -1,7 +1,7 @@
 use teloxide::prelude::*;
 use std::sync::Arc;
 use anyhow::Error;
-use tokio::sync::{Mutex, Semaphore}; // Keep Semaphore here as it's used in endpoint arguments
+use tokio::sync::Mutex; 
 use std::collections::HashSet;
 
 use crate::commands::Command;
