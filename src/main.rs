@@ -1,17 +1,17 @@
 use teloxide::prelude::*;
-
 use std::sync::Arc;
-use std::env;
-use std::fs;
-
 use anyhow::Error;
+
 use crate::commands::Command;
 use crate::database::DatabasePool;
-use crate::handlers::{admin_command_handler, callback_handler, command_handler, link_handler, settings_text_handler, format_text_handler, subscription_text_handler, back_text_handler, set_quality_h265_text_handler, set_quality_h264_text_handler, set_quality_audio_text_handler, enable_subscription_text_handler, disable_subscription_text_handler};
+use crate::handlers::{
+    admin_command_handler, callback_handler, command_handler, link_handler,
+};
 use crate::yt_dlp_interface::{YoutubeFetcher, is_executable_present, ensure_binaries};
 use crate::mtproto_uploader::MTProtoUploader;
 use crate::utils::task_manager::TaskManager;
 use teloxide::dptree;
+
 
 #[cfg(not(target_os = "android"))]
 
@@ -36,6 +36,7 @@ async fn main() -> Result<(), Error> {
     use std::sync::Mutex;
     use std::fs::OpenOptions;
     use std::io::Write;
+    use std::env;
 
     // 1. Get console log level from env
     let console_level_str = env::var("CONSOLE_LOG_LEVEL").unwrap_or_else(|_| "INFO".to_string());
@@ -122,7 +123,7 @@ async fn main() -> Result<(), Error> {
     }
 
     log::info!("Libraries directory: {:?}", libraries_dir.canonicalize()?);
-    log::info!("Contents of libraries directory: {:?}", fs::read_dir(&libraries_dir)?.map(|e| e.unwrap().file_name()).collect::<Vec<_>>());
+    log::info!("Contents of libraries directory: {:?}", std::fs::read_dir(&libraries_dir)?.map(|e| e.unwrap().file_name()).collect::<Vec<_>>());
 
     let yt_dlp_path = libraries_dir.join(if cfg!(target_os = "windows") { "yt-dlp.exe" } else { "yt-dlp" });
     let ffmpeg_dir = libraries_dir.join("ffmpeg");
@@ -199,15 +200,6 @@ async fn main() -> Result<(), Error> {
             .endpoint(admin_command_handler)
         )
         .branch(Update::filter_message().filter_command::<Command>().endpoint(command_handler))
-        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("⚙️ Settings")).endpoint(settings_text_handler))
-        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("Format")).endpoint(format_text_handler))
-        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("Subscription")).endpoint(subscription_text_handler))
-        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("h265")).endpoint(set_quality_h265_text_handler))
-        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("h264")).endpoint(set_quality_h264_text_handler))
-        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("audio")).endpoint(set_quality_audio_text_handler))
-        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("Enable Subscription")).endpoint(enable_subscription_text_handler))
-        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("Disable Subscription")).endpoint(disable_subscription_text_handler))
-        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("Back")).endpoint(back_text_handler))
         .branch(Update::filter_message().endpoint(link_handler))
         .branch(Update::filter_callback_query().endpoint(callback_handler));
 

@@ -1,4 +1,5 @@
 use teloxide::prelude::*;
+use teloxide::types::{InlineKeyboardMarkup, InlineKeyboardButton};
 
 use std::fs;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use crate::handlers::admin::is_admin;
 use crate::handlers::subscription::check_subscription;
 use crate::utils::progress_bar::ProgressBar;
 use crate::utils::{task_manager::TaskManager};
+use crate::handlers::ui::{is_menu_button, BTN_SETTINGS};
 use crate::telegram_bot_api_uploader::{send_video_with_progress_botapi, send_audio_with_progress_botapi};
 
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
@@ -69,6 +71,10 @@ pub async fn link_handler(
         Some(text) => text,
         None => return Ok(()),
     };
+    
+    if is_menu_button(text) {
+        return Ok(());
+    }
 
     if text.contains("tiktok.com") {
         let username: Option<String> = match msg.chat.username() {
@@ -331,8 +337,10 @@ pub async fn link_handler(
             log::error!("Failed to log download: {}", _e);
         }
     } else {
-        bot.send_message(msg.chat.id, "Please send a valid TikTok link.")
-            .await?;
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::callback(BTN_SETTINGS, "settings"),
+        ]]);
+        bot.send_message(msg.chat.id, "Please send a valid TikTok link.").reply_markup(keyboard).await?;
     }
 
     Ok(())

@@ -1,46 +1,12 @@
 use teloxide::prelude::*;
-use teloxide::types::{KeyboardMarkup, KeyboardButton};
+use teloxide::types::{InlineKeyboardMarkup, InlineKeyboardButton};
 use teloxide::utils::command::BotCommands;
 
 use crate::commands::Command;
 use crate::database::DatabasePool;
 use std::sync::Arc;
+use crate::handlers::ui::BTN_SETTINGS;
 
-pub fn get_main_reply_keyboard() -> KeyboardMarkup {
-    KeyboardMarkup::new(vec![vec![
-        KeyboardButton::new("⚙️ Settings"),
-    ]])
-    .resize_keyboard()
-    .one_time_keyboard()
-}
-
-pub fn get_format_reply_keyboard() -> KeyboardMarkup {
-    KeyboardMarkup::new(vec![
-        vec![
-            KeyboardButton::new("h265"),
-            KeyboardButton::new("h264"),
-            KeyboardButton::new("audio"),
-        ],
-        vec![
-            KeyboardButton::new("Back"),
-        ]
-    ])
-    .resize_keyboard()
-    .one_time_keyboard()
-}
-
-pub fn get_subscription_reply_keyboard(subscription_required: bool) -> KeyboardMarkup {
-    let toggle_button = if subscription_required {
-        KeyboardButton::new("Disable Subscription")
-    } else {
-        KeyboardButton::new("Enable Subscription")
-    };
-
-    KeyboardMarkup::new(vec![vec![toggle_button],
-                                vec![KeyboardButton::new("Back")]])
-        .resize_keyboard()
-        .one_time_keyboard()
-}
 
 pub async fn command_handler(bot: Bot, msg: Message, cmd: Command, db_pool: Arc<DatabasePool>) -> Result<(), anyhow::Error> {
     let user_id = msg.chat.id.0;
@@ -56,7 +22,10 @@ pub async fn command_handler(bot: Bot, msg: Message, cmd: Command, db_pool: Arc<
     
     match cmd {
         Command::Start => {
-            bot.send_message(msg.chat.id, "Welcome! Send me a TikTok link.").reply_markup(get_main_reply_keyboard()).await?;
+            let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                InlineKeyboardButton::callback(BTN_SETTINGS, "settings"),
+            ]]);
+            bot.send_message(msg.chat.id, "Welcome! Send me a TikTok link.").reply_markup(keyboard).await?;
         }
         Command::Help => {
             bot.send_message(msg.chat.id, Command::descriptions().to_string()).await?;

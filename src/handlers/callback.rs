@@ -1,25 +1,33 @@
 use teloxide::prelude::*;
-use teloxide::types::{CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton};
+use teloxide::types::{CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton};
 use rusqlite::params;
-use tokio::fs;
 use std::sync::Arc;
+use std::env;
 
 use crate::database::DatabasePool;
 use crate::handlers::admin::is_admin;
-use crate::handlers::command::{get_main_reply_keyboard, get_format_reply_keyboard, get_subscription_reply_keyboard};
+use crate::handlers::ui::{BTN_ADMIN_PANEL, BTN_SETTINGS, BTN_FORMAT, BTN_SUBSCRIPTION, BTN_BACK};
+
+const USERS_PER_PAGE: i64 = 10;
+
+fn get_admin_ids() -> Vec<i64> {
+    env::var("ADMIN_IDS").unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect()
+}
 
 pub async fn callback_handler(bot: Bot, q: CallbackQuery, db_pool: Arc<DatabasePool>) -> Result<(), anyhow::Error> {
     if let Some(data) = q.data {
         log::info!("Received callback query with data: {}", data);
 
-        if let Some(maybe_message) = q.message {
+        if let Some(ref maybe_message) = q.message {
             if let Some(message) = maybe_message.regular_message() {
                 if data.starts_with("set_quality_") {
                     let quality = data.split_at("set_quality_".len()).1;
                     let user_id = message.chat.id.0;
-                    let quality_string = quality.to_string(); // Make a string copy
+                    let quality_string = quality.to_string();
                     
-                    // Use database pool for quality preference update
                     let result = db_pool.execute_with_timeout(move |conn| {
                         conn.execute(
                             "UPDATE users SET quality_preference = ?1 WHERE telegram_id = ?2",
@@ -28,36 +36,262 @@ pub async fn callback_handler(bot: Bot, q: CallbackQuery, db_pool: Arc<DatabaseP
                     }).await;
                     
                     match result {
-        Ok(_) => {
-            // Invalidate the cache for this user to ensure the new quality setting is picked up immediately
-            db_pool.invalidate_user_quality_cache(user_id).await;
-            bot.answer_callback_query(q.id).text(&format!("Quality set to {}", quality)).await?;
-        },
-        Err(e) => {
-            log::error!("Failed to update quality preference: {}", e);
-            bot.answer_callback_query(q.id).text("Failed to update quality preference").await?;
-        }
-    }
-                } else {
+                        Ok(_) => {
+                            db_pool.invalidate_user_quality_cache(user_id).await;
+                            bot.answer_callback_query(q.id).text(&format!("Quality set to {}", quality)).await?;
+                        },
+                        Err(e) => {
+                            log::error!("Failed to update quality preference: {}", e);
+                            bot.answer_callback_query(q.id).text("Failed to update quality preference").await?;
+                        }
+                    }
+                } else if data.starts_with("admin_stats_") {
+                    if !is_admin(&message).await {
+                        bot.answer_callback_query(q.id).text("Access denied.").await?;
+                        return Ok(());
+                    }
+
+                    let period = data.split_at("admin_stats_".len()).1;
+                    let (time_filter, title_period) = match period {
+                        "24h" => ("AND downloaddate >= datetime('now', '-1 day')", "last 24 hours"),
+                        "7d" => ("AND downloaddate >= datetime('now', '-7 days')", "last 7 days"),
+                        "30d" => ("AND downloaddate >= datetime('now', '-30 days')", "last 30 days"),
+                        "all" => ("", "all time"),
+                        _ => return Ok(()),
+                    };
+
+                    let admin_ids = get_admin_ids();
+                    let admin_ids_params = admin_ids.iter().map(|&id| id.to_string()).collect::<Vec<String>>().join(",");
+
+                    let query = format!(
+                        "SELECT COUNT(*), COUNT(DISTINCT usertelegramid) FROM downloads WHERE usertelegramid NOT IN ({}) {}",
+                        admin_ids_params, time_filter
+                    );
+                    
+                    let stats = db_pool.execute_with_timeout(move |conn| {
+                         conn.query_row(&query, [], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                        })
+                    }).await;
+
+                    match stats {
+                        Ok((total_downloads, unique_users)) => {
+                            let text = format!("Statistics for {}:\n\nTotal Downloads: {}\nUnique Users: {}", title_period, total_downloads, unique_users);
+                            let keyboard = InlineKeyboardMarkup::new(vec![
+                                vec![InlineKeyboardButton::callback("Back", "admin_stats")],
+                            ]);
+                            bot.edit_message_text(message.chat.id, message.id, text).await?;
+                            bot.edit_message_reply_markup(message.chat.id, message.id).reply_markup(keyboard).await?;
+                        },
+                        Err(e) => {
+                            log::error!("Failed to get stats: {}", e);
+                            bot.answer_callback_query(q.id).text("Failed to retrieve statistics.").await?;
+                        }
+                    }
+                } else if data.starts_with("admin_top10_") {
+                    if !is_admin(&message).await {
+                        bot.answer_callback_query(q.id).text("Access denied.").await?;
+                        return Ok(());
+                    }
+
+                    let period = data.split_at("admin_top10_".len()).1;
+                    let (time_filter, title_period) = match period {
+                        "24h" => ("WHERE downloaddate >= datetime('now', '-1 day')", "last 24 hours"),
+                        "7d" => ("WHERE downloaddate >= datetime('now', '-7 days')", "last 7 days"),
+                        "30d" => ("WHERE downloaddate >= datetime('now', '-30 days')", "last 30 days"),
+                        "all" => ("", "all time"),
+                        _ => return Ok(()),
+                    };
+
+                    let admin_ids = get_admin_ids();
+                    let admin_ids_params = admin_ids.iter().map(|id| id.to_string()).collect::<Vec<String>>().join(",");
+                    
+                    let mut where_clause = time_filter.to_string();
+                    if !admin_ids.is_empty() {
+                        if where_clause.is_empty() {
+                            where_clause.push_str("WHERE ");
+                        } else {
+                            where_clause.push_str(" AND ");
+                        }
+                        where_clause.push_str(&format!("usertelegramid NOT IN ({})", admin_ids_params));
+                    }
+
+
+                    let query = format!(
+                        "SELECT usertelegramid, COUNT(*) AS cnt FROM downloads {} GROUP BY usertelegramid ORDER BY cnt DESC LIMIT 10",
+                        where_clause
+                    );
+
+                    let top_users = db_pool.execute_with_timeout(move |conn| {
+                        let mut stmt = conn.prepare(&query)?;
+                        let users_iter = stmt.query_map([], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                        })?;
+                        let mut users = Vec::new();
+                        for user in users_iter {
+                            users.push(user?);
+                        }
+                        Ok(users)
+                    }).await;
+                    
+                    match top_users {
+                        Ok(users) => {
+                            let mut text = format!("Top 10 users for {}:\n\n", title_period);
+                            for (i, (user_id, count)) in users.iter().enumerate() {
+                                text.push_str(&format!("{}. {} - {} downloads\n", i + 1, user_id, count));
+                            }
+                            let keyboard = InlineKeyboardMarkup::new(vec![
+                                vec![InlineKeyboardButton::callback("Back", "admin_top10")],
+                            ]);
+                            bot.edit_message_text(message.chat.id, message.id, text).await?;
+                            bot.edit_message_reply_markup(message.chat.id, message.id).reply_markup(keyboard).await?;
+                        },
+                        Err(e) => {
+                            log::error!("Failed to get top 10 users: {}", e);
+                            bot.answer_callback_query(q.id).text("Failed to retrieve top 10 users.").await?;
+                        }
+                    }
+                } else if data.starts_with("admin_users_page_") {
+                    if !is_admin(&message).await {
+                        bot.answer_callback_query(q.id).text("Access denied.").await?;
+                        return Ok(());
+                    }
+
+                    let offset: i64 = data.split_at("admin_users_page_".len()).1.parse().unwrap_or(0);
+
+                    let users_data = db_pool.execute_with_timeout(move |conn| {
+                        let mut stmt = conn.prepare(
+                            "SELECT u.telegramid, u.lastactive, COUNT(d.id) AS downloads_cnt
+                             FROM users u
+                             LEFT JOIN downloads d ON d.usertelegramid = u.telegramid
+                             GROUP BY u.telegramid
+                             ORDER BY downloads_cnt DESC, u.lastactive DESC
+                             LIMIT ? OFFSET ?;"
+                        )?;
+                        let users_iter = stmt.query_map(params![USERS_PER_PAGE, offset], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+                        })?;
+                        
+                        let mut users = Vec::new();
+                        for user_result in users_iter {
+                            users.push(user_result?);
+                        }
+                        Ok(users)
+                    }).await;
+
+                    let total_users: i64 = db_pool.execute_with_timeout(|conn| {
+                        conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+                    }).await.unwrap_or(0);
+
+
+                    match users_data {
+                        Ok(users) => {
+                            let mut text = String::from("All Users:\n\n");
+                            for (id, last_active, count) in users {
+                                text.push_str(&format!("ID: {}, Last Active: {}, Downloads: {}\n", id, last_active, count));
+                            }
+
+                            let mut keyboard_rows = Vec::new();
+                            let mut nav_buttons = Vec::new();
+
+                            if offset > 0 {
+                                nav_buttons.push(InlineKeyboardButton::callback("⬅️ Prev", format!("admin_users_page_{}", offset - USERS_PER_PAGE)));
+                            }
+                            if offset + USERS_PER_PAGE < total_users {
+                                nav_buttons.push(InlineKeyboardButton::callback("Next ➡️", format!("admin_users_page_{}", offset + USERS_PER_PAGE)));
+                            }
+                            
+                            if !nav_buttons.is_empty() {
+                                keyboard_rows.push(nav_buttons);
+                            }
+                            keyboard_rows.push(vec![InlineKeyboardButton::callback("Back", "back_to_admin_panel")]);
+                            
+                            let keyboard = InlineKeyboardMarkup::new(keyboard_rows);
+                            bot.edit_message_text(message.chat.id, message.id, text).await?;
+                            bot.edit_message_reply_markup(message.chat.id, message.id).reply_markup(keyboard).await?;
+                        },
+                        Err(e) => {
+                            log::error!("Failed to get users: {}", e);
+                            bot.answer_callback_query(q.id).text("Failed to retrieve users.").await?;
+                        }
+                    }
+
+                }
+                else {
                     match data.as_str() {
                         "settings" => {
                             let mut keyboard_rows = vec![vec![
-                                InlineKeyboardButton::callback("Format", "format_menu"),
+                                InlineKeyboardButton::callback(BTN_FORMAT, "format_menu"),
                             ]];
 
                             if is_admin(&message).await {
                                 keyboard_rows.push(vec![
-                                    InlineKeyboardButton::callback("Subscription", "subscription_menu"),
+                                    InlineKeyboardButton::callback(BTN_ADMIN_PANEL, "admin_panel"),
                                 ]);
                             }
 
                             keyboard_rows.push(vec![
-                                InlineKeyboardButton::callback("Back", "back_to_main"),
+                                InlineKeyboardButton::callback(BTN_BACK, "back_to_main"),
                             ]);
 
                             let keyboard = InlineKeyboardMarkup::new(keyboard_rows);
 
-                            bot.edit_message_text(message.chat.id, message.id, "Settings").await?;
+                            bot.edit_message_text(message.chat.id, message.id, BTN_SETTINGS).await?;
+                            bot.edit_message_reply_markup(message.chat.id, message.id).reply_markup(keyboard).await?;
+                        }
+                        "admin_panel" => {
+                            if !is_admin(&message).await {
+                                bot.answer_callback_query(q.id).text("Access denied.").await?;
+                                return Ok(());
+                            }
+                            let keyboard = InlineKeyboardMarkup::new(vec![
+                                vec![InlineKeyboardButton::callback("Stats", "admin_stats")],
+                                vec![InlineKeyboardButton::callback("Top 10", "admin_top10")],
+                                vec![InlineKeyboardButton::callback("All users", "admin_users_page_0")],
+                                vec![InlineKeyboardButton::callback(BTN_SUBSCRIPTION, "subscription_menu")],
+                                vec![InlineKeyboardButton::callback(BTN_BACK, "back_to_settings")],
+                            ]);
+                            bot.edit_message_text(message.chat.id, message.id, BTN_ADMIN_PANEL).await?;
+                            bot.edit_message_reply_markup(message.chat.id, message.id).reply_markup(keyboard).await?;
+                        }
+                        "admin_stats" => {
+                            if !is_admin(&message).await {
+                                bot.answer_callback_query(q.id).text("Access denied.").await?;
+                                return Ok(());
+                            }
+                             let keyboard = InlineKeyboardMarkup::new(vec![
+                                vec![
+                                    InlineKeyboardButton::callback("24h", "admin_stats_24h"),
+                                    InlineKeyboardButton::callback("7d", "admin_stats_7d"),
+                                ],
+                                vec![
+                                    InlineKeyboardButton::callback("30d", "admin_stats_30d"),
+                                    InlineKeyboardButton::callback("All time", "admin_stats_all"),
+                                ],
+                                vec![InlineKeyboardButton::callback(BTN_BACK, "back_to_admin_panel")],
+                            ]);
+
+                            bot.edit_message_text(message.chat.id, message.id, "Select statistics period:").await?;
+                            bot.edit_message_reply_markup(message.chat.id, message.id).reply_markup(keyboard).await?;
+                        }
+                        "admin_top10" => {
+                            if !is_admin(&message).await {
+                                bot.answer_callback_query(q.id).text("Access denied.").await?;
+                                return Ok(());
+                            }
+                            let keyboard = InlineKeyboardMarkup::new(vec![
+                                vec![
+                                    InlineKeyboardButton::callback("24h", "admin_top10_24h"),
+                                    InlineKeyboardButton::callback("7d", "admin_top10_7d"),
+                                ],
+                                vec![
+                                    InlineKeyboardButton::callback("30d", "admin_top10_30d"),
+                                    InlineKeyboardButton::callback("All time", "admin_top10_all"),
+                                ],
+                                vec![InlineKeyboardButton::callback(BTN_BACK, "back_to_admin_panel")],
+                            ]);
+
+                            bot.edit_message_text(message.chat.id, message.id, "Select Top 10 period:").await?;
                             bot.edit_message_reply_markup(message.chat.id, message.id).reply_markup(keyboard).await?;
                         }
                         "format_menu" => {
@@ -68,7 +302,7 @@ pub async fn callback_handler(bot: Bot, q: CallbackQuery, db_pool: Arc<DatabaseP
                                     InlineKeyboardButton::callback("audio", "set_quality_audio"),
                                 ],
                                 vec![ 
-                                    InlineKeyboardButton::callback("Back", "back_to_settings"),
+                                    InlineKeyboardButton::callback(BTN_BACK, "back_to_settings"),
                                 ]
                             ]);
                             let text = "h265: best quality, but may not work on some devices.\nh264: worse quality, but works on many devices.\naudio: audio only";
@@ -77,364 +311,50 @@ pub async fn callback_handler(bot: Bot, q: CallbackQuery, db_pool: Arc<DatabaseP
                         }
                         "back_to_main" => {
                             let keyboard = InlineKeyboardMarkup::new(vec![vec![ 
-                                InlineKeyboardButton::callback("Settings", "settings"),
+                                InlineKeyboardButton::callback(BTN_SETTINGS, "settings"),
                             ]]);
+                            bot.edit_message_text(message.chat.id, message.id, "Welcome! Send me a TikTok link.").await?;
                             bot.edit_message_reply_markup(message.chat.id, message.id).reply_markup(keyboard).await?;
-                            bot.send_message(message.chat.id, "").reply_markup(get_main_reply_keyboard()).await?;
                         }
                         "back_to_settings" => {
-                            let keyboard = InlineKeyboardMarkup::new(vec![vec![ 
-                                InlineKeyboardButton::callback("Format", "format_menu"),
-                            ],
-                            vec![ 
-                                InlineKeyboardButton::callback("Back", "back_to_main"),
-                            ]]);
+                            let mut keyboard_rows = vec![vec![
+                                InlineKeyboardButton::callback(BTN_FORMAT, "format_menu"),
+                            ]];
 
-                            bot.edit_message_text(message.chat.id, message.id, "Settings").await?;
+                            if is_admin(&message).await {
+                                keyboard_rows.push(vec![
+                                    InlineKeyboardButton::callback(BTN_ADMIN_PANEL, "admin_panel"),
+                                ]);
+                            }
+
+                            keyboard_rows.push(vec![
+                                InlineKeyboardButton::callback(BTN_BACK, "back_to_main"),
+                            ]);
+
+                            let keyboard = InlineKeyboardMarkup::new(keyboard_rows);
+
+                            bot.edit_message_text(message.chat.id, message.id, BTN_SETTINGS).await?;
                             bot.edit_message_reply_markup(message.chat.id, message.id).reply_markup(keyboard).await?;
                         }
-                    "toggle_subscription" => {
-                        // This arm is no longer needed as toggle logic is handled by enable/disable
-                        bot.answer_callback_query(q.id).text("Action not available.").await?;
-                    }
-                    "enable_subscription" => {
-                        // Using database pool with timeout
-                        let result = db_pool.execute_with_timeout(|conn| {
-                            conn.execute(
-                                "UPDATE settings SET value = ?1 WHERE key = 'subscription_required'",
-                                params!["true"],
-                            )
-                        }).await;
-                        
-                        match result {
-                            Ok(_) => {
-                                // Update the environment variable asynchronously
-                                if let Err(e) = update_env_subscription_setting(true).await {
-                                    log::error!("Failed to update .env file: {}", e);
-                                }
-                                bot.answer_callback_query(q.id).text("Mandatory subscription enabled.").await?;
-                            },
-                            Err(e) => {
-                                log::error!("Database operation failed: {}", e);
-                                bot.answer_callback_query(q.id).text("Operation failed - please try again.").await?;
+                        "back_to_admin_panel" => {
+                            if !is_admin(message).await {
+                                bot.answer_callback_query(q.id).text("Access denied.").await?;
+                                return Ok(());
                             }
+                            let keyboard = InlineKeyboardMarkup::new(vec![
+                                vec![InlineKeyboardButton::callback("Stats", "admin_stats")],
+                                vec![InlineKeyboardButton::callback("Top 10", "admin_top10")],
+                                vec![InlineKeyboardButton::callback("All users", "admin_users_page_0")],
+                                vec![InlineKeyboardButton::callback(BTN_SUBSCRIPTION, "subscription_menu")],
+                                vec![InlineKeyboardButton::callback(BTN_BACK, "back_to_settings")],
+                            ]);
+                            bot.edit_message_text(message.chat.id, message.id, BTN_ADMIN_PANEL).await?;
+                            bot.edit_message_reply_markup(message.chat.id, message.id).reply_markup(keyboard).await?;
                         }
-                        
-                        // Refresh the menu
-                        let subscription_required = db_pool.execute_with_timeout(|conn| {
-                            match conn.query_row(
-                                "SELECT value FROM settings WHERE key = 'subscription_required'",
-                                [],
-                                |row| Ok(row.get::<_, String>(0)? == "true")
-                            ) {
-                                Ok(value) => Ok(value),
-                                Err(_) => Ok(true) // Default to true
-                            }
-                        }).await.unwrap_or(true);
-
-                        let toggle_button = if subscription_required {
-                            InlineKeyboardButton::callback("Disable Subscription", "disable_subscription")
-                        } else {
-                            InlineKeyboardButton::callback("Enable Subscription", "enable_subscription")
-                        };
-
-                        let keyboard = InlineKeyboardMarkup::new(vec![vec![toggle_button],
-                                                                    vec![InlineKeyboardButton::callback("Back", "back_to_settings")]]);
-
-                        bot.edit_message_text(message.chat.id, message.id, "Manage Subscription").await?;
-                        bot.edit_message_reply_markup(message.chat.id, message.id).reply_markup(keyboard).await?;
+                        _ => {}
                     }
-                    "disable_subscription" => {
-                        // Using database pool with timeout
-                        let result = db_pool.execute_with_timeout(|conn| {
-                            conn.execute(
-                                "UPDATE settings SET value = ?1 WHERE key = 'subscription_required'",
-                                params!["false"],
-                            )
-                        }).await;
-                        
-                        match result {
-                            Ok(_) => {
-                                // Update the environment variable asynchronously
-                                if let Err(e) = update_env_subscription_setting(false).await {
-                                    log::error!("Failed to update .env file: {}", e);
-                                }
-                                bot.answer_callback_query(q.id).text("Mandatory subscription disabled.").await?;
-                            },
-                            Err(e) => {
-                                log::error!("Database operation failed: {}", e);
-                                bot.answer_callback_query(q.id).text("Operation failed - please try again.").await?;
-                            }
-                        }
-                        
-                        // Refresh the menu
-                        let subscription_required = db_pool.execute_with_timeout(|conn| {
-                            match conn.query_row(
-                                "SELECT value FROM settings WHERE key = 'subscription_required'",
-                                [],
-                                |row| Ok(row.get::<_, String>(0)? == "true")
-                            ) {
-                                Ok(value) => Ok(value),
-                                Err(_) => Ok(true) // Default to true
-                            }
-                        }).await.unwrap_or(true);
-
-                        let toggle_button = if subscription_required {
-                            InlineKeyboardButton::callback("Disable Subscription", "disable_subscription")
-                        } else {
-                            InlineKeyboardButton::callback("Enable Subscription", "enable_subscription")
-                        };
-
-                        let keyboard = InlineKeyboardMarkup::new(vec![vec![toggle_button],
-                                                                    vec![InlineKeyboardButton::callback("Back", "back_to_settings")]]);
-
-                        bot.edit_message_text(message.chat.id, message.id, "Manage Subscription").await?;
-                        bot.edit_message_reply_markup(message.chat.id, message.id).reply_markup(keyboard).await?;
-                    }
-                    "subscription_menu" => {
-                        let subscription_required = db_pool.execute_with_timeout(|conn| {
-                            match conn.query_row(
-                                "SELECT value FROM settings WHERE key = 'subscription_required'",
-                                [],
-                                |row| Ok(row.get::<_, String>(0)? == "true")
-                            ) {
-                                Ok(value) => Ok(value),
-                                Err(_) => Ok(true) // Default to true
-                            }
-                        }).await.unwrap_or(true);
-
-                        let toggle_button = if subscription_required {
-                            InlineKeyboardButton::callback("Disable Subscription", "disable_subscription")
-                        } else {
-                            InlineKeyboardButton::callback("Enable Subscription", "enable_subscription")
-                        };
-
-                        let keyboard = InlineKeyboardMarkup::new(vec![vec![toggle_button],
-                                                                    vec![InlineKeyboardButton::callback("Back", "back_to_settings")]]);
-
-                        bot.edit_message_text(message.chat.id, message.id, "Manage Subscription").await?;
-                        bot.edit_message_reply_markup(message.chat.id, message.id).reply_markup(keyboard).await?;
-                    }
-                    _ => {}                    }
                 }
             }
-        }
-    }
-    Ok(())
-}
-
-pub async fn update_env_subscription_setting(enable: bool) -> Result<(), anyhow::Error> {
-    let env_path = ".env";
-    let content = fs::read_to_string(env_path).await?;
-    let mut new_content = String::new();
-    let mut found = false;
-
-    for line in content.lines() {
-        if line.starts_with("SUBSCRIPTION_REQUIRED=") {
-            new_content.push_str(&format!("SUBSCRIPTION_REQUIRED={}", enable));
-            found = true;
-        } else {
-            new_content.push_str(line);
-        }
-        new_content.push_str("\n");
-    }
-
-    if !found {
-        new_content.push_str(&format!("SUBSCRIPTION_REQUIRED={}\n", enable));
-    }
-
-    fs::write(env_path, new_content).await?;
-    Ok(())
-}
-
-pub async fn settings_text_handler(bot: Bot, msg: Message) -> Result<(), anyhow::Error> {
-    let mut keyboard_rows = vec![vec![
-        KeyboardButton::new("Format"),
-    ]];
-
-    if is_admin(&msg).await {
-        keyboard_rows.push(vec![
-            KeyboardButton::new("Subscription"),
-        ]);
-    }
-
-    keyboard_rows.push(vec![
-        KeyboardButton::new("Back"),
-    ]);
-
-    let keyboard = teloxide::types::KeyboardMarkup::new(keyboard_rows)
-        .resize_keyboard()
-        .one_time_keyboard();
-
-    bot.send_message(msg.chat.id, "Settings").reply_markup(keyboard).await?;
-
-    Ok(())
-}
-
-pub async fn format_text_handler(bot: Bot, msg: Message) -> Result<(), anyhow::Error> {
-    let keyboard = teloxide::types::KeyboardMarkup::new(vec![
-        vec![
-            KeyboardButton::new("h265"),
-            KeyboardButton::new("h264"),
-            KeyboardButton::new("audio"),
-        ],
-        vec![
-            KeyboardButton::new("Back"),
-        ]
-    ])
-    .resize_keyboard()
-    .one_time_keyboard();
-
-    let text = "h265: best quality, but may not work on some devices.\nh264: worse quality, but works on many devices.\naudio: audio only";
-    bot.send_message(msg.chat.id, text).reply_markup(keyboard).await?;
-
-    Ok(())
-}
-
-pub async fn subscription_text_handler(bot: Bot, msg: Message, db_pool: Arc<DatabasePool>) -> Result<(), anyhow::Error> {
-    if !is_admin(&msg).await {
-        bot.send_message(msg.chat.id, "This option is for admins only.").await?;
-        return Ok(());
-    }
-
-    let subscription_required: bool = db_pool.execute_with_timeout(|conn| {
-        match conn.query_row("SELECT value FROM settings WHERE key = 'subscription_required'", [], |row| {
-            let value: String = row.get(0)?;
-            Ok(value == "true")
-        }) {
-            Ok(value) => Ok(value),
-            Err(_) => Ok(true) // Default to true
-        }
-    }).await.unwrap_or(true);
-
-    let toggle_button = if subscription_required {
-        KeyboardButton::new("Disable Subscription")
-    } else {
-        KeyboardButton::new("Enable Subscription")
-    };
-
-    let keyboard = teloxide::types::KeyboardMarkup::new(vec![vec![toggle_button],
-                                                                vec![KeyboardButton::new("Back")]])
-        .resize_keyboard()
-        .one_time_keyboard();
-
-    bot.send_message(msg.chat.id, "Manage Subscription").reply_markup(keyboard).await?;
-
-    Ok(())
-}
-
-pub async fn back_text_handler(bot: Bot, msg: Message) -> Result<(), anyhow::Error> {
-    bot.send_message(msg.chat.id, "Returning to main menu.").reply_markup(get_main_reply_keyboard()).await?;
-    Ok(())
-}
-
-pub async fn set_quality_h265_text_handler(bot: Bot, msg: Message, db_pool: Arc<DatabasePool>) -> Result<(), anyhow::Error> {
-    let result = db_pool.execute_with_timeout(move |conn| {
-        conn.execute(
-            "UPDATE users SET quality_preference = ?1 WHERE telegram_id = ?2",
-            params!["h265", msg.chat.id.0],
-        )
-    }).await;
-
-    match result {
-        Ok(_) => {
-            // Invalidate the cache for this user to ensure the new quality setting is picked up immediately
-            db_pool.invalidate_user_quality_cache(msg.chat.id.0).await;
-            bot.send_message(msg.chat.id, "Quality set to h265.").reply_markup(get_format_reply_keyboard()).await?;
-        },
-        Err(e) => {
-            log::error!("Failed to update quality preference to h265: {}", e);
-            bot.send_message(msg.chat.id, "Failed to update quality preference.").await?;
-        }
-    }
-    Ok(())
-}
-
-pub async fn set_quality_h264_text_handler(bot: Bot, msg: Message, db_pool: Arc<DatabasePool>) -> Result<(), anyhow::Error> {
-    let result = db_pool.execute_with_timeout(move |conn| {
-        conn.execute(
-            "UPDATE users SET quality_preference = ?1 WHERE telegram_id = ?2",
-            params!["h264", msg.chat.id.0],
-        )
-    }).await;
-
-    match result {
-        Ok(_) => {
-            // Invalidate the cache for this user to ensure the new quality setting is picked up immediately
-            db_pool.invalidate_user_quality_cache(msg.chat.id.0).await;
-            bot.send_message(msg.chat.id, "Quality set to h264.").reply_markup(get_format_reply_keyboard()).await?;
-        },
-        Err(e) => {
-            log::error!("Failed to update quality preference to h264: {}", e);
-            bot.send_message(msg.chat.id, "Failed to update quality preference.").await?;
-        }
-    }
-    Ok(())
-}
-
-pub async fn set_quality_audio_text_handler(bot: Bot, msg: Message, db_pool: Arc<DatabasePool>) -> Result<(), anyhow::Error> {
-    let result = db_pool.execute_with_timeout(move |conn| {
-        conn.execute(
-            "UPDATE users SET quality_preference = ?1 WHERE telegram_id = ?2",
-            params!["audio", msg.chat.id.0],
-        )
-    }).await;
-
-    match result {
-        Ok(_) => {
-            // Invalidate the cache for this user to ensure the new quality setting is picked up immediately
-            db_pool.invalidate_user_quality_cache(msg.chat.id.0).await;
-            bot.send_message(msg.chat.id, "Quality set to audio.").reply_markup(get_format_reply_keyboard()).await?;
-        },
-        Err(e) => {
-            log::error!("Failed to update quality preference to audio: {}", e);
-            bot.send_message(msg.chat.id, "Failed to update quality preference.").await?;
-        }
-    }
-    Ok(())
-}
-
-pub async fn enable_subscription_text_handler(bot: Bot, msg: Message, db_pool: Arc<DatabasePool>) -> Result<(), anyhow::Error> {
-    let result = db_pool.execute_with_timeout(|conn| {
-        conn.execute(
-            "UPDATE settings SET value = ?1 WHERE key = 'subscription_required'",
-            params!["true"],
-        )
-    }).await;
-
-    match result {
-        Ok(_) => {
-            if let Err(e) = update_env_subscription_setting(true).await {
-                log::error!("Failed to update .env file: {}", e);
-            }
-            bot.send_message(msg.chat.id, "Mandatory subscription enabled.").reply_markup(get_subscription_reply_keyboard(true)).await?;
-        },
-        Err(e) => {
-            log::error!("Database operation failed: {}", e);
-            bot.send_message(msg.chat.id, "Operation failed - please try again.").await?;
-        }
-    }
-    Ok(())
-}
-
-pub async fn disable_subscription_text_handler(bot: Bot, msg: Message, db_pool: Arc<DatabasePool>) -> Result<(), anyhow::Error> {
-    let result = db_pool.execute_with_timeout(|conn| {
-        conn.execute(
-            "UPDATE settings SET value = ?1 WHERE key = 'subscription_required'",
-            params!["false"],
-        )
-    }).await;
-
-    match result {
-        Ok(_) => {
-            if let Err(e) = update_env_subscription_setting(false).await {
-                log::error!("Failed to update .env file: {}", e);
-            }
-            bot.send_message(msg.chat.id, "Mandatory subscription disabled.").reply_markup(get_subscription_reply_keyboard(false)).await?;
-        },
-        Err(e) => {
-            log::error!("Database operation failed: {}", e);
-            bot.send_message(msg.chat.id, "Operation failed - please try again.").await?;
         }
     }
     Ok(())
