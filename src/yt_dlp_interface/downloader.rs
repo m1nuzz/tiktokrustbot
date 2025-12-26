@@ -5,7 +5,7 @@ use zip::ZipArchive;
 use anyhow::Result;
 
 #[cfg(target_os = "macos")]
-use sevenz_rust::decompress_file as decompress_7z;
+use sevenz_rust2::decompress_file as decompress_7z;
 
 pub async fn download_file(url: &str, path: &PathBuf) -> Result<()> {
     log::info!("Downloading from {} to {:?}", url, path);
