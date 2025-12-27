@@ -1,7 +1,7 @@
 use teloxide::prelude::*;
 use std::sync::Arc;
 use anyhow::Error;
-use tokio::sync::Mutex; 
+use tokio::sync::Mutex;
 use std::collections::HashSet;
 
 use crate::commands::Command;
@@ -10,12 +10,16 @@ use crate::handlers::{
     admin_command_handler, command_handler, link_handler,
     settings_text_handler, format_text_handler, back_text_handler, admin_panel_text_handler,
     stats_text_handler, top10_text_handler, all_users_text_handler, subscription_text_handler,
+    BroadcastState, start_broadcast, receive_broadcast_message, handle_broadcast_confirmation, BTN_BROADCAST
 };
 use crate::handlers::ui::{BTN_SETTINGS, BTN_FORMAT, BTN_ADMIN_PANEL, BTN_SUBSCRIPTION, BTN_BACK};
 use crate::yt_dlp_interface::{YoutubeFetcher, is_executable_present, ensure_binaries};
 use crate::mtproto_uploader::MTProtoUploader;
 use crate::utils::task_manager::TaskManager;
 use teloxide::dptree;
+use teloxide::dispatching::dialogue;
+use teloxide::types::CallbackQuery;
+type MyDialogue = teloxide::dispatching::dialogue::Dialogue<BroadcastState, teloxide::dispatching::dialogue::InMemStorage<BroadcastState>>;
 
 // For deduplication
 lazy_static::lazy_static! {
@@ -201,8 +205,39 @@ async fn main() -> Result<(), Error> {
 
     let bot = Bot::from_env();
 
-    let handler = dptree::entry()
-        .branch(Update::filter_message()
+    let handler = dialogue::enter::<Update, dialogue::InMemStorage<BroadcastState>, BroadcastState, _>()
+        .branch(
+            Update::filter_message()
+                .branch(
+                    dptree::case![BroadcastState::WaitingForMessage]
+                        .endpoint(receive_broadcast_message)
+                )
+                .branch(
+                    dptree::case![BroadcastState::Idle]
+                        .filter(|msg: Message| {
+                            msg.text().map(|t| t == BTN_BROADCAST).unwrap_or(false)
+                        })
+                        .endpoint(start_broadcast)
+                )
+        )
+        .branch(
+            Update::filter_callback_query()
+                .filter(|q: CallbackQuery| {
+                    q.data.as_ref().map_or(false, |data| {
+                        data == "broadcast_confirm" || data == "broadcast_cancel"
+                    })
+                })
+                .endpoint(|bot: Bot, dialogue: MyDialogue, q: CallbackQuery, db_pool: Arc<DatabasePool>| async move {
+                    match dialogue.get().await {
+                        Ok(Some(BroadcastState::WaitingForConfirmation { message })) => {
+                            handle_broadcast_confirmation(bot, dialogue, q, db_pool, message).await
+                        }
+                        _ => Ok(()),
+                    }
+                })
+        )
+        .branch(
+            Update::filter_message()
             .filter_async(|msg: Message| async move {
                 msg.text().map_or(false, |text| text.starts_with("/addchannel") || text.starts_with("/delchannel") || text.starts_with("/listchannels"))
             })
@@ -225,11 +260,11 @@ async fn main() -> Result<(), Error> {
                     conn.execute("UPDATE users SET quality_preference = 'h265' WHERE telegram_id = ?1", &[&user_id])
                 }).await?;
                 db_pool.invalidate_user_quality_cache(user_id).await;
-                
+
                 bot.send_message(msg.chat.id, "Quality set to h265")
                     .reply_markup(crate::handlers::command::get_main_reply_keyboard())
                     .await?;
-                Ok::<_, anyhow::Error>(())
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
             }))
         .branch(Update::filter_message()
             .filter(|msg: Message| msg.text() == Some("h264"))
@@ -239,11 +274,11 @@ async fn main() -> Result<(), Error> {
                     conn.execute("UPDATE users SET quality_preference = 'h264' WHERE telegram_id = ?1", &[&user_id])
                 }).await?;
                 db_pool.invalidate_user_quality_cache(user_id).await;
-                
+
                 bot.send_message(msg.chat.id, "Quality set to h264")
                     .reply_markup(crate::handlers::command::get_main_reply_keyboard())
                     .await?;
-                Ok::<_, anyhow::Error>(())
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
             }))
         .branch(Update::filter_message()
             .filter(|msg: Message| msg.text() == Some("audio"))
@@ -253,20 +288,23 @@ async fn main() -> Result<(), Error> {
                     conn.execute("UPDATE users SET quality_preference = 'audio' WHERE telegram_id = ?1", &[&user_id])
                 }).await?;
                 db_pool.invalidate_user_quality_cache(user_id).await;
-                
+
                 bot.send_message(msg.chat.id, "Quality set to audio")
                     .reply_markup(crate::handlers::command::get_main_reply_keyboard())
                     .await?;
-                Ok::<_, anyhow::Error>(())
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
             }))
         .branch(Update::filter_message()
+            .filter(|msg: Message| {
+                msg.text().map(|t| !crate::handlers::ui::is_system_button(t)).unwrap_or(false)
+            })
             .endpoint(|bot: Bot, msg: Message, fetcher: Arc<YoutubeFetcher>, mtproto_uploader: Arc<MTProtoUploader>, db_pool: Arc<DatabasePool>, task_manager: Arc<tokio::sync::Mutex<TaskManager>>, upload_semaphore: Arc<tokio::sync::Semaphore>| async move {
-                let message_key = format!("{}:{}:{}", 
-                    msg.chat.id.0, 
-                    msg.id.0, 
+                let message_key = format!("{}:{}:{}",
+                    msg.chat.id.0,
+                    msg.id.0,
                     msg.text().unwrap_or("")
                 );
-                
+
                 // Проверка, не обрабатывается ли уже
                 {
                     let mut processing = PROCESSING.lock().await;
@@ -276,7 +314,7 @@ async fn main() -> Result<(), Error> {
                     }
                     processing.insert(message_key.clone());
                 }
-                
+
                 tokio::spawn(async move {
                     let result = link_handler(
                         bot.clone(),
@@ -287,22 +325,22 @@ async fn main() -> Result<(), Error> {
                         task_manager,
                         upload_semaphore,
                     ).await;
-                    
+
                     // Убрать из processing после завершения
                     {
                         let mut processing = PROCESSING.lock().await;
                         processing.remove(&message_key);
                     }
-                    
+
                     if let Err(e) = result {
                         log::error!("Link handler error: {}", e);
                         // Опционально: отправить сообщение об ошибке пользователю
                         let _ = bot.send_message(msg.chat.id, "Failed to process video").await;
                     }
                 });
-                
+
                 // НЕМЕДЛЕННО вернуть Ok(), чтобы Telegram не ретраил update
-                Ok::<(), anyhow::Error>(())
+                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
             })
         );
 
@@ -310,7 +348,14 @@ async fn main() -> Result<(), Error> {
     log::info!("Starting to dispatch updates...");
 
     let mut dispatcher = Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![fetcher, mtproto_uploader, db_pool, task_manager.clone(), upload_semaphore])
+        .dependencies(dptree::deps![
+            dialogue::InMemStorage::<BroadcastState>::new(),  // Added for FSM dialogue
+            fetcher,
+            mtproto_uploader,
+            db_pool,
+            task_manager.clone(),
+            upload_semaphore
+        ])
         .enable_ctrlc_handler()
         .build();
 

@@ -5,15 +5,23 @@ use crate::handlers::ui::{BTN_ADMIN_PANEL, BTN_SUBSCRIPTION, BTN_BACK};
 use crate::database::DatabasePool;
 use std::sync::Arc;
 
-pub async fn admin_panel_text_handler(bot: Bot, msg: Message) -> Result<(), anyhow::Error> {
+pub const BTN_BROADCAST: &str = "📢 Broadcast";
+
+pub async fn admin_panel_text_handler(
+    bot: Bot,
+    msg: Message
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
-        bot.send_message(msg.chat.id, "This option is for admins only.").await?;
+        bot.send_message(msg.chat.id, "This option is for admins only.")
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         return Ok(());
     }
 
     let keyboard = KeyboardMarkup::new(vec![
         vec![KeyboardButton::new("Stats"), KeyboardButton::new("Top 10")],
         vec![KeyboardButton::new("All users")],
+        vec![KeyboardButton::new(BTN_BROADCAST)],
         vec![KeyboardButton::new(BTN_SUBSCRIPTION)],
         vec![KeyboardButton::new(BTN_BACK)],
     ])
@@ -21,15 +29,22 @@ pub async fn admin_panel_text_handler(bot: Bot, msg: Message) -> Result<(), anyh
 
     bot.send_message(msg.chat.id, BTN_ADMIN_PANEL)
         .reply_markup(keyboard)
-        .await?;
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
     Ok(())
 }
 
 // Новые обработчики
-pub async fn stats_text_handler(bot: Bot, msg: Message, db_pool: Arc<DatabasePool>) -> Result<(), anyhow::Error> {
+pub async fn stats_text_handler(
+    bot: Bot,
+    msg: Message,
+    db_pool: Arc<DatabasePool>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
-        bot.send_message(msg.chat.id, "This option is for admins only.").await?;
+        bot.send_message(msg.chat.id, "This option is for admins only.")
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         return Ok(());
     }
 
@@ -47,32 +62,42 @@ pub async fn stats_text_handler(bot: Bot, msg: Message, db_pool: Arc<DatabasePoo
                  📥 Total downloads: {}",
                 total_users, total_downloads
             );
-            bot.send_message(msg.chat.id, response).await?;
+            bot.send_message(msg.chat.id, response)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         }
         Err(e) => {
             log::error!("Stats DB error: {}", e);
-            bot.send_message(msg.chat.id, "Failed to retrieve statistics.").await?;
+            bot.send_message(msg.chat.id, "Failed to retrieve statistics.")
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         }
     }
 
     Ok(())
 }
 
-pub async fn top10_text_handler(bot: Bot, msg: Message, db_pool: Arc<DatabasePool>) -> Result<(), anyhow::Error> {
+pub async fn top10_text_handler(
+    bot: Bot,
+    msg: Message,
+    db_pool: Arc<DatabasePool>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
-        bot.send_message(msg.chat.id, "This option is for admins only.").await?;
+        bot.send_message(msg.chat.id, "This option is for admins only.")
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         return Ok(());
     }
 
     let result = db_pool.execute_with_timeout(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT user_telegram_id, COUNT(*) as count 
-             FROM downloads 
-             GROUP BY user_telegram_id 
-             ORDER BY count DESC 
+            "SELECT user_telegram_id, COUNT(*) as count
+             FROM downloads
+             GROUP BY user_telegram_id
+             ORDER BY count DESC
              LIMIT 10"
         )?;
-        
+
         let users_iter = stmt.query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -90,36 +115,53 @@ pub async fn top10_text_handler(bot: Bot, msg: Message, db_pool: Arc<DatabasePoo
             for (index, (user_id, count)) in users.iter().enumerate() {
                 response.push_str(&format!("{}. User {} - {} downloads\n", index + 1, user_id, count));
             }
-            
-            bot.send_message(msg.chat.id, response).await?;
+
+            bot.send_message(msg.chat.id, response)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         }
         Err(e) => {
             log::error!("Top 10 DB error: {}", e);
-            bot.send_message(msg.chat.id, "Failed to retrieve top users.").await?;
+            bot.send_message(msg.chat.id, "Failed to retrieve top users.")
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         }
     }
 
     Ok(())
 }
 
-pub async fn all_users_text_handler(bot: Bot, msg: Message, db_pool: Arc<DatabasePool>) -> Result<(), anyhow::Error> {
+pub async fn all_users_text_handler(
+    bot: Bot,
+    msg: Message,
+    db_pool: Arc<DatabasePool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
-        bot.send_message(msg.chat.id, "This option is for admins only.").await?;
+        bot.send_message(msg.chat.id, "This option is for admins only.")
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         return Ok(());
     }
 
+    // ✅ SQL запрос с LEFT JOIN и COUNT
     let result = db_pool.execute_with_timeout(|conn| {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
-        
+
         let mut stmt = conn.prepare(
-            "SELECT telegram_id, last_active 
-             FROM users 
-             ORDER BY last_active DESC 
+            "SELECT u.telegram_id, u.last_active, COUNT(d.id) as download_count
+             FROM users u
+             LEFT JOIN downloads d ON u.telegram_id = d.user_telegram_id
+             GROUP BY u.telegram_id, u.last_active
+             ORDER BY download_count DESC
              LIMIT 50"
         )?;
-        
+
         let users_iter = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,      // telegram_id
+                row.get::<_, String>(1)?,   // last_active
+                row.get::<_, i64>(2)?       // download_count
+            ))
         })?;
 
         let mut users = Vec::new();
@@ -131,16 +173,22 @@ pub async fn all_users_text_handler(bot: Bot, msg: Message, db_pool: Arc<Databas
 
     match result {
         Ok((total_count, users)) => {
-            let mut response = format!("👥 All Users - Total: {}\n\nShowing last 50:\n\n", total_count);
-            for (user_id, last_active) in users.iter() {
-                response.push_str(&format!("• User {}: {}\n", user_id, last_active));
+            let mut response = format!("📊 All Users - Total: {} (last 50)\n\n", total_count);
+            for (user_id, last_active, downloads) in users.iter() {
+                response.push_str(&format!(
+                    "👤 User: {} | 📥 Downloads: {} | 🕒 {}\n",
+                    user_id, downloads, last_active
+                ));
             }
-            
-            bot.send_message(msg.chat.id, response).await?;
+            bot.send_message(msg.chat.id, response)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         }
         Err(e) => {
             log::error!("All users DB error: {}", e);
-            bot.send_message(msg.chat.id, "Failed to retrieve users list.").await?;
+            bot.send_message(msg.chat.id, "Failed to retrieve users list.")
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         }
     }
 

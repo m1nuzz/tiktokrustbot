@@ -5,7 +5,10 @@ use crate::handlers::ui::{BTN_ADMIN_PANEL, BTN_FORMAT, BTN_SETTINGS, BTN_BACK};
 use std::sync::Arc;
 use crate::database::DatabasePool;
 
-pub async fn settings_text_handler(bot: Bot, msg: Message) -> Result<(), anyhow::Error> {
+pub async fn settings_text_handler(
+    bot: Bot,
+    msg: Message
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut rows = vec![
         vec![KeyboardButton::new(BTN_FORMAT)],
     ];
@@ -20,12 +23,16 @@ pub async fn settings_text_handler(bot: Bot, msg: Message) -> Result<(), anyhow:
 
     bot.send_message(msg.chat.id, BTN_SETTINGS)
         .reply_markup(keyboard)
-        .await?;
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
     Ok(())
 }
 
-pub async fn format_text_handler(bot: Bot, msg: Message) -> Result<(), anyhow::Error> {
+pub async fn format_text_handler(
+    bot: Bot,
+    msg: Message
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let keyboard = KeyboardMarkup::new(vec![
         vec![
             KeyboardButton::new("h265"),
@@ -37,25 +44,36 @@ pub async fn format_text_handler(bot: Bot, msg: Message) -> Result<(), anyhow::E
     .resize_keyboard();
 
     let text = "h265: best quality, but may not work on some devices.\nh264: worse quality, but works on many devices.\naudio: audio only";
-    
+
     bot.send_message(msg.chat.id, text)
         .reply_markup(keyboard)
-        .await?;
-    
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
     Ok(())
 }
 
-pub async fn back_text_handler(bot: Bot, msg: Message) -> Result<(), anyhow::Error> {
+pub async fn back_text_handler(
+    bot: Bot,
+    msg: Message
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     bot.send_message(msg.chat.id, "Returning to main menu...")
         .reply_markup(crate::handlers::command::get_main_reply_keyboard())
-        .await?;
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
     Ok(())
 }
 
-pub async fn subscription_text_handler(bot: Bot, msg: Message, db_pool: Arc<DatabasePool>) -> Result<(), anyhow::Error> {
+pub async fn subscription_text_handler(
+    bot: Bot,
+    msg: Message,
+    db_pool: Arc<DatabasePool>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
-        bot.send_message(msg.chat.id, "This option is for admins only.").await?;
+        bot.send_message(msg.chat.id, "This option is for admins only.")
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         return Ok(());
     }
 
@@ -77,11 +95,15 @@ pub async fn subscription_text_handler(bot: Bot, msg: Message, db_pool: Arc<Data
         Ok(new_value) => {
             let status = if new_value { "enabled" } else { "disabled" };
             log::info!("Subscription setting changed to {} in database", status);
-            bot.send_message(msg.chat.id, format!("Mandatory subscription is now {}", status)).await?;
+            bot.send_message(msg.chat.id, format!("Mandatory subscription is now {}", status))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         }
         Err(e) => {
             log::error!("ToggleSubscription DB error: {}", e);
-            bot.send_message(msg.chat.id, "Failed to toggle subscription setting.").await?;
+            bot.send_message(msg.chat.id, "Failed to toggle subscription setting.")
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         }
     }
 

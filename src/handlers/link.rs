@@ -31,7 +31,7 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);   // 10 minutes
 const TELEGRAM_BOT_API_FILE_LIMIT: u64 = 48 * 1024 * 1024; // 48MB
 
-async fn get_subscription_required(db_pool: &DatabasePool) -> Result<bool, anyhow::Error> {
+async fn get_subscription_required(db_pool: &DatabasePool) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let result = db_pool.execute_with_timeout(|conn| {
         match conn.query_row(
             "SELECT value FROM settings WHERE key = 'subscription_required'",
@@ -53,7 +53,7 @@ pub async fn link_handler(
     db_pool: Arc<DatabasePool>,
     _task_manager: Arc<tokio::sync::Mutex<TaskManager>>,
     upload_semaphore: Arc<tokio::sync::Semaphore>,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let user_id = msg.chat.id.0;
 
     // Update user activity using the database pool
@@ -79,7 +79,7 @@ pub async fn link_handler(
         Some(text) => text,
         None => return Ok(()),
     };
-    
+
     if is_menu_button(text) {
         return Ok(());
     }
@@ -142,7 +142,8 @@ pub async fn link_handler(
             let is_user_admin = is_admin(&msg).await;
             if !is_user_admin && !check_subscription(&bot, msg.chat.id.0).await.unwrap_or(false) {
                 bot.send_message(msg.chat.id, "To use the bot, please subscribe to our channels.")
-                    .await?;
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
                 // Cleanup URL_PROCESSING on early exit
                 {
@@ -392,7 +393,10 @@ pub async fn link_handler(
         let keyboard = InlineKeyboardMarkup::new(vec![vec![
             InlineKeyboardButton::callback(BTN_SETTINGS, "settings"),
         ]]);
-        bot.send_message(msg.chat.id, "Please send a valid TikTok link.").reply_markup(keyboard).await?;
+        bot.send_message(msg.chat.id, "Please send a valid TikTok link.")
+            .reply_markup(keyboard)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     }
 
     Ok(())

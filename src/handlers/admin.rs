@@ -17,7 +17,7 @@ pub async fn is_admin(msg: &Message) -> bool {
     admin_ids.contains(&msg.chat.id.0)
 }
 
-pub async fn admin_command_handler(bot: Bot, msg: Message, db_pool: Arc<DatabasePool>) -> Result<(), anyhow::Error> {
+pub async fn admin_command_handler(bot: Bot, msg: Message, db_pool: Arc<DatabasePool>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
         bot.send_message(msg.chat.id, "This command is for admins only.").await?;
         return Ok(())

@@ -5,12 +5,21 @@ pub const BTN_SUBSCRIPTION: &str = "Subscription";
 pub const BTN_BACK: &str = "Back";
 
 pub fn is_menu_button(text: &str) -> bool {
-    matches!(text, 
-        BTN_ADMIN_PANEL | 
-        BTN_SETTINGS | 
-        BTN_FORMAT | 
-        BTN_SUBSCRIPTION | 
+    matches!(text,
+        BTN_ADMIN_PANEL |
+        BTN_SETTINGS |
+        BTN_FORMAT |
+        BTN_SUBSCRIPTION |
         BTN_BACK
+    )
+}
+
+pub fn is_system_button(text: &str) -> bool {
+    matches!(
+        text,
+        BTN_ADMIN_PANEL | BTN_SETTINGS | BTN_FORMAT | BTN_SUBSCRIPTION | BTN_BACK |
+        "📢 Broadcast" | "📊 Stats" | "🏆 Top 10" | "👥 All users" |
+        "h265" | "h264" | "audio"
     )
 }
 
