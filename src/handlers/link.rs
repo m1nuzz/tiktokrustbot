@@ -136,13 +136,14 @@ pub async fn link_handler(
             .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
 
         let subscription_required = get_subscription_required(&db_pool).await.unwrap_or(true);
+        log::debug!("Subscription required setting: {}", subscription_required);
 
         if subscription_required {
             let is_user_admin = is_admin(&msg).await;
             if !is_user_admin && !check_subscription(&bot, msg.chat.id.0).await.unwrap_or(false) {
                 bot.send_message(msg.chat.id, "To use the bot, please subscribe to our channels.")
                     .await?;
-                
+
                 // Cleanup URL_PROCESSING on early exit
                 {
                     let mut urls = URL_PROCESSING.lock().await;

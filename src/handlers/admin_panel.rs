@@ -1,7 +1,7 @@
 use teloxide::prelude::*;
 use teloxide::types::{KeyboardMarkup, KeyboardButton};
 use crate::handlers::admin::is_admin;
-use crate::handlers::ui::{BTN_ADMIN_PANEL, BTN_BACK};
+use crate::handlers::ui::{BTN_ADMIN_PANEL, BTN_SUBSCRIPTION, BTN_BACK};
 use crate::database::DatabasePool;
 use std::sync::Arc;
 
@@ -14,6 +14,7 @@ pub async fn admin_panel_text_handler(bot: Bot, msg: Message) -> Result<(), anyh
     let keyboard = KeyboardMarkup::new(vec![
         vec![KeyboardButton::new("Stats"), KeyboardButton::new("Top 10")],
         vec![KeyboardButton::new("All users")],
+        vec![KeyboardButton::new(BTN_SUBSCRIPTION)],
         vec![KeyboardButton::new(BTN_BACK)],
     ])
     .resize_keyboard();

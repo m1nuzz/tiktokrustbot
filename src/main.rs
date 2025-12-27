@@ -9,9 +9,9 @@ use crate::database::DatabasePool;
 use crate::handlers::{
     admin_command_handler, command_handler, link_handler,
     settings_text_handler, format_text_handler, back_text_handler, admin_panel_text_handler,
-    stats_text_handler, top10_text_handler, all_users_text_handler,
+    stats_text_handler, top10_text_handler, all_users_text_handler, subscription_text_handler,
 };
-use crate::handlers::ui::{BTN_SETTINGS, BTN_FORMAT, BTN_ADMIN_PANEL, BTN_BACK};
+use crate::handlers::ui::{BTN_SETTINGS, BTN_FORMAT, BTN_ADMIN_PANEL, BTN_SUBSCRIPTION, BTN_BACK};
 use crate::yt_dlp_interface::{YoutubeFetcher, is_executable_present, ensure_binaries};
 use crate::mtproto_uploader::MTProtoUploader;
 use crate::utils::task_manager::TaskManager;
@@ -215,6 +215,7 @@ async fn main() -> Result<(), Error> {
         .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("Stats")).endpoint(stats_text_handler))
         .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("Top 10")).endpoint(top10_text_handler))
         .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("All users")).endpoint(all_users_text_handler))
+        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_SUBSCRIPTION)).endpoint(subscription_text_handler))
         .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_BACK)).endpoint(back_text_handler))
         .branch(Update::filter_message()
             .filter(|msg: Message| msg.text() == Some("h265"))
