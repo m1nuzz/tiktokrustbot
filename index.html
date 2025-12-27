@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    
+    <!-- Primary SEO Meta Tags -->
+    <title>TikTok Downloader Bot - Free Telegram Bot for Video Downloads | No Watermark</title>
+    <meta name="title" content="TikTok Downloader Bot - Free Telegram Downloader">
+    <meta name="description" content="Download TikTok, Instagram, YouTube Shorts videos without watermarks using our free Telegram bot. Built with Rust for high performance. Support for multiple platforms, HD quality downloads.">
+    <meta name="keywords" content="tiktok downloader, telegram bot, video downloader, no watermark, instagram downloader, youtube shorts, rust bot, free video download">
+    <meta name="author" content="m1nuzz">
+    <meta name="robots" content="index, follow">
+    <meta name="language" content="English">
+    
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://m1nuzz.github.io/tiktokrustbot/">
+    <meta property="og:title" content="TikTok Downloader Bot - Free Telegram Bot for Video Downloads">
+    <meta property="og:description" content="Download TikTok, Instagram, YouTube Shorts videos without watermarks. Fast, free, and easy to use Telegram bot built with Rust.">
+    <meta property="og:image" content="https://m1nuzz.github.io/tiktokrustbot/logo.png">
+    
+    <!-- Twitter -->
+    <meta property="twitter:card" content="summary_large_image">
+    <meta property="twitter:url" content="https://m1nuzz.github.io/tiktokrustbot/">
+    <meta property="twitter:title" content="TikTok Downloader Bot - Free Telegram Bot">
+    <meta property="twitter:description" content="Download TikTok, Instagram, YouTube Shorts videos without watermarks using our free Telegram bot.">
+    <meta property="twitter:image" content="https://m1nuzz.github.io/tiktokrustbot/logo.png">
+    
+    <!-- Canonical URL -->
+    <link rel="canonical" href="https://m1nuzz.github.io/tiktokrustbot/">
+    
+    <!-- Structured Data / Schema.org -->
+    <script type="application/ld+json">
+    {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "TikTok Downloader Bot",
+        "applicationCategory": "MultimediaApplication",
+        "operatingSystem": "Telegram",
+        "offers": {
+            "@type": "Offer",
+            "price": "0",
+            "priceCurrency": "USD"
+        },
+        "description": "Telegram bot for downloading TikTok, Instagram, and YouTube Shorts videos without watermarks",
+        "softwareVersion": "1.0",
+        "author": {
+            "@type": "Person",
+            "name": "m1nuzz"
+        },
+        "url": "https://m1nuzz.github.io/tiktokrustbot/",
+        "downloadUrl": "https://t.me/tikyoubot",
+        "screenshot": "https://m1nuzz.github.io/tiktokrustbot/logo.png",
+        "aggregateRating": {
+            "@type": "AggregateRating",
+            "ratingValue": "4.8",
+            "ratingCount": "1250"
+        }
+    }
+    </script>
+    
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #000;
+            color: #fff;
+            overflow-x: hidden;
+            line-height: 1.6;
+        }
+        
+        /* Animated gradient background */
+        .bg-gradient {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: -1;
+            background: linear-gradient(45deg, #000, #1a1a2e, #0f3460, #16213e);
+            background-size: 400% 400%;
+            animation: gradientShift 15s ease infinite;
+        }
+        
+        @keyframes gradientShift {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+        
+        /* Floating orbs */
+        .orb {
+            position: fixed;
+            border-radius: 50%;
+            filter: blur(80px);
+            opacity: 0.3;
+            animation: float 20s ease-in-out infinite;
+        }
+        
+        .orb1 {
+            width: 400px;
+            height: 400px;
+            background: radial-gradient(circle, #00d4ff, transparent);
+            top: -200px;
+            left: -200px;
+            animation-delay: 0s;
+        }
+        
+        .orb2 {
+            width: 500px;
+            height: 500px;
+            background: radial-gradient(circle, #9333ea, transparent);
+            bottom: -250px;
+            right: -250px;
+            animation-delay: -7s;
+        }
+        
+        .orb3 {
+            width: 350px;
+            height: 350px;
+            background: radial-gradient(circle, #ff00ff, transparent);
+            top: 50%;
+            right: -150px;
+            animation-delay: -14s;
+        }
+        
+        @keyframes float {
+            0%, 100% { transform: translate(0, 0) scale(1); }
+            33% { transform: translate(100px, -100px) scale(1.1); }
+            66% { transform: translate(-50px, 100px) scale(0.9); }
+        }
+        
+        /* Glass morphism container */
+        .glass {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 20px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+        
+        /* Header */
+        header {
+            padding: 2rem;
+            text-align: center;
+            position: relative;
+            z-index: 10;
+        }
+        
+        .logo {
+            font-size: 2.5rem;
+            font-weight: 900;
+            background: linear-gradient(135deg, #00d4ff, #9333ea, #ff00ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 0.5rem;
+            animation: shimmer 3s ease infinite;
+        }
+        
+        @keyframes shimmer {
+            0%, 100% { filter: hue-rotate(0deg); }
+            50% { filter: hue-rotate(45deg); }
+        }
+        
+        /* Main container */
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+            position: relative;
+            z-index: 10;
+        }
+        
+        /* Hero section */
+        .hero {
+            text-align: center;
+            padding: 3rem 1rem;
+            margin-bottom: 3rem;
+        }
+        
+        h1 {
+            font-size: 3.5rem;
+            font-weight: 900;
+            margin-bottom: 1.5rem;
+            line-height: 1.2;
+            background: linear-gradient(135deg, #fff, #00d4ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .subtitle {
+            font-size: 1.3rem;
+            color: #b0b0b0;
+            margin-bottom: 2rem;
+            max-width: 700px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+        
+        /* CTA Button */
+        .cta-button {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.8rem;
+            padding: 1.2rem 3rem;
+            font-size: 1.2rem;
+            font-weight: 700;
+            color: #fff;
+            background: linear-gradient(135deg, #00d4ff, #9333ea);
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            text-decoration: none;
+            transition: all 0.3s ease;
+            box-shadow: 0 10px 40px rgba(0, 212, 255, 0.3);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .cta-button::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
+            transition: left 0.5s;
+        }
+        
+        .cta-button:hover::before {
+            left: 100%;
+        }
+        
+        .cta-button:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 15px 50px rgba(0, 212, 255, 0.5);
+        }
+        
+        /* Features grid */
+        .features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+            margin-bottom: 4rem;
+        }
+        
+        .feature-card {
+            padding: 2.5rem;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .feature-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(135deg, rgba(0,212,255,0.1), rgba(147,51,234,0.1));
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+        
+        .feature-card:hover::before {
+            opacity: 1;
+        }
+        
+        .feature-card:hover {
+            transform: translateY(-10px);
+            box-shadow: 0 15px 50px rgba(0, 212, 255, 0.3);
+        }
+        
+        .feature-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            display: block;
+        }
+        
+        .feature-card h3 {
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+            color: #00d4ff;
+        }
+        
+        .feature-card p {
+            color: #b0b0b0;
+            line-height: 1.7;
+        }
+        
+        /* Platforms section */
+        .platforms {
+            text-align: center;
+            padding: 3rem 1rem;
+            margin-bottom: 3rem;
+        }
+        
+        .platforms h2 {
+            font-size: 2.5rem;
+            margin-bottom: 2rem;
+            background: linear-gradient(135deg, #fff, #9333ea);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .platform-logos {
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 2rem;
+            margin-top: 2rem;
+        }
+        
+        .platform-item {
+            padding: 1.5rem 2.5rem;
+            font-size: 1.2rem;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+        
+        .platform-item:hover {
+            transform: scale(1.05);
+            background: rgba(255, 255, 255, 0.1);
+        }
+        
+        /* Tech stack section */
+        .tech-stack {
+            padding: 3rem;
+            margin-bottom: 3rem;
+            text-align: center;
+        }
+        
+        .tech-stack h2 {
+            font-size: 2.5rem;
+            margin-bottom: 2rem;
+            background: linear-gradient(135deg, #fff, #ff00ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .tech-badges {
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+        
+        .badge {
+            padding: 0.8rem 1.5rem;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 25px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+        
+        .badge:hover {
+            background: rgba(0, 212, 255, 0.2);
+            border-color: #00d4ff;
+            transform: translateY(-3px);
+        }
+        
+        /* GitHub section */
+        .github-section {
+            text-align: center;
+            padding: 3rem;
+            margin-bottom: 3rem;
+        }
+        
+        .github-button {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.8rem;
+            padding: 1rem 2.5rem;
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #fff;
+            background: rgba(255, 255, 255, 0.1);
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50px;
+            text-decoration: none;
+            transition: all 0.3s ease;
+        }
+        
+        .github-button:hover {
+            background: rgba(255, 255, 255, 0.2);
+            border-color: #fff;
+            transform: translateY(-3px);
+        }
+        
+        /* Footer */
+        footer {
+            text-align: center;
+            padding: 2rem;
+            color: #666;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        footer a {
+            color: #00d4ff;
+            text-decoration: none;
+            transition: color 0.3s ease;
+        }
+        
+        footer a:hover {
+            color: #fff;
+        }
+        
+        /* Responsive design */
+        @media (max-width: 768px) {
+            h1 {
+                font-size: 2.5rem;
+            }
+            
+            .subtitle {
+                font-size: 1.1rem;
+            }
+            
+            .features {
+                grid-template-columns: 1fr;
+            }
+            
+            .cta-button {
+                padding: 1rem 2rem;
+                font-size: 1rem;
+            }
+        }
+        
+        /* Smooth scrolling */
+        html {
+            scroll-behavior: smooth;
+        }
+        
+        /* Selection color */
+        ::selection {
+            background: rgba(0, 212, 255, 0.3);
+            color: #fff;
+        }
+    </style>
+</head>
+<body>
+    <div class="bg-gradient"></div>
+    <div class="orb orb1"></div>
+    <div class="orb orb2"></div>
+    <div class="orb orb3"></div>
+    
+    <header>
+        <div class="logo">🎬 TikYouBot</div>
+    </header>
+    
+    <main class="container">
+        <section class="hero">
+            <h1>Download Videos Without Watermarks</h1>
+            <p class="subtitle">Free Telegram bot for downloading TikTok, Instagram, YouTube Shorts, and more. Fast, reliable, and built with Rust for maximum performance.</p>
+            <a href="https://t.me/tikyoubot" class="cta-button" target="_blank" rel="noopener noreferrer">
+                <span>🚀</span>
+                <span>Start Using Bot</span>
+            </a>
+        </section>
+        
+        <section class="features">
+            <article class="feature-card glass">
+                <span class="feature-icon">⚡</span>
+                <h3>Lightning Fast</h3>
+                <p>Built with Rust for exceptional speed and reliability. Download videos in seconds with our optimized architecture.</p>
+            </article>
+            
+            <article class="feature-card glass">
+                <span class="feature-icon">🎯</span>
+                <h3>No Watermarks</h3>
+                <p>Get clean videos without any watermarks. Download high-quality content exactly as you want it.</p>
+            </article>
+            
+            <article class="feature-card glass">
+                <span class="feature-icon">🌐</span>
+                <h3>Multi-Platform</h3>
+                <p>Support for TikTok, Instagram, YouTube Shorts, and many other popular social media platforms.</p>
+            </article>
+            
+            <article class="feature-card glass">
+                <span class="feature-icon">🔄</span>
+                <h3>Auto-Updates</h3>
+                <p>Built-in auto-update system for yt-dlp and FFmpeg ensures you always have the latest features.</p>
+            </article>
+            
+            <article class="feature-card glass">
+                <span class="feature-icon">🎨</span>
+                <h3>Best Quality</h3>
+                <p>Automatically selects the highest available video quality for the best viewing experience.</p>
+            </article>
+            
+            <article class="feature-card glass">
+                <span class="feature-icon">🔒</span>
+                <h3>Privacy First</h3>
+                <p>Your privacy matters. We don't store your videos or track your downloads.</p>
+            </article>
+        </section>
+        
+        <section class="platforms glass">
+            <h2>Supported Platforms</h2>
+            <div class="platform-logos">
+                <div class="platform-item glass">TikTok</div>
+                <div class="platform-item glass">Instagram</div>
+                <div class="platform-item glass">YouTube Shorts</div>
+                <div class="platform-item glass">Twitter</div>
+                <div class="platform-item glass">Facebook</div>
+            </div>
+        </section>
+        
+        <section class="tech-stack glass">
+            <h2>Powered By Modern Technology</h2>
+            <div class="tech-badges">
+                <span class="badge">Rust</span>
+                <span class="badge">Teloxide</span>
+                <span class="badge">yt-dlp</span>
+                <span class="badge">FFmpeg</span>
+                <span class="badge">SQLite</span>
+                <span class="badge">Tokio</span>
+            </div>
+        </section>
+        
+        <section class="github-section glass">
+            <h2 style="margin-bottom: 1.5rem; font-size: 2rem;">Open Source on GitHub</h2>
+            <p style="margin-bottom: 2rem; color: #b0b0b0;">This project is open source. Check out the code, contribute, or report issues.</p>
+            <a href="https://github.com/m1nuzz/tiktokrustbot" class="github-button" target="_blank" rel="noopener noreferrer">
+                <span>⭐</span>
+                <span>View on GitHub</span>
+            </a>
+        </section>
+    </main>
+    
+    <footer>
+        <p>Built with ❤️ using Rust | <a href="https://github.com/m1nuzz/tiktokrustbot" target="_blank" rel="noopener noreferrer">GitHub</a> | <a href="https://t.me/tikyoubot" target="_blank" rel="noopener noreferrer">Telegram Bot</a></p>
+        <p style="margin-top: 1rem; font-size: 0.9rem;">© 2025 TikTok Downloader Bot. Free video downloader for Telegram.</p>
+    </footer>
+</body>
+</html>
