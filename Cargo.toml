@@ -14,7 +14,7 @@ log = "0.4.29"
 pretty_env_logger = "0.5"
 chrono = { version = "0.4.42", features = ["serde"] }
 anyhow = "1.0"
-reqwest = { version = "0.13.1", features = ["multipart", "stream", "json"] }
+reqwest = { version = "0.12.28", features = ["multipart", "stream", "json", "rustls-tls"] }
 zip = "7.0.0"
 tar = "0.4"
 xz2 = "0.1.7"

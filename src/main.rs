@@ -241,7 +241,15 @@ async fn main() -> Result<(), Error> {
     let task_manager = Arc::new(tokio::sync::Mutex::new(TaskManager::new(2))); // For progress tasks
     let upload_semaphore = Arc::new(tokio::sync::Semaphore::new(2)); // Maximum 2 simultaneous uploads
 
-    let bot = Bot::from_env();
+    // Create custom HTTP client with longer timeout for long polling
+    let reqwest_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60)) // Total timeout for request
+        .connect_timeout(std::time::Duration::from_secs(10)) // Connection timeout
+        .tcp_nodelay(true)
+        .build()
+        .expect("Failed to create HTTP client");
+
+    let bot = Bot::with_client(bot_token, reqwest_client);
 
     let handler = dialogue::enter::<Update, dialogue::InMemStorage<BroadcastState>, BroadcastState, _>()
         .branch(
