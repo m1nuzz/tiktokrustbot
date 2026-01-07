@@ -1,25 +1,28 @@
+use regex::Regex;
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardMarkup, InlineKeyboardButton};
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
+use std::collections::HashMap;
 use std::fs;
-use std::sync::Arc;
-use uuid::Uuid;
-use tokio::time::{Duration, timeout};
+use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::future::Future;
-use tokio::time::{Instant}; // Import Instant and Duration here
-use std::collections::HashMap; // Import HashMap here
+use std::sync::Arc;
+use tokio::time::Instant; // Import Instant and Duration here
+use tokio::time::{Duration, timeout};
+use uuid::Uuid; // Import HashMap here
 
 use crate::database::DatabasePool;
-use crate::mtproto_uploader::MTProtoUploader;
-use crate::yt_dlp_interface::YoutubeFetcher;
 use crate::handlers::admin::is_admin;
 use crate::handlers::subscription::check_subscription;
+use crate::handlers::ui::{BTN_SETTINGS, is_menu_button};
+use crate::mtproto_uploader::MTProtoUploader;
+use crate::telegram_bot_api_uploader::{
+    send_audio_with_progress_botapi, send_video_with_progress_botapi,
+};
 use crate::utils::progress_bar::ProgressBar;
-use crate::utils::{task_manager::TaskManager};
-use crate::handlers::ui::{is_menu_button, BTN_SETTINGS};
-use crate::telegram_bot_api_uploader::{send_video_with_progress_botapi, send_audio_with_progress_botapi};
+use crate::utils::task_manager::TaskManager;
+use crate::yt_dlp_interface::YoutubeFetcher;
 
 // For rate limiting per chat
 lazy_static::lazy_static! {
@@ -28,20 +31,36 @@ lazy_static::lazy_static! {
 }
 
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);   // 10 minutes
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
 const TELEGRAM_BOT_API_FILE_LIMIT: u64 = 48 * 1024 * 1024; // 48MB
 
-async fn get_subscription_required(db_pool: &DatabasePool) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let result = db_pool.execute_with_timeout(|conn| {
-        match conn.query_row(
-            "SELECT value FROM settings WHERE key = 'subscription_required'",
-            [],
-            |row| Ok(row.get::<_, String>(0)? == "true")
-        ) {
-            Ok(value) => Ok(value),
-            Err(_) => Ok(true) // Default to true
-        }
-    }).await?;
+// 🔥 ДОДАЙ ЦЮ ФУНКЦІЮ НА ПОЧАТКУ ФАЙЛУ
+fn extract_url_from_text(text: &str) -> Option<String> {
+    // Regex для пошуку TikTok URL
+    let re = Regex::new(r"https?://(?:www\.|vm\.)?tiktok\.com/[^\s]+").unwrap();
+
+    if let Some(captures) = re.find(text) {
+        Some(captures.as_str().to_string())
+    } else {
+        None
+    }
+}
+
+async fn get_subscription_required(
+    db_pool: &DatabasePool,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let result = db_pool
+        .execute_with_timeout(|conn| {
+            match conn.query_row(
+                "SELECT value FROM settings WHERE key = 'subscription_required'",
+                [],
+                |row| Ok(row.get::<_, String>(0)? == "true"),
+            ) {
+                Ok(value) => Ok(value),
+                Err(_) => Ok(true), // Default to true
+            }
+        })
+        .await?;
     Ok(result)
 }
 
@@ -85,13 +104,22 @@ pub async fn link_handler(
     }
 
     if text.contains("tiktok.com") {
-        let url = text.to_string(); // Capture URL for deduplication
+        // 🔥 ВИТЯГУЄМО ТІЛЬКИ URL, А НЕ ВЕСЬ ТЕКСТ!
+        let url = match extract_url_from_text(text) {
+            Some(url) => url,
+            None => {
+                bot.send_message(msg.chat.id, "❌ Could not extract TikTok URL from message.")
+                    .await?;
+                return Ok(());
+            }
+        };
 
         // URL Deduplication
         {
             let mut urls = URL_PROCESSING.lock().await;
             if urls.contains(&url) {
-                bot.send_message(msg.chat.id, "This video is already being processed.").await?;
+                bot.send_message(msg.chat.id, "⏳ This video is already being processed.")
+                    .await?;
                 return Ok(());
             }
             urls.insert(url.clone());
@@ -104,7 +132,11 @@ pub async fn link_handler(
                 let elapsed = last_time.elapsed();
                 if elapsed < Duration::from_secs(2) {
                     let wait_time = Duration::from_secs(2) - elapsed;
-                    log::info!("Rate limiting: waiting {:?} for chat {}", wait_time, user_id);
+                    log::info!(
+                        "Rate limiting: waiting {:?} for chat {}",
+                        wait_time,
+                        user_id
+                    );
                     tokio::time::sleep(wait_time).await;
                 }
             }
@@ -121,6 +153,12 @@ pub async fn link_handler(
             .get_user_quality(msg.chat.id.0)
             .await
             .unwrap_or_else(|_| "best".to_string());
+
+        let fingerprint =
+            crate::handlers::fingerprint::get_current_fingerprint(db_pool.clone()).await;
+        if let Some(ref fp) = fingerprint {
+            log::info!("🔐 Using TLS fingerprint for download: {}", fp);
+        }
 
         let is_audio = quality_preference == "audio";
         log::info!(
@@ -140,10 +178,17 @@ pub async fn link_handler(
 
         if subscription_required {
             let is_user_admin = is_admin(&msg).await;
-            if !is_user_admin && !check_subscription(&bot, msg.chat.id.0).await.unwrap_or(false) {
-                bot.send_message(msg.chat.id, "To use the bot, please subscribe to our channels.")
+            if !is_user_admin
+                && !check_subscription(&bot, msg.chat.id.0)
                     .await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    .unwrap_or(false)
+            {
+                bot.send_message(
+                    msg.chat.id,
+                    "To use the bot, please subscribe to our channels.",
+                )
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
                 // Cleanup URL_PROCESSING on early exit
                 {
@@ -168,9 +213,10 @@ pub async fn link_handler(
         let download_result = loop {
             let file_stem = format!("output/{}", Uuid::new_v4());
             let download_future = fetcher.download_video_from_url(
-                text.to_string(),
+                url.clone(),
                 &file_stem,
                 &quality_preference,
+                fingerprint.clone(),
                 &mut progress_bar,
             );
 
@@ -184,7 +230,8 @@ pub async fn link_handler(
                     let delay_ms = (1000 * 2_u64.pow(retries - 1)).min(30000);
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
-                Err(e) => { // timeout
+                Err(e) => {
+                    // timeout
                     retries += 1;
                     if retries >= 3 {
                         break Err(anyhow::Error::new(e));
@@ -213,7 +260,8 @@ pub async fn link_handler(
                     "🔒 Video is private and cannot be downloaded".to_string()
                 } else if e.to_string().contains("This video is age-restricted") {
                     "🔞 Video is age-restricted and cannot be downloaded".to_string()
-                } else if e.to_string().contains("Failed to parse") || e.to_string().contains("JSON")
+                } else if e.to_string().contains("Failed to parse")
+                    || e.to_string().contains("JSON")
                 {
                     "🔧 Error processing TikTok API response. Please try again later.".to_string()
                 } else if e.to_string().contains("timeout") {
@@ -255,21 +303,25 @@ pub async fn link_handler(
 
             // Use the new reconnect mechanism which includes retries internally
             let upload_result = if is_audio {
-                mtproto_uploader.upload_audio(
-                    msg.chat.id.0,
-                    username.clone(),
-                    &path,
-                    "",
-                    &mut progress_bar,
-                ).await
+                mtproto_uploader
+                    .upload_audio(
+                        msg.chat.id.0,
+                        username.clone(),
+                        &path,
+                        "",
+                        &mut progress_bar,
+                    )
+                    .await
             } else {
-                mtproto_uploader.upload_video(
-                    msg.chat.id.0,
-                    username.clone(),
-                    &path,
-                    "",
-                    &mut progress_bar,
-                ).await
+                mtproto_uploader
+                    .upload_video(
+                        msg.chat.id.0,
+                        username.clone(),
+                        &path,
+                        "",
+                        &mut progress_bar,
+                    )
+                    .await
             };
 
             match upload_result {
@@ -285,15 +337,16 @@ pub async fn link_handler(
                 }
                 Err(e) => {
                     progress_bar.delete().await?;
-                    let error_msg =
-                        if let Some(wait_seconds) = crate::utils::retry::extract_flood_wait(&e.to_string()) {
-                            format!(
-                                "⏳ Rate limited. Please wait {} seconds and try again.",
-                                wait_seconds
-                            )
-                        } else {
-                            "❌ Upload failed - please try again later".to_string()
-                        };
+                    let error_msg = if let Some(wait_seconds) =
+                        crate::utils::retry::extract_flood_wait(&e.to_string())
+                    {
+                        format!(
+                            "⏳ Rate limited. Please wait {} seconds and try again.",
+                            wait_seconds
+                        )
+                    } else {
+                        "❌ Upload failed - please try again later".to_string()
+                    };
                     bot.send_message(msg.chat.id, error_msg).await?;
                 }
             }
@@ -301,25 +354,28 @@ pub async fn link_handler(
             // Regular upload via Bot API with timeout and retry
             let mut retries = 0;
             let send_result = loop {
-                 let send_future: Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>> = Box::pin(async {
-                    if is_audio {
-                        send_audio_with_progress_botapi(
-                            &bot.token(),
-                            msg.chat.id,
-                            &path,
-                            None,
-                            &mut progress_bar,
-                        ).await
-                    } else {
-                        send_video_with_progress_botapi(
-                            &bot.token(),
-                            msg.chat.id,
-                            &path,
-                            None,
-                            &mut progress_bar,
-                        ).await
-                    }
-                });
+                let send_future: Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>> =
+                    Box::pin(async {
+                        if is_audio {
+                            send_audio_with_progress_botapi(
+                                &bot.token(),
+                                msg.chat.id,
+                                &path,
+                                None,
+                                &mut progress_bar,
+                            )
+                            .await
+                        } else {
+                            send_video_with_progress_botapi(
+                                &bot.token(),
+                                msg.chat.id,
+                                &path,
+                                None,
+                                &mut progress_bar,
+                            )
+                            .await
+                        }
+                    });
 
                 match timeout(UPLOAD_TIMEOUT, send_future).await {
                     Ok(Ok(val)) => break Ok(val),
@@ -331,7 +387,8 @@ pub async fn link_handler(
                         let delay_ms = (1000 * 2_u64.pow(retries - 1)).min(30000);
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     }
-                    Err(e) => { // timeout
+                    Err(e) => {
+                        // timeout
                         retries += 1;
                         if retries >= 3 {
                             break Err(anyhow::Error::new(e));
@@ -344,10 +401,7 @@ pub async fn link_handler(
 
             match send_result {
                 Ok(_) => {
-                    log::info!(
-                        "File sent successfully via Bot API (audio: {})",
-                        is_audio
-                    );
+                    log::info!("File sent successfully via Bot API (audio: {})", is_audio);
                     // Progress bar already handled by send functions
                 }
                 Err(_e) => {
@@ -360,7 +414,7 @@ pub async fn link_handler(
 
         // Logging and cleanup
         let user_id = msg.chat.id.0;
-        let video_url = text.to_string();
+        let video_url = url.clone();
         let result = db_pool
             .execute_with_timeout(move |conn| {
                 // Update user activity first (to ensure the user exists in the database)
@@ -390,9 +444,10 @@ pub async fn link_handler(
             urls.remove(&url);
         }
     } else {
-        let keyboard = InlineKeyboardMarkup::new(vec![vec![
-            InlineKeyboardButton::callback(BTN_SETTINGS, "settings"),
-        ]]);
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+            BTN_SETTINGS,
+            "settings",
+        )]]);
         bot.send_message(msg.chat.id, "Please send a valid TikTok link.")
             .reply_markup(keyboard)
             .await
@@ -419,7 +474,10 @@ impl Drop for TempFile {
         // Drop should not panic, so we handle errors
         if std::thread::panicking() {
             // If already panicking, skip cleanup to avoid double panic
-            log::warn!("Skipping temp file cleanup during panic: {}", self.path.display());
+            log::warn!(
+                "Skipping temp file cleanup during panic: {}",
+                self.path.display()
+            );
             return;
         }
         match std::fs::remove_file(&self.path) {

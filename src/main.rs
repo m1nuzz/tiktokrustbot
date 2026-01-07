@@ -1,25 +1,29 @@
-use teloxide::prelude::*;
-use std::sync::Arc;
 use anyhow::Error;
-use tokio::sync::Mutex;
 use std::collections::HashSet;
+use std::sync::Arc;
+use teloxide::prelude::*;
+use tokio::sync::Mutex;
 
+use crate::commands::AdminCommand;
 use crate::commands::Command;
 use crate::database::DatabasePool;
+use crate::handlers::ui::{BTN_ADMIN_PANEL, BTN_BACK, BTN_FORMAT, BTN_SETTINGS, BTN_SUBSCRIPTION};
 use crate::handlers::{
-    admin_command_handler, command_handler, link_handler,
-    settings_text_handler, format_text_handler, back_text_handler, admin_panel_text_handler,
-    stats_text_handler, top10_text_handler, all_users_text_handler, subscription_text_handler,
-    BroadcastState, start_broadcast, receive_broadcast_message, handle_broadcast_confirmation, BTN_BROADCAST
+    BTN_BROADCAST, BroadcastState, admin_panel_text_handler, all_users_text_handler,
+    back_text_handler, command_handler, format_text_handler, handle_broadcast_confirmation,
+    link_handler, receive_broadcast_message, settings_text_handler, start_broadcast,
+    stats_text_handler, subscription_text_handler, top10_text_handler,
 };
-use crate::handlers::ui::{BTN_SETTINGS, BTN_FORMAT, BTN_ADMIN_PANEL, BTN_SUBSCRIPTION, BTN_BACK};
-use crate::yt_dlp_interface::{YoutubeFetcher, is_executable_present, ensure_binaries};
 use crate::mtproto_uploader::MTProtoUploader;
 use crate::utils::task_manager::TaskManager;
-use teloxide::dptree;
+use crate::yt_dlp_interface::{YoutubeFetcher, ensure_binaries, is_executable_present};
 use teloxide::dispatching::dialogue;
+use teloxide::dptree;
 use teloxide::types::CallbackQuery;
-type MyDialogue = teloxide::dispatching::dialogue::Dialogue<BroadcastState, teloxide::dispatching::dialogue::InMemStorage<BroadcastState>>;
+type MyDialogue = teloxide::dispatching::dialogue::Dialogue<
+    BroadcastState,
+    teloxide::dispatching::dialogue::InMemStorage<BroadcastState>,
+>;
 
 // For deduplication
 lazy_static::lazy_static! {
@@ -27,29 +31,28 @@ lazy_static::lazy_static! {
 }
 
 #[cfg(not(target_os = "android"))]
-
 #[cfg(target_os = "android")]
 use robius_directories::ProjectDirs;
 
+mod auto_update;
 mod commands;
 mod config;
 mod database;
 mod handlers;
 pub mod mtproto_uploader;
-mod yt_dlp_interface;
-mod utils;
-mod telegram_bot_api_uploader;
 pub mod peers;
-mod auto_update;
+mod telegram_bot_api_uploader;
+mod utils;
+mod yt_dlp_interface;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     // --- Logging Setup ---
     use log::LevelFilter;
-    use std::sync::Mutex as StdMutex; // Renamed to avoid conflict with tokio::sync::Mutex
+    use std::env;
     use std::fs::OpenOptions;
     use std::io::Write;
-    use std::env;
+    use std::sync::Mutex as StdMutex; // Renamed to avoid conflict with tokio::sync::Mutex
 
     // 1. Get console log level from env
     let console_level_str = env::var("CONSOLE_LOG_LEVEL").unwrap_or_else(|_| "INFO".to_string());
@@ -67,14 +70,15 @@ async fn main() -> Result<(), Error> {
     };
 
     // 3. Determine the most verbose level needed overall for the logger to process
-    let max_level = std::cmp::max(
-        console_level,
-        file_level_config.unwrap_or(LevelFilter::Off)
-    );
+    let max_level = std::cmp::max(console_level, file_level_config.unwrap_or(LevelFilter::Off));
 
     // 4. Setup file handle if needed
     let log_file = if file_level_config.is_some() {
-        let file = OpenOptions::new().create(true).write(true).append(true).open("bot_errors.log")?;
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open("bot_errors.log")?;
         Some(Arc::new(StdMutex::new(file))) // Use StdMutex here
     } else {
         None
@@ -111,7 +115,7 @@ async fn main() -> Result<(), Error> {
             Ok(())
         })
         .init();
-    
+
     log::info!("Starting TikTok downloader bot...");
     let start_time = std::time::Instant::now();
 
@@ -120,7 +124,10 @@ async fn main() -> Result<(), Error> {
         return Err(e.into());
     }
 
-    let exe_dir = std::env::current_exe()?.parent().ok_or_else(|| anyhow::anyhow!("Failed to get parent directory of executable"))?.to_path_buf();
+    let exe_dir = std::env::current_exe()?
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get parent directory of executable"))?
+        .to_path_buf();
     log::info!("Executable directory: {:?}", exe_dir);
 
     // Dynamic directory for libraries (yt-dlp and ffmpeg)
@@ -136,33 +143,59 @@ async fn main() -> Result<(), Error> {
     }
 
     log::info!("Libraries directory: {:?}", libraries_dir.canonicalize()?);
-    log::info!("Contents of libraries directory: {:?}", std::fs::read_dir(&libraries_dir)?.map(|e| e.unwrap().file_name()).collect::<Vec<_>>());
+    log::info!(
+        "Contents of libraries directory: {:?}",
+        std::fs::read_dir(&libraries_dir)?
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>()
+    );
 
-    let yt_dlp_path = libraries_dir.join(if cfg!(target_os = "windows") { "yt-dlp.exe" } else { "yt-dlp" });
+    let yt_dlp_path = libraries_dir.join(if cfg!(target_os = "windows") {
+        "yt-dlp.exe"
+    } else {
+        "yt-dlp"
+    });
     let ffmpeg_dir = libraries_dir.join("ffmpeg");
-    let ffmpeg_path = ffmpeg_dir.join(if cfg!(target_os = "windows") { "ffmpeg.exe" } else { "ffmpeg" });
-    let ffprobe_path = ffmpeg_dir.join(if cfg!(target_os = "windows") { "ffprobe.exe" } else { "ffprobe" });
+    let ffmpeg_path = ffmpeg_dir.join(if cfg!(target_os = "windows") {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    });
+    let ffprobe_path = ffmpeg_dir.join(if cfg!(target_os = "windows") {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    });
 
     if !is_executable_present(&yt_dlp_path) {
-        log::error!("yt-dlp not found at {:?} after attempted download", yt_dlp_path);
+        log::error!(
+            "yt-dlp not found at {:?} after attempted download",
+            yt_dlp_path
+        );
         return Err(anyhow::Error::msg("yt-dlp not available"));
     } else {
         log::info!("yt-dlp found at {:?}", yt_dlp_path);
     }
 
     if !is_executable_present(&ffmpeg_path) {
-        log::error!("ffmpeg not found at {:?} after attempted download", ffmpeg_path);
+        log::error!(
+            "ffmpeg not found at {:?} after attempted download",
+            ffmpeg_path
+        );
         return Err(anyhow::Error::msg("ffmpeg not available"));
     }
 
     if !is_executable_present(&ffprobe_path) {
-        log::error!("ffprobe not found at {:?} after attempted download", ffprobe_path);
+        log::error!(
+            "ffprobe not found at {:?} after attempted download",
+            ffprobe_path
+        );
         return Err(anyhow::Error::msg("ffprobe not available"));
     }
 
     // Настройка автообновления ПОСЛЕ ensure_binaries
     let auto_updater = Arc::new(auto_update::AutoUpdater::new(libraries_dir.clone(), 30)); // Проверка каждые 30 минут
-    
+
     // Первоначальная проверка обновлений
     if let Err(e) = auto_updater.check_for_updates().await {
         log::warn!("Initial update check failed: {}", e);
@@ -184,22 +217,27 @@ async fn main() -> Result<(), Error> {
     }
     log::info!("Database initialized successfully.");
 
-    let fetcher = Arc::new(YoutubeFetcher::new(yt_dlp_path, output_dir.clone(), ffmpeg_dir.clone())?);
+    let fetcher = Arc::new(YoutubeFetcher::new(
+        yt_dlp_path,
+        output_dir.clone(),
+        ffmpeg_dir.clone(),
+    )?);
     let bot_token = env::var("TELOXIDE_TOKEN").expect("TELOXIDE_TOKEN must be set");
-    let mtproto_uploader = match MTProtoUploader::new(&bot_token, ffprobe_path.clone(), ffmpeg_path.clone()).await {
-        Ok(uploader) => Arc::new(uploader),
-        Err(e) => {
-            log::error!("Failed to create MTProtoUploader: {}", e);
-            return Err(anyhow::anyhow!("{}", e));
-        }
-    };
+    let mtproto_uploader =
+        match MTProtoUploader::new(&bot_token, ffprobe_path.clone(), ffmpeg_path.clone()).await {
+            Ok(uploader) => Arc::new(uploader),
+            Err(e) => {
+                log::error!("Failed to create MTProtoUploader: {}", e);
+                return Err(anyhow::anyhow!("{}", e));
+            }
+        };
 
     // Create database pool and task manager
     let db_pool = Arc::new(DatabasePool::new(
         crate::database::get_database_path(),
-        3 // Maximum 3 simultaneous database connections
+        3, // Maximum 3 simultaneous database connections
     ));
-    
+
     let task_manager = Arc::new(tokio::sync::Mutex::new(TaskManager::new(2))); // For progress tasks
     let upload_semaphore = Arc::new(tokio::sync::Semaphore::new(2)); // Maximum 2 simultaneous uploads
 
@@ -238,10 +276,173 @@ async fn main() -> Result<(), Error> {
         )
         .branch(
             Update::filter_message()
-            .filter_async(|msg: Message| async move {
-                msg.text().map_or(false, |text| text.starts_with("/addchannel") || text.starts_with("/delchannel") || text.starts_with("/listchannels"))
-            })
-            .endpoint(admin_command_handler)
+                .filter_command::<AdminCommand>()
+                .endpoint(|bot: Bot, msg: Message, cmd: AdminCommand, db_pool: Arc<DatabasePool>| async move {
+                    // Отримуємо шлях до yt-dlp
+                    let exe_dir = std::env::current_exe()?
+                        .parent()
+                        .ok_or_else(|| anyhow::anyhow!("Failed to get parent directory"))?
+                        .to_path_buf();
+                    let ytdlp_path = exe_dir.join("lib").join("yt-dlp");
+                    let ytdlp_path_str = ytdlp_path.to_string_lossy().to_string();
+
+                    // Перевіряємо чи це адмін
+                    if !crate::handlers::admin::is_admin(&msg).await {
+                        bot.send_message(msg.chat.id, "This command is for admins only.").await?;
+                        return Ok(());
+                    }
+
+                    match cmd {
+                        AdminCommand::AddChannel { id_name } => {
+                            let parts: Vec<&str> = id_name.splitn(2, ',').collect();
+                            if parts.len() == 2 {
+                                let id = parts[0].to_string();
+                                let name = parts[1].to_string();
+                                let id_cloned_for_format = id.clone();
+                                let name_cloned_for_format = name.clone();
+
+                                let result = db_pool
+                                    .execute_with_timeout(move |conn| {
+                                        conn.execute(
+                                            "INSERT OR REPLACE INTO channels (channel_id, channel_name) VALUES (?1, ?2)",
+                                            rusqlite::params![id, name],
+                                        )
+                                    })
+                                    .await;
+
+                                match result {
+                                    Ok(_) => {
+                                        bot.send_message(
+                                            msg.chat.id,
+                                            format!("✅ Channel '{}' added: {}", name_cloned_for_format, id_cloned_for_format),
+                                        )
+                                        .await?;
+                                    }
+                                    Err(e) => {
+                                        log::error!("AddChannel DB error: {}", e);
+                                        bot.send_message(msg.chat.id, "Failed to add channel.").await?;
+                                    }
+                                }
+                            } else {
+                                bot.send_message(msg.chat.id, "Usage: /addchannel <id>,<name>").await?;
+                            }
+                        }
+                        AdminCommand::DelChannel { id } => {
+                            let id_cloned_for_format = id.clone();
+                            let result = db_pool
+                                .execute_with_timeout(move |conn| {
+                                    conn.execute("DELETE FROM channels WHERE channel_id = ?1", rusqlite::params![id])
+                                })
+                                .await;
+
+                            match result {
+                                Ok(changes) => {
+                                    if changes > 0 {
+                                        bot.send_message(
+                                            msg.chat.id,
+                                            format!("✅ Channel deleted: {}", id_cloned_for_format),
+                                        )
+                                        .await?;
+                                    } else {
+                                        bot.send_message(
+                                            msg.chat.id,
+                                            format!("❌ Channel not found: {}", id_cloned_for_format),
+                                        )
+                                        .await?;
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("DelChannel DB error: {}", e);
+                                    bot.send_message(msg.chat.id, "Failed to delete channel.").await?;
+                                }
+                            }
+                        }
+                        AdminCommand::ListChannels => {
+                            let result = db_pool
+                                .execute_with_timeout(|conn| {
+                                    let mut stmt = conn.prepare("SELECT channel_id, channel_name FROM channels")?;
+                                    let channels_iter = stmt.query_map([], |row| {
+                                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                                    })?;
+                                    let mut channels = Vec::new();
+                                    for channel_result in channels_iter {
+                                        channels.push(channel_result?);
+                                    }
+                                    Ok(channels)
+                                })
+                                .await;
+
+                            match result {
+                                Ok(channels) => {
+                                    let mut response = String::from("📋 Subscription channels:\n");
+                                    for (id, name) in channels {
+                                        response.push_str(&format!("- {} ({})\n", name, id));
+                                    }
+                                    bot.send_message(msg.chat.id, response).await?;
+                                }
+                                Err(e) => {
+                                    log::error!("ListChannels DB error: {}", e);
+                                    bot.send_message(msg.chat.id, "Failed to list channels.").await?;
+                                }
+                            }
+                        }
+                        AdminCommand::ToggleSubscription => {
+                            let result = db_pool
+                                .execute_with_timeout(|conn| {
+                                    let current_value: String = conn.query_row(
+                                        "SELECT value FROM settings WHERE key = 'subscription_required'",
+                                        [],
+                                        |row| row.get(0),
+                                    )?;
+                                    let new_value = !(current_value == "true");
+                                    conn.execute(
+                                        "UPDATE settings SET value = ?1 WHERE key = 'subscription_required'",
+                                        rusqlite::params![new_value.to_string()],
+                                    )?;
+                                    Ok(new_value)
+                                })
+                                .await;
+
+                            match result {
+                                Ok(new_value) => {
+                                    let status = if new_value { "enabled" } else { "disabled" };
+                                    bot.send_message(
+                                        msg.chat.id,
+                                        format!("✅ Mandatory subscription is now {}", status),
+                                    )
+                                    .await?;
+                                }
+                                Err(e) => {
+                                    log::error!("ToggleSubscription DB error: {}", e);
+                                    bot.send_message(msg.chat.id, "Failed to toggle subscription setting.").await?;
+                                }
+                            }
+                        }
+                        AdminCommand::Fingerprint => {
+                            crate::handlers::fingerprint::fingerprint_list_handler(bot, msg, &ytdlp_path_str).await?;
+                        }
+                    }
+
+                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                })
+        )
+        .branch(
+            Update::filter_message()
+                .filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with("/setfingerprint-")))
+                .endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+                    let text = msg.text().unwrap_or_default();
+                    if !crate::handlers::admin::is_admin(&msg).await {
+                        bot.send_message(msg.chat.id, "❌ This command is for admins only.").await?;
+                        return Ok(());
+                    }
+                    let fingerprint = text.trim_start_matches("/setfingerprint-").to_string();
+
+                    let exe_dir = std::env::current_exe()?.parent().ok_or_else(|| anyhow::anyhow!("Failed to get parent directory"))?.to_path_buf();
+                    let ytdlp_path = exe_dir.join("lib").join("yt-dlp");
+                    let ytdlp_path_str = ytdlp_path.to_string_lossy().to_string();
+
+                    crate::handlers::fingerprint::set_fingerprint_handler(bot, msg, db_pool, fingerprint, &ytdlp_path_str).await
+                })
         )
         .branch(Update::filter_message().filter_command::<Command>().endpoint(command_handler))
         .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_SETTINGS)).endpoint(settings_text_handler))
@@ -344,12 +545,15 @@ async fn main() -> Result<(), Error> {
             })
         );
 
-    log::info!("Bot initialization completed in {:.2?}", start_time.elapsed());
+    log::info!(
+        "Bot initialization completed in {:.2?}",
+        start_time.elapsed()
+    );
     log::info!("Starting to dispatch updates...");
 
     let mut dispatcher = Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![
-            dialogue::InMemStorage::<BroadcastState>::new(),  // Added for FSM dialogue
+            dialogue::InMemStorage::<BroadcastState>::new(), // Added for FSM dialogue
             fetcher,
             mtproto_uploader,
             db_pool,
@@ -372,7 +576,7 @@ async fn main() -> Result<(), Error> {
         let mut tm = task_manager.lock().await;
         tm.shutdown().await;
     }
-    
+
     log::info!("Bot shutdown complete");
     Ok(())
 }

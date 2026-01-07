@@ -1,8 +1,8 @@
-use std::path::PathBuf;
-use tokio::process::Command;
-use tokio::io::{BufReader, AsyncBufReadExt};
 use anyhow::Result;
 use regex::Regex;
+use std::path::PathBuf;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 
 use crate::utils::progress_bar::ProgressBar;
 
@@ -22,7 +22,14 @@ impl YoutubeFetcher {
         })
     }
 
-pub async fn download_video_from_url(&self,url: String,filename_stem: &str,quality: &str,progress_bar: &mut ProgressBar) -> Result<std::path::PathBuf> {
+    pub async fn download_video_from_url(
+        &self,
+        url: String,
+        filename_stem: &str,
+        quality: &str,
+        fingerprint: Option<String>,
+        progress_bar: &mut ProgressBar,
+    ) -> Result<std::path::PathBuf> {
         log::info!("Starting download for URL: {}", url);
         let start_time = std::time::Instant::now();
 
@@ -34,42 +41,38 @@ pub async fn download_video_from_url(&self,url: String,filename_stem: &str,quali
 
         let mut cmd = Command::new(&self.yt_dlp_path);
         cmd.arg("--extractor-args")
-           .arg("tiktok:skip=feed")
-           .arg("--output")
-           .arg(&output_template)
-           .arg("--no-part")
-           .arg("--no-mtime")
-           .arg("--ffmpeg-location")
-           .arg(&self.ffmpeg_dir)
-           .arg(&url)
-           .arg("--progress")
-           .arg("--newline")
-           .stdout(std::process::Stdio::piped())
-           .stderr(std::process::Stdio::piped());
+            .arg("tiktok:skip=feed")
+            .arg("--output")
+            .arg(&output_template)
+            .arg("--no-part")
+            .arg("--no-mtime")
+            .arg("--ffmpeg-location")
+            .arg(&self.ffmpeg_dir)
+            .arg("--progress")
+            .arg("--newline")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
 
-        match quality {
-            "h265" => {
-                // Сортировка: предпочитаем высокое разрешение, битрейт и h265 (hevc)
-                cmd.arg("--format-sort").arg("res,br,vcodec:hevc");
-                // Формат: лучшее видео с h265 + лучшее аудио, fallback на лучший mp4
-                // Учитываем также bytevc1, используемый TikTok для H.265
-                cmd.arg("--format").arg("bestvideo[vcodec~='hevc|bytevc1'][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]");
-            }
-            "h264" => {
-                // Для h264: использовать только h264 форматы, выбираем лучший доступный
-                cmd.arg("--format").arg("best[ext=mp4][vcodec=h264][height<=1080]/best[ext=mp4][vcodec=h264]/best[ext=mp4]");
-            }
-            "audio" => {
-                // Для аудио: извлекаем аудио в формате mp3
-                cmd.arg("--extract-audio").arg("--audio-format").arg("mp3").arg("--audio-quality").arg("0");
-                // Более широкий формат для аудио, чтобы yt-dlp мог обработать больше типов контента
-                cmd.arg("--format").arg("bestaudio/best[ext=mp4]/best");
-            }
-            _ => {
-                // Fallback для других качеств
-                cmd.arg("--format").arg("best[ext=mp4]");
-            }
+        if let Some(fp) = fingerprint {
+            log::info!("🔐 Applying TLS fingerprint: {}", fp);
+            // Використовуємо об'єднаний формат --impersonate=VALUE
+            cmd.arg(format!("--impersonate={}", fp));
         }
+
+        // Додаємо quality аргументи
+        if quality == "h264" {
+            cmd.arg("-f")
+                .arg("bestvideo[vcodec^=avc]+bestaudio/best[vcodec^=avc]/best");
+        } else if quality == "audio" {
+            cmd.arg("-x").arg("--audio-format").arg("best");
+        } else {
+            cmd.arg("-f").arg("bestvideo+bestaudio/best");
+        }
+
+        cmd.arg(&url);
+
+        // 🔥 ДОДАЄМО ЛОГУВАННЯ КОМАНДИ ДЛЯ ДІАГНОСТИКИ
+        log::info!("🔍 Full yt-dlp command: {:?}", cmd);
 
         let mut child = cmd.spawn()?;
         let stdout = child.stdout.take().expect("stdout not captured");
@@ -134,13 +137,19 @@ pub async fn download_video_from_url(&self,url: String,filename_stem: &str,quali
         let output = child.wait_with_output().await?;
         let elapsed = start_time.elapsed();
 
-        log::debug!("yt-dlp process finished with status: {:?}, stdout len: {}, stderr len: {}", 
-                   output.status, output.stdout.len(), output.stderr.len());
-        
+        log::debug!(
+            "yt-dlp process finished with status: {:?}, stdout len: {}, stderr len: {}",
+            output.status,
+            output.stdout.len(),
+            output.stderr.len()
+        );
+
         if output.status.success() {
             // After download completion, show 80%
-            progress_bar.update(80, Some("⬇️ Download completed")).await?;
-            
+            progress_bar
+                .update(80, Some("⬇️ Download completed"))
+                .await?;
+
             let parent = self.output_dir.clone();
             let stem = PathBuf::from(filename_stem);
 
@@ -163,14 +172,21 @@ pub async fn download_video_from_url(&self,url: String,filename_stem: &str,quali
                 }
             }
 
-            for ext in [".mp4", ".mov", ".webm", ".mkv", ".flv", ".m4a", ".mp3", ".ogg", ".aac"] {
+            for ext in [
+                ".mp4", ".mov", ".webm", ".mkv", ".flv", ".m4a", ".mp3", ".ogg", ".aac",
+            ] {
                 let alt_path = parent.join(format!("{}{}", stem.to_string_lossy(), ext));
                 if alt_path.exists() {
-                    log::info!("Download completed successfully in {:.2?} for: {} with file: {:?}", elapsed, url, alt_path);
+                    log::info!(
+                        "Download completed successfully in {:.2?} for: {} with file: {:?}",
+                        elapsed,
+                        url,
+                        alt_path
+                    );
                     return Ok(alt_path);
                 }
             }
-            
+
             // If we can't find with expected extensions, try to find any file that starts with the stem
             if let Ok(entries) = tokio::fs::read_dir(&parent).await {
                 let mut entry = entries;
@@ -188,20 +204,27 @@ pub async fn download_video_from_url(&self,url: String,filename_stem: &str,quali
                     }
                 }
             }
-            
-            log::error!("Downloaded file not found after successful yt-dlp execution for: {}", url);
+
+            log::error!(
+                "Downloaded file not found after successful yt-dlp execution for: {}",
+                url
+            );
             Err(anyhow::anyhow!("Downloaded file not found"))
         } else {
             let stderr_output = String::from_utf8_lossy(&output.stderr);
             let stdout_output = String::from_utf8_lossy(&output.stdout);
-            
-            log::error!("yt-dlp failed with status {:?} for URL: {}", output.status, url);
+
+            log::error!(
+                "yt-dlp failed with status {:?} for URL: {}",
+                output.status,
+                url
+            );
             log::error!("yt-dlp stderr: {}", stderr_output);
             log::error!("yt-dlp stdout: {}", stdout_output);
-            
+
             // Log the command that was executed for debugging
             log::debug!("yt-dlp command for quality '{}': url: {}", quality, url);
-            
+
             // Return more informative error
             Err(anyhow::anyhow!("yt-dlp failed: {}", stderr_output.trim()))
         }
@@ -262,12 +285,12 @@ mod tests {
     fn test_parse_size_string_mb() {
         // MB is 1000^2, not 1024^2 (MiB)
         assert_eq!(parse_size_string("10.0MB"), 10_000_000); // 10.0 * 1000^2
-        assert_eq!(parse_size_string("5.0MB"), 5_000_000);   // 5.0 * 1000^2
+        assert_eq!(parse_size_string("5.0MB"), 5_000_000); // 5.0 * 1000^2
     }
 
     #[test]
     fn test_parse_size_string_gb() {
-        assert_eq!(parse_size_string("1.0GB"), 1_000_000_000);   // 1.0 * 1000^3
+        assert_eq!(parse_size_string("1.0GB"), 1_000_000_000); // 1.0 * 1000^3
     }
 
     #[test]

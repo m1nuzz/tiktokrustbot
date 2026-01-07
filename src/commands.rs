@@ -1,7 +1,10 @@
 use teloxide::utils::command::BotCommands;
 
 #[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase", description = "These commands are supported:")]
+#[command(
+    rename_rule = "lowercase",
+    description = "These commands are supported:"
+)]
 pub enum Command {
     #[command(description = "display this text.")]
     Help,
@@ -9,14 +12,17 @@ pub enum Command {
     Start,
 }
 
-#[derive(BotCommands, Clone)]
+#[derive(BotCommands, Clone, Debug)]
+#[command(rename_rule = "lowercase")]
 pub enum AdminCommand {
-    #[command(description = "add a channel: /addchannel <id_name>")]
-    AddChannel(String),
+    #[command(description = "add a channel: /addchannel <id>,<name>")]
+    AddChannel { id_name: String },
     #[command(description = "delete a channel: /delchannel <id>")]
-    DelChannel(String),
+    DelChannel { id: String },
     #[command(description = "list all subscription channels.")]
     ListChannels,
     #[command(description = "toggle mandatory subscription.")]
     ToggleSubscription,
+    #[command(description = "List available TLS fingerprints")]
+    Fingerprint,
 }
