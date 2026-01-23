@@ -161,7 +161,7 @@ impl YoutubeFetcher {
                     if let Ok(file_type) = file.file_type().await {
                         if file_type.is_file() {
                             if let Some(filename) = file.file_name().to_str() {
-                                if filename.starts_with(stem.to_string_lossy().as_ref()) {
+                                if filename.starts_with(&*stem.to_string_lossy()) {
                                     let path = parent.join(filename);
                                     log::info!("Found unexpected file for download: {:?}", path);
                                     return Ok(path);
@@ -194,7 +194,7 @@ impl YoutubeFetcher {
                     if let Ok(file_type) = file.file_type().await {
                         if file_type.is_file() {
                             if let Some(filename) = file.file_name().to_str() {
-                                if filename.starts_with(stem.to_string_lossy().as_ref()) {
+                                if filename.starts_with(&*stem.to_string_lossy()) {
                                     let path = parent.join(filename);
                                     log::info!("Found unexpected file for download: {:?}", path);
                                     return Ok(path);
