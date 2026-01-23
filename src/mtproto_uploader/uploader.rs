@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::mtproto_uploader::constants::SESSION_FILE;
 
-// Добавляем импорт для tl функций
+// Add import for tl functions
 use grammers_tl_types as tl;
 
 #[derive(Clone)]
@@ -27,7 +27,7 @@ impl MTProtoUploader {
 
         let session = Session::load_file_or_create(SESSION_FILE)?;
         
-        // Настройка параметров инициализации
+        // Configure initialization parameters
         let params = InitParams {
             device_model: "Desktop".to_string(),
             system_version: "Windows 10".to_string(),
@@ -53,17 +53,17 @@ impl MTProtoUploader {
         }
         client.session().save_to_file(SESSION_FILE)?;
 
-        // Обернем клиента в Arc<Mutex<>> для возможности переподключения
+        // Wrap the client in Arc<Mutex<>> for reconnection capability
         let client = Arc::new(Mutex::new(client));
 
-        // Запускаем keep-alive пинг в отдельной задаче
+        // Run keep-alive ping in a separate task
         let client_keepalive = client.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 минут
+            let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 minutes
             loop {
                 interval.tick().await;
 
-                // Попробуем выполнить ping
+                // Try to execute ping
                 let result = {
                     let client_guard = client_keepalive.lock().await;
                     client_guard.invoke(&tl::functions::updates::GetState {}).await
@@ -74,7 +74,7 @@ impl MTProtoUploader {
                     Err(e) => {
                         log::error!("Keep-alive ping failed: {:?}, reconnecting...", e);
                         
-                        // Попытка переподключения
+                        // Reconnection attempt
                         if let Err(reconnect_err) = MTProtoUploader::reconnect_client(&client_keepalive).await {
                             log::error!("Reconnection failed: {:?}", reconnect_err);
                         } else {
@@ -115,13 +115,13 @@ impl MTProtoUploader {
             params,
         }).await?;
 
-        // Проверим авторизацию и при необходимости переподключимся как бот
+        // Check authorization and reconnect as a bot if necessary
         if !new_client.is_authorized().await? {
             new_client.bot_sign_in(&bot_token).await?;
         }
         new_client.session().save_to_file(SESSION_FILE)?;
         
-        // Заменим старый клиент на новый
+        // Replace the old client with a new one
         {
             let mut client_guard = client.lock().await;
             *client_guard = new_client;
@@ -162,8 +162,8 @@ impl MTProtoUploader {
             }
         }
         
-        // Если мы дошли до этой точки, то это ошибка, которая не связана с подключением
-        // или все попытки переподключения были безуспешны
+        // If we have reached this point, then this is an error that is not related to the connection
+        // or all reconnection attempts were unsuccessful
         Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Operation failed after retries")))
     }
 }

@@ -35,7 +35,7 @@ pub async fn admin_panel_text_handler(
     Ok(())
 }
 
-// Новые обработчики
+// New handlers
 pub async fn stats_text_handler(
     bot: Bot,
     msg: Message,
@@ -143,7 +143,7 @@ pub async fn all_users_text_handler(
         return Ok(());
     }
 
-    // ✅ SQL запрос с LEFT JOIN и COUNT
+    // SQL query with LEFT JOIN and COUNT
     let result = db_pool.execute_with_timeout(|conn| {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
 

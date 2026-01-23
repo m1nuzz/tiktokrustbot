@@ -4,7 +4,7 @@ use std::process::Command;
 use std::sync::Arc;
 use teloxide::prelude::*;
 
-/// Парсить вивід yt-dlp --list-impersonate-targets
+/// Parse the output of yt-dlp --list-impersonate-targets
 fn parse_impersonate_targets(output: &str) -> Vec<(String, String)> {
     let mut targets = Vec::new();
     let mut lines = output.lines().skip(3);
@@ -22,7 +22,7 @@ fn parse_impersonate_targets(output: &str) -> Vec<(String, String)> {
                     format!("{}:{}", client, os)
                 };
 
-                // 🔥 ДОДАЛИ .to_lowercase() - це ключова зміна!
+                // Added .to_lowercase() - this is a key change!
                 targets.push((target.to_lowercase(), format!("{} {}", target, source)));
             }
         }

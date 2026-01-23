@@ -34,10 +34,10 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
 const TELEGRAM_BOT_API_FILE_LIMIT: u64 = 48 * 1024 * 1024; // 48MB
 
-// 🔥 ДОДАЙ ЦЮ ФУНКЦІЮ НА ПОЧАТКУ ФАЙЛУ
+// Add this function at the beginning of the file
 fn extract_url_from_text(text: &str) -> Option<String> {
-    // Regex для пошуку TikTok URL
-    let re = Regex::new(r"https?://(?:www\.|vm\.)?tiktok\.com/[^\s]+").unwrap();
+    // Regex for searching TikTok URL
+    let re = Regex::new(r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/[^\s]+").unwrap();
 
     if let Some(captures) = re.find(text) {
         Some(captures.as_str().to_string())
@@ -104,7 +104,7 @@ pub async fn link_handler(
     }
 
     if text.contains("tiktok.com") {
-        // 🔥 ВИТЯГУЄМО ТІЛЬКИ URL, А НЕ ВЕСЬ ТЕКСТ!
+        // Extract only the URL, not the entire text!
         let url = match extract_url_from_text(text) {
             Some(url) => url,
             None => {

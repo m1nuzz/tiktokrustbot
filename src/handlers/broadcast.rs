@@ -14,7 +14,7 @@ pub enum BroadcastState {
     #[default]
     Idle,
     WaitingForMessage,
-    WaitingForConfirmation { message: String },  // Новое состояние!
+    WaitingForConfirmation { message: String },  // New state!
 }
 
 pub async fn start_broadcast(
@@ -58,7 +58,7 @@ pub async fn receive_broadcast_message(
             return Ok(());
         }
 
-        // ✅ Показываем preview админу
+        // Show preview to admin
         bot.send_message(msg.chat.id, "📝 Preview:")
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
@@ -68,7 +68,7 @@ pub async fn receive_broadcast_message(
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        // ✅ Кнопки подтверждения
+        // Confirmation buttons
         let keyboard = InlineKeyboardMarkup::new(vec![
             vec![
                 InlineKeyboardButton::callback("✅ Send to all", "broadcast_confirm"),
@@ -99,7 +99,7 @@ pub async fn handle_broadcast_confirmation(
     message: String,
 ) -> HandlerResult {
     if let Some(data) = &q.data {
-        // Удаляем кнопки
+        // Delete buttons
         if let Some(msg) = &q.message {
             let _ = bot.edit_message_reply_markup(msg.chat().id, msg.id()).await;
         }
@@ -127,7 +127,7 @@ pub async fn handle_broadcast_confirmation(
                     .await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-                // Получаем пользователей
+                // Get users
                 let users = db_pool.execute_with_timeout(|conn| {
                     let mut stmt = conn.prepare("SELECT telegram_id FROM users")?;
                     let users_iter = stmt.query_map([], |row| row.get::<_, i64>(0))?;

@@ -52,10 +52,10 @@ impl ProgressBar {
         let mut inner = self.inner.lock().await;
         let now = Instant::now();
 
-        // Проверяем, нужно ли обновление
+        // Check if an update is needed
         let should_update = if let Some(last) = inner.last_update {
             let time_passed = now.duration_since(last) >= MIN_UPDATE_INTERVAL;
-            let significant_change = percentage.saturating_sub(inner.last_percentage) >= 5; // Минимум 5% изменения
+            let significant_change = percentage.saturating_sub(inner.last_percentage) >= 5; // Minimum 5% change
             let is_completion = percentage == 100;
             
             time_passed && (significant_change || is_completion) || is_completion
@@ -83,27 +83,27 @@ impl ProgressBar {
                 Err(e) => {
                     let error_str = e.to_string();
                     
-                    // Сброс при инвалидном ID
+                    // Reset on invalid ID
                     if error_str.contains("MESSAGE_ID_INVALID") 
                         || error_str.contains("message to edit not found")
                         || error_str.contains("message can't be edited") {
                         log::warn!("Progress message invalidated, creating new one");
                         inner.message_id = None;
                         
-                        // Создать новое сообщение только если не завершено
+                        // Create a new message only if not completed
                         if percentage < 100 {
                             if let Ok(msg) = inner.bot.send_message(inner.chat_id, progresstext).await {
                                 inner.message_id = Some(msg.id);
                             }
                         }
                     } else if !error_str.contains("message is not modified") {
-                        // Логируем только реальные ошибки
+                        // Log only real errors
                         log::debug!("Progress update skipped: {}", e);
                     }
                 }
             }
         } else {
-            // Создать новое сообщение
+            // Create a new message
             if let Ok(msg) = inner.bot.send_message(inner.chat_id, progresstext).await {
                 inner.message_id = Some(msg.id);
             }

@@ -193,15 +193,15 @@ async fn main() -> Result<(), Error> {
         return Err(anyhow::Error::msg("ffprobe not available"));
     }
 
-    // Настройка автообновления ПОСЛЕ ensure_binaries
-    let auto_updater = Arc::new(auto_update::AutoUpdater::new(libraries_dir.clone(), 30)); // Проверка каждые 30 минут
+    // Configure auto-update AFTER ensure_binaries
+    let auto_updater = Arc::new(auto_update::AutoUpdater::new(libraries_dir.clone(), 30)); // Check every 30 minutes
 
-    // Первоначальная проверка обновлений
+    // Initial check for updates
     if let Err(e) = auto_updater.check_for_updates().await {
         log::warn!("Initial update check failed: {}", e);
     }
 
-    // Запускаем периодическую проверку в фоне
+    // Run periodic check in the background
     let updater_clone = Arc::clone(&auto_updater);
     tokio::spawn(async move {
         if let Err(e) = updater_clone.start_periodic_checks().await {
@@ -286,7 +286,7 @@ async fn main() -> Result<(), Error> {
             Update::filter_message()
                 .filter_command::<AdminCommand>()
                 .endpoint(|bot: Bot, msg: Message, cmd: AdminCommand, db_pool: Arc<DatabasePool>| async move {
-                    // Отримуємо шлях до yt-dlp
+                    // Get the path to yt-dlp
                     let exe_dir = std::env::current_exe()?
                         .parent()
                         .ok_or_else(|| anyhow::anyhow!("Failed to get parent directory"))?
@@ -294,7 +294,7 @@ async fn main() -> Result<(), Error> {
                     let ytdlp_path = exe_dir.join("lib").join("yt-dlp");
                     let ytdlp_path_str = ytdlp_path.to_string_lossy().to_string();
 
-                    // Перевіряємо чи це адмін
+                    // Check if it's an admin
                     if !crate::handlers::admin::is_admin(&msg).await {
                         bot.send_message(msg.chat.id, "This command is for admins only.").await?;
                         return Ok(());
@@ -514,7 +514,7 @@ async fn main() -> Result<(), Error> {
                     msg.text().unwrap_or("")
                 );
 
-                // Проверка, не обрабатывается ли уже
+                // Check if already being processed
                 {
                     let mut processing = PROCESSING.lock().await;
                     if processing.contains(&message_key) {
@@ -535,7 +535,7 @@ async fn main() -> Result<(), Error> {
                         upload_semaphore,
                     ).await;
 
-                    // Убрать из processing после завершения
+                    // Remove from processing after completion
                     {
                         let mut processing = PROCESSING.lock().await;
                         processing.remove(&message_key);
@@ -543,12 +543,12 @@ async fn main() -> Result<(), Error> {
 
                     if let Err(e) = result {
                         log::error!("Link handler error: {}", e);
-                        // Опционально: отправить сообщение об ошибке пользователю
+                        // Optionally: send an error message to the user
                         let _ = bot.send_message(msg.chat.id, "Failed to process video").await;
                     }
                 });
 
-                // НЕМЕДЛЕННО вернуть Ok(), чтобы Telegram не ретраил update
+                // IMMEDIATELY return Ok() so that Telegram does not retry the update
                 Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
             })
         );

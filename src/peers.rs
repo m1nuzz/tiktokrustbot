@@ -12,18 +12,18 @@ pub async fn resolve_peer(
     // Access the actual client through the mutex
     let actual_client = client.lock().await;
 
-    // 1) Basic group: отрицательный id, но не канал (-100...)
+    // 1) Basic group: negative id, but not a channel (-100...)
     if chat_id < 0 && !format!("{}", chat_id).starts_with("-100") {
-        let raw_id = chat_id.abs() as i32; // basic group id без -100 префикса
+        let raw_id = chat_id.abs() as i32; // basic group id without -100 prefix
         return Ok(tl::enums::InputPeer::Chat(tl::types::InputPeerChat { chat_id: raw_id as i64 }));
     }
 
-    // 2) Пользователь или канал/супергруппа: резолвим по username (ботам dialogs запрещён)
+    // 2) User or channel/supergroup: resolve by username (dialogs are forbidden for bots)
     if let Some(un) = username {
-        // contacts.resolveUsername доступен ботам
+        // contacts.resolveUsername is available for bots
         let res = actual_client.invoke(&tl::functions::contacts::ResolveUsername { username: un.to_string() }).await.map_err(|e| anyhow!("contacts.resolveUsername failed for @{}: {:?}", un, e))?;
         let tl::enums::contacts::ResolvedPeer::Peer(r) = res;
-            // Пытаемся сопоставить возвращённый peer с users/chats чтобы достать access_hash
+            // Trying to match the returned peer with users/chats to get the access_hash
             match r.peer {
                 tl::enums::Peer::User(pu) => {
                     if let Some(u) = r.users.into_iter().find_map(|u| match u {

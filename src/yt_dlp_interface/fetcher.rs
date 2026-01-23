@@ -55,11 +55,11 @@ impl YoutubeFetcher {
 
         if let Some(fp) = fingerprint {
             log::info!("🔐 Applying TLS fingerprint: {}", fp);
-            // Використовуємо об'єднаний формат --impersonate=VALUE
+            // Use the combined format --impersonate=VALUE
             cmd.arg(format!("--impersonate={}", fp));
         }
 
-        // Додаємо quality аргументи
+        // Add quality arguments
         if quality == "h264" {
             cmd.arg("-f")
                 .arg("bestvideo[vcodec^=avc]+bestaudio/best[vcodec^=avc]/best");
@@ -71,7 +71,7 @@ impl YoutubeFetcher {
 
         cmd.arg(&url);
 
-        // 🔥 ДОДАЄМО ЛОГУВАННЯ КОМАНДИ ДЛЯ ДІАГНОСТИКИ
+        // Add command logging for diagnostics
         log::info!("🔍 Full yt-dlp command: {:?}", cmd);
 
         let mut child = cmd.spawn()?;
