@@ -505,7 +505,9 @@ async fn main() -> Result<(), Error> {
             }))
         .branch(Update::filter_message()
             .filter(|msg: Message| {
-                msg.text().map(|t| !crate::handlers::ui::is_system_button(t)).unwrap_or(false)
+                msg.text().map(|t| {
+                    !crate::handlers::ui::is_system_button(t) || t == "Admin Panel"
+                }).unwrap_or(false)
             })
             .endpoint(|bot: Bot, msg: Message, fetcher: Arc<YoutubeFetcher>, mtproto_uploader: Arc<MTProtoUploader>, db_pool: Arc<DatabasePool>, task_manager: Arc<tokio::sync::Mutex<TaskManager>>, upload_semaphore: Arc<tokio::sync::Semaphore>| async move {
                 let message_key = format!("{}:{}:{}",
