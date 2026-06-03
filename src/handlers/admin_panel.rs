@@ -9,7 +9,8 @@ pub const BTN_BROADCAST: &str = "📢 Broadcast";
 
 pub async fn admin_panel_text_handler(
     bot: Bot,
-    msg: Message
+    msg: Message,
+    db_pool: Arc<DatabasePool>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
         bot.send_message(msg.chat.id, "This option is for admins only.")
@@ -18,11 +19,16 @@ pub async fn admin_panel_text_handler(
         return Ok(());
     }
 
+    let ads_enabled = match db_pool.get_setting("ads_enabled").await {
+        Ok(val) => val == "true",
+        Err(_) => true, // Default
+    };
+
     let keyboard = KeyboardMarkup::new(vec![
-        vec![KeyboardButton::new("Stats"), KeyboardButton::new("Top 10")],
-        vec![KeyboardButton::new("All users")],
-        vec![KeyboardButton::new(BTN_BROADCAST)],
+        vec![KeyboardButton::new("📊 Stats"), KeyboardButton::new("📢 Broadcast")],
+        vec![KeyboardButton::new("🏆 Top 10"), KeyboardButton::new("👥 All users")],
         vec![KeyboardButton::new(BTN_SUBSCRIPTION)],
+        vec![KeyboardButton::new(format!("{}{}", crate::handlers::ui::BTN_TOGGLE_ADS, if ads_enabled { "ON ✅" } else { "OFF ❌" }))],
         vec![KeyboardButton::new(BTN_BACK)],
     ])
     .resize_keyboard();

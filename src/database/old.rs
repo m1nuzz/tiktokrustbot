@@ -107,7 +107,15 @@ pub fn init_database() -> Result<()> {
         (),
     )?;
     conn.execute(
+        "CREATE TABLE IF NOT EXISTS pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        (),
+    )?;
+    conn.execute(
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('subscription_required', 'true')",
+        (),
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('ads_enabled', 'true')",
         (),
     )?;
     Ok(())

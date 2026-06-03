@@ -43,6 +43,7 @@ pub mod mtproto_uploader;
 pub mod peers;
 mod telegram_bot_api_uploader;
 mod utils;
+mod web_server;
 mod yt_dlp_interface;
 
 #[tokio::main]
@@ -251,6 +252,25 @@ async fn main() -> Result<(), Error> {
 
     let bot = Bot::with_client(bot_token, reqwest_client);
 
+    // Start web server
+    let web_state = crate::web_server::AppState {
+        db: db_pool.clone(),
+        bot: bot.clone(),
+        fetcher: fetcher.clone(),
+        mtproto_uploader: mtproto_uploader.clone(),
+        task_manager: task_manager.clone(),
+        upload_semaphore: upload_semaphore.clone(),
+    };
+    
+    let web_port = env::var("WEB_SERVER_PORT")
+        .unwrap_or_else(|_| "8088".to_string())
+        .parse()
+        .unwrap_or(8088);
+    
+    tokio::spawn(async move {
+        crate::web_server::start_web_server(web_state, web_port).await;
+    });
+
     let handler = dialogue::enter::<Update, dialogue::InMemStorage<BroadcastState>, BroadcastState, _>()
         .branch(
             Update::filter_message()
@@ -455,7 +475,26 @@ async fn main() -> Result<(), Error> {
         .branch(Update::filter_message().filter_command::<Command>().endpoint(command_handler))
         .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_SETTINGS)).endpoint(settings_text_handler))
         .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_FORMAT)).endpoint(format_text_handler))
-        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_ADMIN_PANEL)).endpoint(admin_panel_text_handler))
+        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_ADMIN_PANEL)).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+            admin_panel_text_handler(bot, msg, db_pool).await
+        }))
+        .branch(Update::filter_message().filter(|msg: Message| {
+            msg.text().map_or(false, |t| t.starts_with(crate::handlers::ui::BTN_TOGGLE_ADS))
+        }).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+            if !crate::handlers::admin::is_admin(&msg).await {
+                return Ok(());
+            }
+
+            let current = match db_pool.get_setting("ads_enabled").await {
+                Ok(val) => val == "true",
+                Err(_) => true,
+            };
+            let new_val = !current;
+            db_pool.set_setting("ads_enabled", if new_val { "true" } else { "false" }).await?;
+            
+            // Refresh admin panel
+            admin_panel_text_handler(bot, msg, db_pool).await
+        }))
         .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("Stats")).endpoint(stats_text_handler))
         .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("Top 10")).endpoint(top10_text_handler))
         .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("All users")).endpoint(all_users_text_handler))

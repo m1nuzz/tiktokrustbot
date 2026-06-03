@@ -129,4 +129,138 @@ impl DatabasePool {
         cache.pop(&user_id);
         log::info!("Invalidated cached quality preference for user {}", user_id);
     }
+
+    /// Get a setting from the settings table
+    pub async fn get_setting(&self, key: &str) -> Result<String, anyhow::Error> {
+        let key_owned = key.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key_owned],
+                |row| row.get(0)
+            )
+        }).await.map_err(|e| anyhow::anyhow!("Failed to get setting {}: {}", key, e))
+    }
+
+    /// Set a setting in the settings table
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<(), anyhow::Error> {
+        let key_owned = key.to_string();
+        let value_owned = value.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                params![key_owned, value_owned],
+            )?;
+            Ok(())
+        }).await.map_err(|e| anyhow::anyhow!("Failed to set setting {}: {}", key, e))
+    }
+
+    /// Create a pending download record and return its unique ID (ymid)
+    pub async fn create_pending_download(&self, user_id: i64, video_url: &str) -> Result<String, anyhow::Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let id_owned = id.clone();
+        let video_url_owned = video_url.to_string();
+        
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url) VALUES (?1, ?2, ?3)",
+                params![id_owned, user_id, video_url_owned],
+            )?;
+            Ok(())
+        }).await.map(|_| id).map_err(|e| anyhow::anyhow!("Failed to create pending download: {}", e))
+    }
+
+    /// Get pending download data and mark it as completed
+    pub async fn get_and_complete_download(&self, id: &str) -> Result<(i64, String), anyhow::Error> {
+        let id_owned = id.to_string();
+        
+        self.execute_with_timeout(move |conn| {
+            let (user_id, url): (i64, String) = conn.query_row(
+                "SELECT user_id, video_url FROM pending_downloads WHERE id = ?1 AND status = 'pending'",
+                params![id_owned],
+                |row| Ok((row.get(0)?, row.get(1)?))
+            )?;
+            
+            conn.execute(
+                "UPDATE pending_downloads SET status = 'completed' WHERE id = ?1",
+                params![id_owned],
+            )?;
+            
+            Ok((user_id, url))
+        }).await.map_err(|e| anyhow::anyhow!("Failed to complete pending download {}: {}", id, e))
+    }
+
+    /// Mark a pending download as verified (ad watched but not yet claimed)
+    pub async fn mark_as_verified(&self, id: &str) -> Result<(), anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "UPDATE pending_downloads SET status = 'verified' WHERE id = ?1 AND status = 'pending'",
+                params![id_owned],
+            )?;
+            Ok(())
+        }).await.map_err(|e| anyhow::anyhow!("Failed to verify download {}: {}", id, e))
+    }
+
+    /// Claim a verified download and trigger completion
+    pub async fn claim_verified_download(&self, id: &str) -> Result<(i64, String), anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let (user_id, url): (i64, String) = conn.query_row(
+                "SELECT user_id, video_url FROM pending_downloads WHERE id = ?1 AND status = 'verified'",
+                params![id_owned],
+                |row| Ok((row.get(0)?, row.get(1)?))
+            )?;
+            
+            conn.execute(
+                "UPDATE pending_downloads SET status = 'completed' WHERE id = ?1",
+                params![id_owned],
+            )?;
+            
+            Ok((user_id, url))
+        }).await.map_err(|e| anyhow::anyhow!("Failed to claim verified download {}: {}", id, e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    async fn setup_test_db() -> (DatabasePool, NamedTempFile) {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap().to_string();
+        let pool = DatabasePool::new(db_path, 1);
+        
+        // Initialize settings table
+        pool.execute_with_timeout(|conn| {
+            conn.execute(
+                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                (),
+            )?;
+            Ok(())
+        }).await.unwrap();
+        
+        (pool, temp_file)
+    }
+
+    #[tokio::test]
+    async fn test_settings_get_set() {
+        let (pool, _file) = setup_test_db().await;
+        
+        pool.set_setting("test_key", "test_value").await.unwrap();
+        let value = pool.get_setting("test_key").await.unwrap();
+        assert_eq!(value, "test_value");
+        
+        pool.set_setting("test_key", "new_value").await.unwrap();
+        let value = pool.get_setting("test_key").await.unwrap();
+        assert_eq!(value, "new_value");
+    }
+
+    #[tokio::test]
+    async fn test_get_nonexistent_setting() {
+        let (pool, _file) = setup_test_db().await;
+        let result = pool.get_setting("ghost").await;
+        assert!(result.is_err());
+    }
 }
