@@ -37,11 +37,13 @@ pub fn init_database() -> Result<()> {
     let db_path = get_database_path();
     let conn = Connection::open(db_path)?;
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264')",
+        "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME)",
         (),
     )?;
     // Add the quality_preference column to the users table if it doesn't exist, ignoring the error if it does.
     let _ = conn.execute("ALTER TABLE users ADD COLUMN quality_preference TEXT DEFAULT 'h264'", ());
+    // Add the premium_until column to the users table if it doesn't exist.
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN premium_until DATETIME", ());
 
     // Create the table with the new format
     conn.execute(

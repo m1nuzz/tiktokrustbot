@@ -1,4 +1,3 @@
-
 use grammers_client::{Client, Config};
 use grammers_session::Session;
 use std::env;
@@ -25,6 +24,14 @@ impl MTProtoUploader {
         let api_id: i32 = env::var("TELEGRAM_API_ID")?.parse()?;
         let api_hash = env::var("TELEGRAM_API_HASH")?;
 
+        let is_test_mode = env::var("TEST_MODE")
+            .unwrap_or_else(|_| "false".to_string())
+            .to_lowercase() == "true";
+
+        if is_test_mode && std::path::Path::new(SESSION_FILE).exists() {
+            log::warn!("⚠️  TEST MODE detected. Using session file: {}", SESSION_FILE);
+        }
+
         let session = Session::load_file_or_create(SESSION_FILE)?;
         
         // Configure initialization parameters
@@ -35,7 +42,12 @@ impl MTProtoUploader {
             system_lang_code: "en".to_string(),
             lang_code: "en".to_string(),
             catch_up: false,
-            server_addr: None,
+            // Connect to Test DC2 (Amsterdam) if TEST_MODE is enabled
+            server_addr: if is_test_mode {
+                Some("149.154.167.40:443".parse().unwrap())
+            } else {
+                None
+            },
             flood_sleep_threshold: 60,
             update_queue_limit: Some(100),
             ..Default::default()
@@ -93,6 +105,10 @@ impl MTProtoUploader {
         let api_id: i32 = env::var("TELEGRAM_API_ID")?.parse()?;
         let api_hash = env::var("TELEGRAM_API_HASH")?;
         
+        let is_test_mode = env::var("TEST_MODE")
+            .unwrap_or_else(|_| "false".to_string())
+            .to_lowercase() == "true";
+        
         let session = Session::load_file_or_create(SESSION_FILE)?;
         
         let params = InitParams {
@@ -102,7 +118,11 @@ impl MTProtoUploader {
             system_lang_code: "en".to_string(),
             lang_code: "en".to_string(),
             catch_up: false,
-            server_addr: None,
+            server_addr: if is_test_mode {
+                Some("149.154.167.40:443".parse().unwrap())
+            } else {
+                None
+            },
             flood_sleep_threshold: 60,
             update_queue_limit: Some(100),
             ..Default::default()

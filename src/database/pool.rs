@@ -170,26 +170,6 @@ impl DatabasePool {
         }).await.map(|_| id).map_err(|e| anyhow::anyhow!("Failed to create pending download: {}", e))
     }
 
-    /// Get pending download data and mark it as completed
-    pub async fn get_and_complete_download(&self, id: &str) -> Result<(i64, String), anyhow::Error> {
-        let id_owned = id.to_string();
-        
-        self.execute_with_timeout(move |conn| {
-            let (user_id, url): (i64, String) = conn.query_row(
-                "SELECT user_id, video_url FROM pending_downloads WHERE id = ?1 AND status = 'pending'",
-                params![id_owned],
-                |row| Ok((row.get(0)?, row.get(1)?))
-            )?;
-            
-            conn.execute(
-                "UPDATE pending_downloads SET status = 'completed' WHERE id = ?1",
-                params![id_owned],
-            )?;
-            
-            Ok((user_id, url))
-        }).await.map_err(|e| anyhow::anyhow!("Failed to complete pending download {}: {}", id, e))
-    }
-
     /// Mark a pending download as verified (ad watched but not yet claimed)
     pub async fn mark_as_verified(&self, id: &str) -> Result<(), anyhow::Error> {
         let id_owned = id.to_string();
@@ -219,6 +199,34 @@ impl DatabasePool {
             
             Ok((user_id, url))
         }).await.map_err(|e| anyhow::anyhow!("Failed to claim verified download {}: {}", id, e))
+    }
+
+    /// Check if user has active premium status
+    pub async fn is_user_premium(&self, user_id: i64) -> bool {
+        let result = self.execute_with_timeout(move |conn| {
+            let is_premium: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE telegram_id = ?1 AND premium_until > datetime('now'))",
+                params![user_id],
+                |row| row.get(0)
+            )?;
+            Ok(is_premium)
+        }).await;
+
+        result.unwrap_or(false)
+    }
+
+    /// Set or extend premium status for user
+    pub async fn set_user_premium(&self, user_id: i64, days: i64) -> Result<(), anyhow::Error> {
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "INSERT INTO users (telegram_id, premium_until) 
+                 VALUES (?1, datetime('now', '+' || ?2 || ' days'))
+                 ON CONFLICT(telegram_id) DO UPDATE SET 
+                 premium_until = datetime(MAX(COALESCE(premium_until, datetime('now')), datetime('now')), '+' || ?2 || ' days')",
+                params![user_id, days],
+            )?;
+            Ok(())
+        }).await.map_err(|e| anyhow::anyhow!("Failed to set premium for user {}: {}", user_id, e))
     }
 }
 

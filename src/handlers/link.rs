@@ -145,6 +145,8 @@ pub async fn link_handler(
 
         // Mini App Ad invitation
         let is_user_admin = is_admin(&msg).await;
+        let is_premium = db_pool.is_user_premium(user_id as i64).await;
+
         let ads_enabled = {
             let module_enabled = std::env::var("MONETAG_MODULE_ENABLED")
                 .map(|v| v.to_lowercase() == "true")
@@ -155,6 +157,9 @@ pub async fn link_handler(
                 false
             } else if is_user_admin {
                 log::info!("Ads disabled: User is admin");
+                false
+            } else if is_premium {
+                log::info!("Ads disabled: User {} has Premium", user_id);
                 false
             } else {
                 let db_status = db_pool.get_setting("ads_enabled").await.map(|val| val == "true").unwrap_or(true);
@@ -169,7 +174,7 @@ pub async fn link_handler(
             if !webapp_url.is_empty() {
                 if let Ok(url_obj) = webapp_url.parse::<reqwest::Url>() {
                     // Create pending download
-                    let ymid = match db_pool.create_pending_download(user_id, &url).await {
+                    let ymid = match db_pool.create_pending_download(user_id as i64, &url).await {
                         Ok(id) => id,
                         Err(e) => {
                             log::error!("Failed to create pending download: {}", e);
@@ -199,6 +204,17 @@ pub async fn link_handler(
                         .await {
                             Ok(_) => {
                                 log::info!("Ad invitation sent successfully to {}", user_id);
+                                
+                                // Send Premium Offer as a second message
+                                let premium_price = std::env::var("PREMIUM_STARS_PRICE").unwrap_or_else(|_| "50".to_string());
+                                let premium_kb = InlineKeyboardMarkup::new(vec![
+                                    vec![InlineKeyboardButton::callback(format!("💎 Buy Premium for {} Stars", premium_price), "buy_premium")]
+                                ]);
+                                
+                                let _ = bot.send_message(msg.chat.id, "✨ Remove ad (Buy Premium) for 1 month!")
+                                    .reply_markup(premium_kb)
+                                    .await;
+
                                 // STOP HERE. Do not download yet.
                                 // Cleanup URL_PROCESSING since we're not actually processing it yet (it's pending)
                                 {
@@ -219,7 +235,7 @@ pub async fn link_handler(
             }
         }
 
-        // Proceed normally (admins or ads disabled)
+        // Proceed normally (admins or ads disabled or premium)
         process_video_request(
             bot,
             user_id,

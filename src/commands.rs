@@ -23,6 +23,8 @@ pub enum AdminCommand {
     ListChannels,
     #[command(description = "toggle mandatory subscription.")]
     ToggleSubscription,
+    #[command(description = "Test Premium activation (Admin only)")]
+    FakePayment,
     #[command(description = "List available TLS fingerprints")]
     Fingerprint,
 }
