@@ -209,15 +209,8 @@ pub async fn link_handler(
                             Ok(_) => {
                                 log::info!("Ad invitation sent successfully to {}", user_id);
                                 
-                                // Send Premium Offer as a second message
-                                let premium_price = std::env::var("PREMIUM_STARS_PRICE").unwrap_or_else(|_| "50".to_string());
-                                let premium_kb = InlineKeyboardMarkup::new(vec![
-                                    vec![InlineKeyboardButton::callback(format!("💎 Buy Premium for {} Stars", premium_price), "buy_premium")]
-                                ]);
-                                
-                                let _ = bot.send_message(msg.chat.id, "✨ Remove ad (Buy Premium) for 1 month!")
-                                    .reply_markup(premium_kb)
-                                    .await;
+                                // Send Premium Invoice directly
+                                let _ = crate::handlers::payments::send_premium_invoice(bot.clone(), msg.chat.id).await;
 
                                 // STOP HERE. Do not download yet.
                                 // Cleanup URL_PROCESSING since we're not actually processing it yet (it's pending)

@@ -75,6 +75,9 @@ fn build_bot(is_test_mode: bool, client: reqwest::Client) -> (Bot, String) {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     // 1. Initialize logger IMMEDIATELY
+    if std::env::var("RUST_LOG").is_err() {
+        unsafe { std::env::set_var("RUST_LOG", "info"); }
+    }
     pretty_env_logger::init();
     log::info!("Starting TikTok downloader bot...");
     let start_time = std::time::Instant::now();
@@ -269,6 +272,15 @@ async fn main() -> Result<(), Error> {
                                 bot.send_message(msg.chat.id, "✅ [TEST] Premium activated!").await?;
                             }
                         }
+                        AdminCommand::ResetPremium => {
+                            if let Some(user) = msg.from {
+                                let user_id = user.id.0 as i64;
+                                let _ = db_pool.execute_with_timeout(move |conn| {
+                                    conn.execute("UPDATE users SET premium_until = datetime('now', '-1 day') WHERE telegram_id = ?1", [user_id])
+                                }).await;
+                                bot.send_message(msg.chat.id, "🔄 [TEST] Premium status has been reset (expired).").await?;
+                            }
+                        }
                     }
                     Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
                 })
@@ -286,73 +298,11 @@ async fn main() -> Result<(), Error> {
             admin_panel_text_handler(bot, msg, db_pool).await
         }))
         .branch(Update::filter_callback_query().filter(|q: CallbackQuery| q.data == Some("buy_premium".to_string())).endpoint(|bot: Bot, q: CallbackQuery| async move {
-            let price: u32 = std::env::var("PREMIUM_STARS_PRICE").unwrap_or_else(|_| "50".to_string()).parse().unwrap_or(50);
-
-            // For Telegram Stars (XTR), provider_token is set via a setter as None
-            bot.send_invoice(
-                q.from.id,
-                "Premium Status (1 Month)",
-                "🌟 Remove all ads and get instant downloads for 30 days.",
-                "premium_30_days",
-                "XTR",
-                vec![teloxide::types::LabeledPrice::new("Premium", price)],
-            )
-            .provider_token("")
-            .await?;
-
             let _ = bot.answer_callback_query(q.id).await;
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+            crate::handlers::payments::send_premium_invoice(bot, q.from.id.into()).await
         }))
-        .branch(Update::filter_pre_checkout_query().endpoint(|bot: Bot, q: PreCheckoutQuery| async move {
-            let _ = bot.answer_pre_checkout_query(q.id, true).await;
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-        }))
-        .branch(Update::filter_message().filter(|msg: Message| msg.successful_payment().is_some()).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
-            if let Some(user) = msg.from {
-                let notify_success = db_pool.get_setting("notify_success").await.map(|v| v == "true").unwrap_or(true);
-                let notify_fail = db_pool.get_setting("notify_fail").await.map(|v| v == "true").unwrap_or(true);
-
-                let admin_ids_str = std::env::var("ADMIN_IDS").unwrap_or_default();
-                let admin_ids: Vec<i64> = admin_ids_str
-                    .split(',')
-                    .filter_map(|s| s.trim().parse().ok())
-                    .collect();
-
-                match db_pool.set_user_premium(user.id.0 as i64, 30).await {
-                    Ok(_) => {
-                        bot.send_message(msg.chat.id, "✅ Premium activated! 🌟").await?;
-                        
-                        if notify_success {
-                            let notify_text = format!(
-                                "🔔 User @{} (ID: {}) successfully purchased premium for 30 days! 🌟",
-                                user.username.as_deref().unwrap_or("Unknown"),
-                                user.id
-                            );
-                            for admin_id in admin_ids {
-                                let _ = bot.send_message(ChatId(admin_id), &notify_text).await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Failed to activate premium for user {}: {}", user.id.0, e);
-                        bot.send_message(msg.chat.id, "❌ Error activating Premium. Please contact support.").await?;
-                        
-                        if notify_fail {
-                            let notify_text = format!(
-                                "⚠️ FAILED to activate premium for user @{} (ID: {}). Error: {}",
-                                user.username.as_deref().unwrap_or("Unknown"),
-                                user.id,
-                                e
-                            );
-                            for admin_id in admin_ids {
-                                let _ = bot.send_message(ChatId(admin_id), &notify_text).await;
-                            }
-                        }
-                    }
-                }
-            }
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-        }))
+        .branch(Update::filter_pre_checkout_query().endpoint(crate::handlers::payments::handle_pre_checkout))
+        .branch(Update::filter_message().filter(|msg: Message| msg.successful_payment().is_some()).endpoint(crate::handlers::payments::handle_successful_payment))
         .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(crate::handlers::ui::BTN_TOGGLE_ADS))).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
             let curr = db_pool.get_setting("ads_enabled").await.map(|v| v == "true").unwrap_or(true);
             let _ = db_pool.set_setting("ads_enabled", if !curr { "true" } else { "false" }).await;

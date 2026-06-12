@@ -7,6 +7,7 @@ pub mod link;
 pub mod subscription;
 pub mod text;
 pub mod ui;
+pub mod payments;
 
 pub use admin_panel::{
     BTN_BROADCAST, admin_panel_text_handler, all_users_text_handler, stats_text_handler,

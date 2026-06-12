@@ -1,14 +1,18 @@
 use teloxide::prelude::*;
 use teloxide::types::{KeyboardMarkup, KeyboardButton};
+use teloxide::dispatching::dialogue::{InMemStorage, Dialogue};
 use crate::handlers::admin::is_admin;
 use crate::handlers::ui::{
     BTN_ADMIN_PANEL, BTN_SUBSCRIPTION, BTN_BACK,
     BTN_TOGGLE_ADS, BTN_TOGGLE_SUCCESS_NOTIFS, BTN_TOGGLE_FAIL_NOTIFS
 };
 use crate::database::DatabasePool;
+use crate::handlers::broadcast::BroadcastState;
 use std::sync::Arc;
 
 pub const BTN_BROADCAST: &str = "📢 Broadcast";
+
+type MyDialogue = Dialogue<BroadcastState, InMemStorage<BroadcastState>>;
 
 pub async fn admin_panel_text_handler(
     bot: Bot,
@@ -52,6 +56,7 @@ pub async fn admin_panel_text_handler(
 
 pub async fn add_premium_user_handler(
     bot: Bot,
+    dialogue: MyDialogue,
     msg: Message,
     db_pool: Arc<DatabasePool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -64,6 +69,7 @@ pub async fn add_premium_user_handler(
             bot.send_message(msg.chat.id, "❌ Cancelled.")
                 .reply_markup(crate::handlers::command::get_main_reply_keyboard())
                 .await?;
+            dialogue.exit().await?;
             return Ok(());
         }
 
@@ -74,6 +80,7 @@ pub async fn add_premium_user_handler(
                         bot.send_message(msg.chat.id, format!("✅ User {} granted 30 days of Premium!", user_id))
                             .reply_markup(crate::handlers::command::get_main_reply_keyboard())
                             .await?;
+                        dialogue.exit().await?;
                     }
                     Err(e) => {
                         log::error!("Failed to add premium manually: {}", e);

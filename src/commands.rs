@@ -25,6 +25,8 @@ pub enum AdminCommand {
     ToggleSubscription,
     #[command(description = "Test Premium activation (Admin only)")]
     FakePayment,
+    #[command(description = "Reset your Premium status (Admin only)")]
+    ResetPremium,
     #[command(description = "List available TLS fingerprints")]
     Fingerprint,
 }
