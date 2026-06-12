@@ -1,7 +1,6 @@
 use anyhow::Error;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::env;
 use teloxide::prelude::*;
 use tokio::sync::Mutex;
 
@@ -13,8 +12,7 @@ use crate::handlers::{
     BTN_BROADCAST, BroadcastState, admin_panel_text_handler, all_users_text_handler,
     back_text_handler, command_handler, format_text_handler, handle_broadcast_confirmation,
     link_handler, receive_broadcast_message, settings_text_handler, start_broadcast,
-    stats_text_handler, subscription_text_handler, top10_text_handler, premium_users_text_handler,
-    add_premium_user_handler,
+    stats_text_handler, subscription_text_handler, top10_text_handler,
 };
 use crate::mtproto_uploader::MTProtoUploader;
 use crate::utils::task_manager::TaskManager;
@@ -48,41 +46,77 @@ mod utils;
 mod web_server;
 mod yt_dlp_interface;
 
-fn build_bot(is_test_mode: bool, client: reqwest::Client) -> (Bot, String) {
-    let token_var = if is_test_mode { "TELEGRAM_TEST_TOKEN" } else { "TELOXIDE_TOKEN" };
-    
-    let raw_token = std::env::var(token_var)
-        .unwrap_or_else(|_| {
-            if is_test_mode {
-                std::env::var("TELOXIDE_TOKEN").expect("Neither TELEGRAM_TEST_TOKEN nor TELOXIDE_TOKEN is set")
-            } else {
-                panic!("TELOXIDE_TOKEN must be set")
-            }
-        })
-        .trim()
-        .to_string();
-
-    let bot_token = if is_test_mode {
-        log::warn!("⚠️  RUNNING IN TEST MODE (Telegram Test Server)");
-        format!("{}/test", raw_token)
-    } else {
-        raw_token.clone()
-    };
-
-    (Bot::with_client(bot_token, client), raw_token)
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    // 1. Initialize logger IMMEDIATELY
-    pretty_env_logger::init();
-    log::info!("Starting TikTok downloader bot...");
-    let start_time = std::time::Instant::now();
-
-    // 2. Load environment
+    // 1. Load environment BEFORE anything else
     if let Err(e) = crate::config::load_environment() {
         eprintln!("Warning: Failed to load environment: {}", e);
     }
+
+    // --- Logging Setup ---
+    use log::LevelFilter;
+    use std::env;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::sync::Mutex as StdMutex;
+
+    let console_level_str = env::var("CONSOLE_LOG_LEVEL").unwrap_or_else(|_| "INFO".to_string());
+    let console_level = match console_level_str.to_uppercase().as_str() {
+        "ERROR" => LevelFilter::Error,
+        _ => LevelFilter::Info,
+    };
+
+    let file_level_str = env::var("FILE_LOG_LEVEL").unwrap_or_else(|_| "OFF".to_string());
+    let file_level_config = match file_level_str.to_uppercase().as_str() {
+        "ERROR" => Some(LevelFilter::Error),
+        "ALL" | "INFO" => Some(LevelFilter::Info),
+        _ => None,
+    };
+
+    let max_level = std::cmp::max(console_level, file_level_config.unwrap_or(LevelFilter::Off));
+
+    let log_file = if file_level_config.is_some() {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open("bot_errors.log")?;
+        Some(Arc::new(StdMutex::new(file)))
+    } else {
+        None
+    };
+
+    let mut builder = pretty_env_logger::formatted_builder();
+    builder
+        .filter(None, max_level)
+        .format(move |buf, record| {
+            let formatted_record = format!(
+                "{} [{}] {}: {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.target(),
+                record.args()
+            );
+
+            if record.level() <= console_level {
+                writeln!(buf, "{}", formatted_record)?;
+            }
+
+            if let Some(file_level) = file_level_config {
+                if record.level() <= file_level {
+                    if let Some(file_handle) = &log_file {
+                        if let Ok(mut guard) = file_handle.lock() {
+                            let _ = writeln!(guard, "{}", formatted_record);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+        .init();
+
+    log::info!("Starting TikTok downloader bot...");
+    let start_time = std::time::Instant::now();
 
     let exe_dir = std::env::current_exe()?
         .parent()
@@ -122,6 +156,11 @@ async fn main() -> Result<(), Error> {
     let fetcher = Arc::new(YoutubeFetcher::new(yt_dlp_path, output_dir.clone(), ffmpeg_dir.clone())?);
 
     // --- Bot Configuration ---
+    let raw_token = env::var("TELOXIDE_TOKEN")
+        .expect("TELOXIDE_TOKEN must be set in .env")
+        .trim()
+        .to_string();
+
     let reqwest_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -133,7 +172,15 @@ async fn main() -> Result<(), Error> {
         .unwrap_or_else(|_| "false".to_string())
         .to_lowercase() == "true";
 
-    let (bot, raw_token) = build_bot(is_test_mode, reqwest_client.clone());
+    // Хак для teloxide: добавляем /test к токену, чтобы он ходил на тестовый сервер
+    let bot_token = if is_test_mode {
+        log::warn!("⚠️  RUNNING IN TEST MODE (Telegram Test Server)");
+        format!("{}/test", raw_token)
+    } else {
+        raw_token.clone()
+    };
+
+    let bot = Bot::with_client(bot_token, reqwest_client.clone());
 
     // Diagnostic check
     match bot.get_me().await {
@@ -150,19 +197,6 @@ async fn main() -> Result<(), Error> {
     };
 
     let db_pool = Arc::new(DatabasePool::new(crate::database::get_database_path(), 3));
-
-    // Sync settings from .env to database
-    if let Ok(sub_req) = env::var("SUBSCRIPTION_REQUIRED") {
-        let val = if sub_req.to_lowercase() == "true" { "true" } else { "false" };
-        let _ = db_pool.set_setting("subscription_required", val).await;
-        log::info!("Synced subscription_required from .env: {}", val);
-    }
-    if let Ok(ads_en) = env::var("ADS_ENABLED") {
-        let val = if ads_en.to_lowercase() == "true" { "true" } else { "false" };
-        let _ = db_pool.set_setting("ads_enabled", val).await;
-        log::info!("Synced ads_enabled from .env: {}", val);
-    }
-
     let task_manager = Arc::new(tokio::sync::Mutex::new(TaskManager::new(2)));
     let upload_semaphore = Arc::new(tokio::sync::Semaphore::new(2));
 
@@ -185,17 +219,9 @@ async fn main() -> Result<(), Error> {
         .branch(
             Update::filter_message()
                 .branch(dptree::case![BroadcastState::WaitingForMessage].endpoint(receive_broadcast_message))
-                .branch(dptree::case![BroadcastState::WaitingForAddPremiumUserId].endpoint(add_premium_user_handler))
                 .branch(dptree::case![BroadcastState::Idle]
                         .filter(|msg: Message| msg.text().map(|t| t == BTN_BROADCAST).unwrap_or(false))
                         .endpoint(start_broadcast))
-                .branch(dptree::case![BroadcastState::Idle]
-                        .filter(|msg: Message| msg.text().map(|t| t == "➕ Add Premium User").unwrap_or(false))
-                        .endpoint(|bot: Bot, dialogue: MyDialogue, msg: Message| async move {
-                            bot.send_message(msg.chat.id, "👤 Send the numeric Telegram ID to grant 30 days of Premium (or /cancel):").await?;
-                            dialogue.update(BroadcastState::WaitingForAddPremiumUserId).await?;
-                            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-                        }))
         )
         .branch(
             Update::filter_callback_query()
@@ -287,19 +313,7 @@ async fn main() -> Result<(), Error> {
         }))
         .branch(Update::filter_callback_query().filter(|q: CallbackQuery| q.data == Some("buy_premium".to_string())).endpoint(|bot: Bot, q: CallbackQuery| async move {
             let price: u32 = std::env::var("PREMIUM_STARS_PRICE").unwrap_or_else(|_| "50".to_string()).parse().unwrap_or(50);
-
-            // For Telegram Stars (XTR), provider_token is set via a setter as None
-            bot.send_invoice(
-                q.from.id,
-                "Premium Status (1 Month)",
-                "🌟 Remove all ads and get instant downloads for 30 days.",
-                "premium_30_days",
-                "XTR",
-                vec![teloxide::types::LabeledPrice::new("Premium", price)],
-            )
-            .provider_token("")
-            .await?;
-
+            bot.send_invoice(q.from.id, "Premium", "🌟 Remove ads for 30 days.", "premium_30_days", "XTR", vec![teloxide::types::LabeledPrice::new("Premium", price)]).await?;
             let _ = bot.answer_callback_query(q.id).await;
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         }))
@@ -309,47 +323,8 @@ async fn main() -> Result<(), Error> {
         }))
         .branch(Update::filter_message().filter(|msg: Message| msg.successful_payment().is_some()).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
             if let Some(user) = msg.from {
-                let notify_success = db_pool.get_setting("notify_success").await.map(|v| v == "true").unwrap_or(true);
-                let notify_fail = db_pool.get_setting("notify_fail").await.map(|v| v == "true").unwrap_or(true);
-
-                let admin_ids_str = std::env::var("ADMIN_IDS").unwrap_or_default();
-                let admin_ids: Vec<i64> = admin_ids_str
-                    .split(',')
-                    .filter_map(|s| s.trim().parse().ok())
-                    .collect();
-
-                match db_pool.set_user_premium(user.id.0 as i64, 30).await {
-                    Ok(_) => {
-                        bot.send_message(msg.chat.id, "✅ Premium activated! 🌟").await?;
-                        
-                        if notify_success {
-                            let notify_text = format!(
-                                "🔔 User @{} (ID: {}) successfully purchased premium for 30 days! 🌟",
-                                user.username.as_deref().unwrap_or("Unknown"),
-                                user.id
-                            );
-                            for admin_id in admin_ids {
-                                let _ = bot.send_message(ChatId(admin_id), &notify_text).await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Failed to activate premium for user {}: {}", user.id.0, e);
-                        bot.send_message(msg.chat.id, "❌ Error activating Premium. Please contact support.").await?;
-                        
-                        if notify_fail {
-                            let notify_text = format!(
-                                "⚠️ FAILED to activate premium for user @{} (ID: {}). Error: {}",
-                                user.username.as_deref().unwrap_or("Unknown"),
-                                user.id,
-                                e
-                            );
-                            for admin_id in admin_ids {
-                                let _ = bot.send_message(ChatId(admin_id), &notify_text).await;
-                            }
-                        }
-                    }
-                }
+                let _ = db_pool.set_user_premium(user.id.0 as i64, 30).await;
+                bot.send_message(msg.chat.id, "✅ Premium activated! 🌟").await?;
             }
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         }))
@@ -358,22 +333,9 @@ async fn main() -> Result<(), Error> {
             let _ = db_pool.set_setting("ads_enabled", if !curr { "true" } else { "false" }).await;
             admin_panel_text_handler(bot, msg, db_pool).await
         }))
-        .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(crate::handlers::ui::BTN_TOGGLE_SUCCESS_NOTIFS))).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
-            let curr = db_pool.get_setting("notify_success").await.map(|v| v == "true").unwrap_or(true);
-            let _ = db_pool.set_setting("notify_success", if !curr { "true" } else { "false" }).await;
-            admin_panel_text_handler(bot, msg, db_pool).await
-        }))
-        .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(crate::handlers::ui::BTN_TOGGLE_FAIL_NOTIFS))).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
-            let curr = db_pool.get_setting("notify_fail").await.map(|v| v == "true").unwrap_or(true);
-            let _ = db_pool.set_setting("notify_fail", if !curr { "true" } else { "false" }).await;
-            admin_panel_text_handler(bot, msg, db_pool).await
-        }))
         .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("Stats")).endpoint(stats_text_handler))
         .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("Top 10")).endpoint(top10_text_handler))
         .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("All users")).endpoint(all_users_text_handler))
-        .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("💎 Premium Users")).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
-            premium_users_text_handler(bot, msg, db_pool).await
-        }))
         .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_SUBSCRIPTION)).endpoint(subscription_text_handler))
         .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_BACK)).endpoint(back_text_handler))
         .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("h265")).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
@@ -397,7 +359,7 @@ async fn main() -> Result<(), Error> {
             bot.send_message(msg.chat.id, "Quality: audio").reply_markup(crate::handlers::command::get_main_reply_keyboard()).await?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         }))
-        .branch(Update::filter_message().filter(|msg: Message| msg.text().map(|t| !crate::handlers::ui::is_system_button(t)).unwrap_or(false)).endpoint(|bot: Bot, msg: Message, fetcher: Arc<YoutubeFetcher>, mtproto_uploader: Arc<MTProtoUploader>, db_pool: Arc<DatabasePool>, task_manager: Arc<tokio::sync::Mutex<TaskManager>>, upload_semaphore: Arc<tokio::sync::Semaphore>| async move {
+        .branch(Update::filter_message().filter(|msg: Message| msg.text().map(|t| !crate::handlers::ui::is_system_button(t) || t == "Admin Panel").unwrap_or(false)).endpoint(|bot: Bot, msg: Message, fetcher: Arc<YoutubeFetcher>, mtproto_uploader: Arc<MTProtoUploader>, db_pool: Arc<DatabasePool>, task_manager: Arc<tokio::sync::Mutex<TaskManager>>, upload_semaphore: Arc<tokio::sync::Semaphore>| async move {
             let key = format!("{}:{}:{}", msg.chat.id.0, msg.id.0, msg.text().unwrap_or(""));
             {
                 let mut p = PROCESSING.lock().await;

@@ -201,6 +201,38 @@ impl DatabasePool {
         }).await.map_err(|e| anyhow::anyhow!("Failed to claim verified download {}: {}", id, e))
     }
 
+    /// Claim a download regardless of status (for admins or bypassing)
+    pub async fn claim_any_download(&self, id: &str) -> Result<(i64, String), anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let (user_id, url): (i64, String) = conn.query_row(
+                "SELECT user_id, video_url FROM pending_downloads WHERE id = ?1 AND (status = 'verified' OR status = 'pending')",
+                params![id_owned],
+                |row| Ok((row.get(0)?, row.get(1)?))
+            )?;
+            
+            conn.execute(
+                "UPDATE pending_downloads SET status = 'completed' WHERE id = ?1",
+                params![id_owned],
+            )?;
+            
+            Ok((user_id, url))
+        }).await.map_err(|e| anyhow::anyhow!("Failed to bypass-claim download {}: {}", id, e))
+    }
+
+    /// Get user_id for a specific ymid
+    pub async fn get_user_id_by_ymid(&self, id: &str) -> Result<i64, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let user_id: i64 = conn.query_row(
+                "SELECT user_id FROM pending_downloads WHERE id = ?1",
+                params![id_owned],
+                |row| row.get(0)
+            )?;
+            Ok(user_id)
+        }).await.map_err(|e| anyhow::anyhow!("Ymid {} not found: {}", id, e))
+    }
+
     /// Check if user has active premium status
     pub async fn is_user_premium(&self, user_id: i64) -> bool {
         let result = self.execute_with_timeout(move |conn| {
@@ -227,6 +259,30 @@ impl DatabasePool {
             )?;
             Ok(())
         }).await.map_err(|e| anyhow::anyhow!("Failed to set premium for user {}: {}", user_id, e))
+    }
+
+    /// Get list of users with active premium status
+    pub async fn get_premium_users(&self) -> Result<Vec<(i64, String, String)>, anyhow::Error> {
+        self.execute_with_timeout(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT telegram_id, premium_until, COALESCE(last_active, 'N/A')
+                 FROM users 
+                 WHERE premium_until > datetime('now')
+                 ORDER BY premium_until DESC"
+            )?;
+            let users_iter = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut users = Vec::new();
+            for user_result in users_iter {
+                users.push(user_result?);
+            }
+            Ok(users)
+        }).await.map_err(|e| anyhow::anyhow!("Failed to query premium users: {}", e))
     }
 }
 

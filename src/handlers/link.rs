@@ -152,10 +152,14 @@ pub async fn link_handler(
                 .map(|v| v.to_lowercase() == "true")
                 .unwrap_or(true);
             
+            let is_test_mode = std::env::var("TEST_MODE")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false);
+
             if !module_enabled {
                 log::info!("Ads disabled: Module is disabled in .env");
                 false
-            } else if is_user_admin {
+            } else if is_user_admin && !is_test_mode {
                 log::info!("Ads disabled: User is admin");
                 false
             } else if is_premium {

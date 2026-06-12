@@ -1,71 +1,88 @@
-# Telegram TikTok Downloader Bot
+# Telegram TikTok Downloader Bot (Rust)
 
-A Telegram bot written in Rust for downloading TikTok videos without watermarks, with support for various social media platforms including TikTok, Instagram, YouTube Shorts, and more.
+A powerful, high-performance Telegram bot written in Rust for downloading TikTok videos (no watermarks), Instagram reels, and YouTube Shorts. Optimized for scalability, security, and monetization.
 
-## Features
+## 🌟 Key Features
 
-- **Multi-platform support**: Download videos from TikTok, Instagram, YouTube Shorts, and other social media platforms
-- **No watermarks**: Download clean videos without watermarks
-- **High-quality downloads**: Automatically selects the best available quality
-- **Telegram interface**: Easy-to-use bot interface within Telegram
-- **Automatic updates**: Built-in auto-update functionality for yt-dlp and FFmpeg binaries
-- **Database support**: Stores user information and download history
-- **Admin commands**: Administrative features for channel management and Ad control
-- **Monetization**: Integrated Telegram Mini App with Monetag ads (Rewarded Interstitial)
-- **Safe Verification**: Server-to-Server (S2S) postback verification for ad rewards
-- **Cross-platform**: Runs on Windows, Linux, and macOS
+-   **Multi-Platform Support**: TikTok, Instagram, YouTube, and more (via `yt-dlp`).
+-   **Monetization (Monetag)**: Integrated Rewarded Interstitial ads with **Server-to-Server (S2S) verification**.
+-   **Premium Subscriptions**: Support for **Telegram Stars** (XTR) to bypass ads and unlock instant downloads.
+-   **Advanced Admin Panel**:
+    -   Real-time stats (Total Users, Downloads).
+    -   Global Broadcast system.
+    -   Manual Premium User management.
+    -   Granular notification toggles (Success/Fail alerts).
+    -   Ad system master switch.
+-   **Auto-Update System**: Automatically monitors and downloads the latest `yt-dlp` and `FFmpeg` binaries.
+-   **MTProto Support**: High-speed uploads for large files (up to 2GB) using the Telegram MTProto protocol.
+-   **Global Test Mode**: Seamless switching between Telegram Production and Test servers.
 
-## Telegram Mini App & Ads
+## 🛠 Tech Stack
 
-The bot includes a built-in Axum web server to handle a Telegram Mini App for monetization. Users are required to watch a Rewarded Interstitial ad before their video is processed.
+-   **Language**: Rust (Edition 2024)
+-   **Framework**: [Teloxide](https://github.com/teloxide/teloxide) (Telegram Bot Framework)
+-   **Web Server**: [Axum](https://github.com/tokio-rs/axum) (for Mini App and Webhooks)
+-   **Database**: SQLite (via `rusqlite` and `r2d2` pool)
+-   **MTProto**: `grammers` (for large file handling)
 
-### How it works:
-1. User sends a link.
-2. Bot generates a unique `ymid` and sends an invitation to the Mini App.
-3. User watches the ad in the Mini App.
-4. Monetag sends a secure S2S Postback to the bot's API.
-5. User clicks "Get Video" in the Mini App (additional Popup monetization).
-6. Bot releases the video to the user's chat.
+## 💰 Monetization & "Double Lock" Verification
 
-## Configuration
+The bot uses a unique "Double Lock" system to ensure high ad completion rates:
+1.  **S2S Postback**: The bot's API receives a verified signal from Monetag when an ad is completed.
+2.  **Mini App Claim**: Users must click "Claim" in the Telegram Mini App to trigger the download after verification.
+3.  **Admin Bypass**: Admins can bypass verification during testing to ensure smooth flows.
 
-The bot can be configured using environment variables in the `.env` file:
-- `TELOXIDE_TOKEN`: Your Telegram bot token
-- `ADMIN_IDS`: Comma-separated list of admin IDs
-- `DATABASE_PATH`: Path to the SQLite database file
-- `WEB_SERVER_PORT`: Port for the Axum web server (default: 8088)
-- `WEBAPP_URL`: Your production domain (e.g., `https://cdnapi52.mooo.com`)
-- `MONETAG_ZONE_ID`: Your Monetag Zone ID
-- `MONETAG_MODULE_ENABLED`: Set to `true` or `false` to toggle the entire ad system
+## 🚀 Installation & Setup
 
-## Deployment (Nginx)
+### Prerequisites
+-   Rust 1.83.0+
+-   A Telegram Bot Token (from [@BotFather](https://t.me/BotFather))
+-   Monetag account (for Ads)
 
-To run the bot in production with HTTPS, use Nginx as a reverse proxy:
+### 1. Configuration
+Create a `.env` file in the root directory:
 
-```nginx
-server {
-    listen 8443 ssl; # Or 443
-    server_name cdnapi52.mooo.com;
+```env
+TELOXIDE_TOKEN=your_bot_token
+ADMIN_IDS=12345678,87654321
+CHANNEL_IDS=-100... (mandatory sub channels)
 
-    location / {
-        proxy_pass http://127.0.0.1:8088;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
+# MTProto Credentials (my.telegram.org)
+TELEGRAM_API_ID=12345
+TELEGRAM_API_HASH=your_hash
+
+# Mini App & Ads
+WEBAPP_URL=https://your-domain.com
+MONETAG_ZONE_ID=11093538
+MONETAG_MODULE_ENABLED=true
+WEB_SERVER_PORT=8088
+
+# Global Toggles
+TEST_MODE=false
+SUBSCRIPTION_REQUIRED=true
 ```
 
-## Monetag S2S Setup
+### 2. Run
+```bash
+cargo run --release
+```
+*Note: Binaries (`yt-dlp`, `ffmpeg`) will be automatically downloaded on the first run.*
 
-In your Monetag dashboard, set the **Postback URL** for your Rewarded Interstitial zone to:
-`https://your-domain.com/api/monetag-postback?ymid={ymid}&status={reward_event_type}`
+## 🧪 Telegram Test Server Support
 
-## Contributing
+To test features like Telegram Stars without spending real money:
+1.  Set `TEST_MODE=true` in `.env`.
+2.  Use a test token from BotFather in the Test environment.
+3.  Delete `telegram.session` before restarting.
+4.  The bot will automatically connect to **Amsterdam DC2**.
 
-Contributions are welcome! Please feel free to fork the repository and submit pull requests.
+## 📊 Admin Commands
 
-## License
+-   `/start` - Access main menu.
+-   `Admin Panel` button - Access the granular control interface.
+-   `➕ Add Premium User` - Grant 30 days of Premium to a specific ID.
+-   `Ads: ON/OFF` - Instant global ad toggle.
+
+## 📝 License
 
 This project is licensed under the MIT License.

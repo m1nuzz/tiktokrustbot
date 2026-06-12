@@ -1,7 +1,10 @@
 use teloxide::prelude::*;
 use teloxide::types::{KeyboardMarkup, KeyboardButton};
 use crate::handlers::admin::is_admin;
-use crate::handlers::ui::{BTN_ADMIN_PANEL, BTN_SUBSCRIPTION, BTN_BACK};
+use crate::handlers::ui::{
+    BTN_ADMIN_PANEL, BTN_SUBSCRIPTION, BTN_BACK,
+    BTN_TOGGLE_ADS, BTN_TOGGLE_SUCCESS_NOTIFS, BTN_TOGGLE_FAIL_NOTIFS
+};
 use crate::database::DatabasePool;
 use std::sync::Arc;
 
@@ -19,16 +22,22 @@ pub async fn admin_panel_text_handler(
         return Ok(());
     }
 
-    let ads_enabled = match db_pool.get_setting("ads_enabled").await {
-        Ok(val) => val == "true",
-        Err(_) => true, // Default
-    };
+    let ads_enabled = db_pool.get_setting("ads_enabled").await.map(|v| v == "true").unwrap_or(true);
+    let notify_success = db_pool.get_setting("notify_success").await.map(|v| v == "true").unwrap_or(true);
+    let notify_fail = db_pool.get_setting("notify_fail").await.map(|v| v == "true").unwrap_or(true);
 
     let keyboard = KeyboardMarkup::new(vec![
         vec![KeyboardButton::new("📊 Stats"), KeyboardButton::new("📢 Broadcast")],
         vec![KeyboardButton::new("🏆 Top 10"), KeyboardButton::new("👥 All users")],
+        vec![KeyboardButton::new("💎 Premium Users"), KeyboardButton::new("➕ Add Premium User")],
         vec![KeyboardButton::new(BTN_SUBSCRIPTION)],
-        vec![KeyboardButton::new(format!("{}{}", crate::handlers::ui::BTN_TOGGLE_ADS, if ads_enabled { "ON ✅" } else { "OFF ❌" }))],
+        vec![
+            KeyboardButton::new(format!("{}{}", BTN_TOGGLE_ADS, if ads_enabled { "ON ✅" } else { "OFF ❌" })),
+        ],
+        vec![
+            KeyboardButton::new(format!("{}{}", BTN_TOGGLE_SUCCESS_NOTIFS, if notify_success { "ON ✅" } else { "OFF ❌" })),
+            KeyboardButton::new(format!("{}{}", BTN_TOGGLE_FAIL_NOTIFS, if notify_fail { "ON ✅" } else { "OFF ❌" })),
+        ],
         vec![KeyboardButton::new(BTN_BACK)],
     ])
     .resize_keyboard();
@@ -37,6 +46,89 @@ pub async fn admin_panel_text_handler(
         .reply_markup(keyboard)
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+    Ok(())
+}
+
+pub async fn add_premium_user_handler(
+    bot: Bot,
+    msg: Message,
+    db_pool: Arc<DatabasePool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !is_admin(&msg).await {
+        return Ok(());
+    }
+
+    if let Some(text) = msg.text() {
+        if text == "/cancel" {
+            bot.send_message(msg.chat.id, "❌ Cancelled.")
+                .reply_markup(crate::handlers::command::get_main_reply_keyboard())
+                .await?;
+            return Ok(());
+        }
+
+        match text.parse::<i64>() {
+            Ok(user_id) => {
+                match db_pool.set_user_premium(user_id, 30).await {
+                    Ok(_) => {
+                        bot.send_message(msg.chat.id, format!("✅ User {} granted 30 days of Premium!", user_id))
+                            .reply_markup(crate::handlers::command::get_main_reply_keyboard())
+                            .await?;
+                    }
+                    Err(e) => {
+                        log::error!("Failed to add premium manually: {}", e);
+                        bot.send_message(msg.chat.id, "❌ Database error.")
+                            .await?;
+                    }
+                }
+            }
+            Err(_) => {
+                bot.send_message(msg.chat.id, "⚠️ Please send a valid numeric Telegram ID (or /cancel):")
+                    .await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn premium_users_text_handler(
+    bot: Bot,
+    msg: Message,
+    db_pool: Arc<DatabasePool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !is_admin(&msg).await {
+        bot.send_message(msg.chat.id, "This option is for admins only.")
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        return Ok(());
+    }
+
+    let result = db_pool.get_premium_users().await;
+
+    match result {
+        Ok(users) => {
+            let mut response = format!("💎 Premium Users - Total: {}\n\n", users.len());
+            for (user_id, premium_until, last_active) in users.iter() {
+                response.push_str(&format!(
+                    "👤 User: {} | 📅 Until: {} | 🕒 Last active: {}\n",
+                    user_id, premium_until, last_active
+                ));
+            }
+            if users.is_empty() {
+                response.push_str("No active premium users found.");
+            }
+            bot.send_message(msg.chat.id, response)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        }
+        Err(e) => {
+            log::error!("Premium users DB error: {}", e);
+            bot.send_message(msg.chat.id, "Failed to retrieve premium users list.")
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        }
+    }
 
     Ok(())
 }

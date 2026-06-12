@@ -3,6 +3,8 @@ pub const BTN_SETTINGS: &str = "⚙️ Settings";
 pub const BTN_FORMAT: &str = "Format";
 pub const BTN_SUBSCRIPTION: &str = "Subscription";
 pub const BTN_TOGGLE_ADS: &str = "Ads: ";
+pub const BTN_TOGGLE_SUCCESS_NOTIFS: &str = "Notify Success: ";
+pub const BTN_TOGGLE_FAIL_NOTIFS: &str = "Notify Fail: ";
 pub const BTN_BACK: &str = "Back";
 
 pub fn is_menu_button(text: &str) -> bool {
@@ -19,9 +21,11 @@ pub fn is_system_button(text: &str) -> bool {
     matches!(
         text,
         BTN_ADMIN_PANEL | BTN_SETTINGS | BTN_FORMAT | BTN_SUBSCRIPTION | BTN_BACK |
-        "📢 Broadcast" | "📊 Stats" | "🏆 Top 10" | "👥 All users" |
+        "📢 Broadcast" | "📊 Stats" | "🏆 Top 10" | "👥 All users" | "💎 Premium Users" | "➕ Add Premium User" |
         "h265" | "h264" | "audio"
     ) || text.starts_with(BTN_TOGGLE_ADS)
+      || text.starts_with(BTN_TOGGLE_SUCCESS_NOTIFS)
+      || text.starts_with(BTN_TOGGLE_FAIL_NOTIFS)
 }
 
 #[cfg(test)]

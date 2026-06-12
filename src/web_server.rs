@@ -100,7 +100,33 @@ async fn claim_video(
     let db = state.db.clone();
     let ymid = payload.ymid.clone();
 
-    match db.claim_verified_download(&ymid).await {
+    // 1. Get user_id for this ymid
+    let user_id = match db.get_user_id_by_ymid(&ymid).await {
+        Ok(id) => id,
+        Err(e) => {
+            log::error!("Claim failed: Ymid {} not found: {}", ymid, e);
+            return Json(json!({ "success": false, "error": "Invalid request ID" }));
+        }
+    };
+
+    // 2. Check if user is admin
+    let admins: Vec<i64> = std::env::var("ADMIN_IDS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    
+    let is_admin = admins.contains(&user_id);
+
+    // 3. Attempt to claim
+    let claim_result = if is_admin {
+        log::info!("Admin detected (user {}), using bypass claim for ymid {}", user_id, ymid);
+        db.claim_any_download(&ymid).await
+    } else {
+        db.claim_verified_download(&ymid).await
+    };
+
+    match claim_result {
         Ok((user_id, url)) => {
             log::info!("Claim success! Triggering download for user {}: {}", user_id, url);
             
@@ -126,7 +152,10 @@ async fn claim_video(
         },
         Err(e) => {
             log::error!("Claim failed for ymid {}: {}", ymid, e);
-            Json(json!({ "success": false, "error": "Verification not found or already claimed" }))
+            Json(json!({ 
+                "success": false, 
+                "error": "Ad verification not received yet. Please finish watching the ad or wait a few seconds." 
+            }))
         }
     }
 }

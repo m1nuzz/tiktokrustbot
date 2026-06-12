@@ -15,6 +15,7 @@ pub enum BroadcastState {
     Idle,
     WaitingForMessage,
     WaitingForConfirmation { message: String },  // New state!
+    WaitingForAddPremiumUserId,
 }
 
 pub async fn start_broadcast(

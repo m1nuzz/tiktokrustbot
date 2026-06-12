@@ -236,7 +236,7 @@
                     if (claimData.success) {
                         tg.close();
                     } else {
-                        statusMsg.innerText = "❌ Verification expired. Try again.";
+                        statusMsg.innerText = "❌ " + (claimData.error || "Verification expired. Try again.");
                         tg.MainButton.hideProgress();
                     }
                 } catch (e) {
