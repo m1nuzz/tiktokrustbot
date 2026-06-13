@@ -26,7 +26,7 @@ pub struct AppState {
 #[derive(Deserialize)]
 pub struct PostbackQuery {
     pub ymid: String,
-    pub status: String,
+    pub reward_event_type: String,
 }
 
 #[derive(Deserialize)]
@@ -74,9 +74,9 @@ async fn monetag_postback(
     State(state): State<AppState>,
     Query(query): Query<PostbackQuery>,
 ) -> impl axum::response::IntoResponse {
-    log::info!("Received Monetag postback: ymid={}, status={}", query.ymid, query.status);
+    log::info!("Received Monetag postback: ymid={}, type={}", query.ymid, query.reward_event_type);
 
-    if query.status == "valued" || query.status == "non_valued" {
+    if query.reward_event_type == "valued" {
         let db = state.db.clone();
         let ymid = query.ymid.clone();
         
@@ -84,8 +84,10 @@ async fn monetag_postback(
         if let Err(e) = db.mark_as_verified(&ymid).await {
             log::error!("Failed to mark download as verified for ymid {}: {}", ymid, e);
         } else {
-            log::info!("Download {} marked as VERIFIED (waiting for claim)", ymid);
+            log::info!("Download {} marked as VERIFIED (VALUED impression)", ymid);
         }
+    } else {
+        log::warn!("Received non-monetized impression (non_valued) for ymid: {}", query.ymid);
     }
 
     axum::http::StatusCode::OK
