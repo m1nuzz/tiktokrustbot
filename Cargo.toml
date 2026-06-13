@@ -37,5 +37,8 @@ tower = "0.5.3"
 tower-http = { version = "0.6.11", features = ["cors", "fs"] }
 teloxide-core = "0.13.0"
 
+[patch.crates-io]
+core2 = { git = "https://github.com/bbqsrc/core2", rev = "545e84bcb0f235b12e21351e0c69767958efe2a7" }
+
 [dev-dependencies]
 serial_test = "3.3.1"
