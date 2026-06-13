@@ -4,9 +4,7 @@ use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo};
 
 use std::collections::HashMap;
 use std::fs;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
 use tokio::time::Instant;
 use tokio::time::{Duration, timeout};

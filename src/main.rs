@@ -5,7 +5,6 @@ use std::env;
 use teloxide::prelude::*;
 use tokio::sync::Mutex;
 
-use tiktokdownloader::commands::AdminCommand;
 use tiktokdownloader::database::DatabasePool;
 use tiktokdownloader::handlers::broadcast::BroadcastState;
 use tiktokdownloader::mtproto_uploader::MTProtoUploader;
