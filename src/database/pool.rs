@@ -294,12 +294,20 @@ mod tests {
     async fn setup_test_db() -> (DatabasePool, NamedTempFile) {
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap().to_string();
-        let pool = DatabasePool::new(db_path, 1);
+        let pool = DatabasePool::new(db_path.clone(), 1);
         
-        // Initialize settings table
+        // Initialize all necessary tables
         pool.execute_with_timeout(|conn| {
             conn.execute(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME)",
+                (),
+            )?;
+            conn.execute(
                 "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                (),
+            )?;
+            conn.execute(
+                "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
                 (),
             )?;
             Ok(())
@@ -326,5 +334,63 @@ mod tests {
         let (pool, _file) = setup_test_db().await;
         let result = pool.get_setting("ghost").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_premium_activation_and_check() {
+        let (pool, _file) = setup_test_db().await;
+        let user_id = 123456789i64;
+
+        // Initially not premium
+        assert!(!pool.is_user_premium(user_id).await);
+
+        // Activate premium
+        pool.set_user_premium(user_id, 30).await.unwrap();
+
+        // Now is premium
+        assert!(pool.is_user_premium(user_id).await);
+
+        // Check premium users list
+        let premium_users = pool.get_premium_users().await.unwrap();
+        assert_eq!(premium_users.len(), 1);
+        assert_eq!(premium_users[0].0, user_id);
+    }
+
+    #[tokio::test]
+    async fn test_premium_extension() {
+        let (pool, _file) = setup_test_db().await;
+        let user_id = 987654321i64;
+
+        // Set initial premium
+        pool.set_user_premium(user_id, 30).await.unwrap();
+        let first_expiry = pool.get_premium_users().await.unwrap()[0].1.clone();
+
+        // Extend premium
+        pool.set_user_premium(user_id, 30).await.unwrap();
+        let second_expiry = pool.get_premium_users().await.unwrap()[0].1.clone();
+
+        // Second expiry should be later than first
+        assert!(second_expiry > first_expiry);
+    }
+
+    #[tokio::test]
+    async fn test_get_premium_users_filtering() {
+        let (pool, _file) = setup_test_db().await;
+        
+        // Add active premium user
+        pool.set_user_premium(1, 30).await.unwrap();
+        
+        // Add expired premium user
+        pool.execute_with_timeout(|conn| {
+            conn.execute(
+                "INSERT INTO users (telegram_id, premium_until) VALUES (?1, datetime('now', '-1 day'))",
+                params![2i64],
+            )?;
+            Ok(())
+        }).await.unwrap();
+
+        let premium_users = pool.get_premium_users().await.unwrap();
+        assert_eq!(premium_users.len(), 1);
+        assert_eq!(premium_users[0].0, 1);
     }
 }

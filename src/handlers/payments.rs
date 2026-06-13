@@ -4,8 +4,18 @@ use std::sync::Arc;
 use crate::database::DatabasePool;
 use std::env;
 
-const PREMIUM_PAYLOAD: &str = "premium_30_days_xtr";
-const CURRENCY_XTR: &str = "XTR";
+pub const PREMIUM_PAYLOAD: &str = "premium_30_days_xtr";
+pub const CURRENCY_XTR: &str = "XTR";
+
+/// Validate if the payload matches the expected premium purchase payload
+pub fn is_valid_premium_payload(payload: &str) -> bool {
+    payload == PREMIUM_PAYLOAD
+}
+
+/// Validate if the currency is Telegram Stars (XTR)
+pub fn is_xtr_currency(currency: &str) -> bool {
+    currency == CURRENCY_XTR
+}
 
 /// 1. Send Invoice (Telegram Stars)
 pub async fn send_premium_invoice(bot: Bot, chat_id: ChatId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -36,6 +46,11 @@ pub async fn send_premium_invoice(bot: Bot, chat_id: ChatId) -> Result<(), Box<d
     Ok(())
 }
 
+/// Logic for approving/rejecting PreCheckoutQuery
+pub fn validate_pre_checkout(payload: &str, currency: &str) -> bool {
+    is_valid_premium_payload(payload) && is_xtr_currency(currency)
+}
+
 /// 2. Handle PreCheckoutQuery (Crucial step to stop the loading spinner)
 pub async fn handle_pre_checkout(bot: Bot, q: PreCheckoutQuery) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let query_id = q.id.clone();
@@ -44,16 +59,16 @@ pub async fn handle_pre_checkout(bot: Bot, q: PreCheckoutQuery) -> Result<(), Bo
         query_id, q.from.id, q.invoice_payload, q.total_amount
     );
 
-    // Payload validation
-    if q.invoice_payload != PREMIUM_PAYLOAD {
-        log::warn!("[PAYMENT_CHAIN] ❌ Rejecting PreCheckout {}: invalid payload '{}'", query_id, q.invoice_payload);
+    let ok = validate_pre_checkout(&q.invoice_payload, &q.currency);
+
+    if !ok {
+        log::warn!("[PAYMENT_CHAIN] ❌ Rejecting PreCheckout {}: invalid payload or currency", query_id);
         bot.answer_pre_checkout_query(query_id, false)
-            .error_message("Error: invalid order identifier.")
+            .error_message("Error: invalid order identifier or currency.")
             .await?;
         return Ok(());
     }
 
-    // Answer OK immediately
     match bot.answer_pre_checkout_query(query_id.clone(), true).await {
         Ok(_) => {
             log::info!("[PAYMENT_CHAIN] 4. PreCheckout approved (OK) for ID={}", query_id);
@@ -64,6 +79,23 @@ pub async fn handle_pre_checkout(bot: Bot, q: PreCheckoutQuery) -> Result<(), Bo
     }
     
     Ok(())
+}
+
+/// Core logic for processing a successful payment without Telegram API dependencies
+pub async fn process_successful_payment_logic(
+    user_id: i64,
+    payload: &str,
+    currency: &str,
+    _amount: i32,
+    db_pool: &DatabasePool,
+) -> Result<bool, anyhow::Error> {
+    if !is_valid_premium_payload(payload) || !is_xtr_currency(currency) {
+        return Ok(false);
+    }
+
+    log::info!("[PAYMENT_CHAIN] 6. Granting premium in DB for user {}", user_id);
+    db_pool.set_user_premium(user_id, 30).await?;
+    Ok(true)
 }
 
 /// 3. Handle Successful Payment
@@ -77,54 +109,73 @@ pub async fn handle_successful_payment(
         None => return Ok(()),
     };
 
+    let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+
     log::info!(
         "[PAYMENT_CHAIN] 5. FINAL: SuccessfulPayment received! User={}, Payload={}, Total={} {}",
-        msg.chat.id,
+        user_id,
         payment.invoice_payload,
         payment.total_amount,
         payment.currency
     );
 
-    // Final validation
-    if payment.invoice_payload != PREMIUM_PAYLOAD {
-        log::error!("[PAYMENT_CHAIN] ❌ CRITICAL: Payload mismatch! Expected {}, got {}", PREMIUM_PAYLOAD, payment.invoice_payload);
-        return Ok(());
-    }
+    let success = process_successful_payment_logic(
+        user_id,
+        &payment.invoice_payload,
+        &payment.currency,
+        payment.total_amount as i32,
+        &db_pool
+    ).await?;
 
-    if let Some(user) = &msg.from {
-        log::info!("[PAYMENT_CHAIN] 6. Granting premium in DB for user {}", user.id);
-        match db_pool.set_user_premium(user.id.0 as i64, 30).await {
-            Ok(_) => {
-                bot.send_message(msg.chat.id, "🎉 Success! Premium activated for 30 days! ✨").await?;
-                log::info!("[PAYMENT_CHAIN] 7. Payment completed. User {} (ID: {}) is now Premium.", user.first_name, user.id);
+    if success {
+        if let Some(user) = &msg.from {
+            bot.send_message(msg.chat.id, "🎉 Success! Premium activated for 30 days! ✨").await?;
+            log::info!("[PAYMENT_CHAIN] 7. Payment completed. User {} (ID: {}) is now Premium.", user.first_name, user.id);
+            
+            let notify_success = db_pool.get_setting("notify_success").await.map(|v| v == "true").unwrap_or(true);
+            
+            if notify_success {
+                let admin_ids_str = env::var("ADMIN_IDS").unwrap_or_default();
+                let admin_ids: Vec<i64> = admin_ids_str
+                    .split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect();
                 
-                let notify_success = db_pool.get_setting("notify_success").await.map(|v| v == "true").unwrap_or(true);
+                let notify_text = format!(
+                    "💰 [STARS] Purchase! User @{} (ID: {}) bought Premium for {} Stars.",
+                    user.username.as_deref().unwrap_or("unknown"),
+                    user.id,
+                    payment.total_amount
+                );
                 
-                if notify_success {
-                    let admin_ids_str = env::var("ADMIN_IDS").unwrap_or_default();
-                    let admin_ids: Vec<i64> = admin_ids_str
-                        .split(',')
-                        .filter_map(|s| s.trim().parse().ok())
-                        .collect();
-                    
-                    let notify_text = format!(
-                        "💰 [STARS] Purchase! User @{} (ID: {}) bought Premium for {} Stars.",
-                        user.username.as_deref().unwrap_or("unknown"),
-                        user.id,
-                        payment.total_amount
-                    );
-                    
-                    for admin_id in admin_ids {
-                        let _ = bot.send_message(ChatId(admin_id), &notify_text).await;
-                    }
+                for admin_id in admin_ids {
+                    let _ = bot.send_message(ChatId(admin_id), &notify_text).await;
                 }
             }
-            Err(e) => {
-                log::error!("[PAYMENT_CHAIN] ❌ DB Error granting premium to {}: {}", user.id, e);
-                bot.send_message(msg.chat.id, "❌ Database error during activation. Please contact support.").await?;
-            }
         }
+    } else {
+        log::error!("[PAYMENT_CHAIN] ❌ Validation failed for successful payment from user {}", user_id);
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_valid_premium_payload() {
+        assert!(is_valid_premium_payload(PREMIUM_PAYLOAD));
+        assert!(!is_valid_premium_payload("premium_60_days"));
+        assert!(!is_valid_premium_payload(""));
+    }
+
+    #[test]
+    fn test_xtr_currency() {
+        assert!(is_xtr_currency(CURRENCY_XTR));
+        assert!(!is_xtr_currency("USD"));
+        assert!(!is_xtr_currency("RUB"));
+        assert!(!is_xtr_currency(""));
+    }
 }
