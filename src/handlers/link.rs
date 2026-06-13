@@ -145,17 +145,21 @@ pub async fn link_handler(
 
     let ads_enabled = {
         let module_enabled = std::env::var("MONETAG_MODULE_ENABLED").map(|v| v.to_lowercase() == "true").unwrap_or(true);
+        let global_ads = db_pool.get_setting("ads_enabled").await.map(|val| val == "true").unwrap_or(true);
         let is_test_mode = std::env::var("TEST_MODE").map(|v| v.to_lowercase() == "true").unwrap_or(false);
 
-        if !module_enabled {
+        if !module_enabled || !global_ads {
+            log::info!("Ads disabled globally or by module flag");
             false
         } else if is_user_admin {
             let admin_ads = db_pool.get_setting("admin_ads_enabled").await.map(|val| val == "true").unwrap_or(false);
+            log::info!("Ads check for admin: admin_ads={}, test_mode={}", admin_ads, is_test_mode);
             admin_ads || is_test_mode
         } else if is_premium {
+            log::info!("Ads disabled: User {} has Premium", user_id);
             false
         } else {
-            db_pool.get_setting("ads_enabled").await.map(|val| val == "true").unwrap_or(true)
+            true
         }
     };
 
