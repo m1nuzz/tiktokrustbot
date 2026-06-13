@@ -4,7 +4,6 @@ use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo};
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::Instant;
 use tokio::time::{Duration, timeout};
@@ -20,6 +19,7 @@ use crate::telegram_bot_api_uploader::{
 };
 use crate::utils::progress_bar::ProgressBar;
 use crate::utils::task_manager::TaskManager;
+use crate::utils::temp_file::TempFileGuard;
 use crate::yt_dlp_interface::YoutubeFetcher;
 
 // To track active link processing and avoid double-triggering
@@ -294,7 +294,7 @@ pub async fn process_video_request(
         }
     };
 
-    let _guard = TempFile::new(path.clone());
+    let _guard = TempFileGuard::new(path.clone());
     let file_size = fs::metadata(&path)?.len();
 
     if file_size > TELEGRAM_BOT_API_FILE_LIMIT {
@@ -345,19 +345,4 @@ pub async fn process_video_request(
         urls.remove(&url);
     }
     Ok(())
-}
-
-struct TempFile {
-    path: PathBuf,
-}
-
-impl TempFile {
-    fn new(path: PathBuf) -> Self { Self { path } }
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        if std::thread::panicking() { return; }
-        let _ = std::fs::remove_file(&mut self.path);
-    }
 }

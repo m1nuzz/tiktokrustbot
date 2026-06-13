@@ -1,5 +1,4 @@
 use std::path::Path;
-use tokio::fs;
 use tokio::process::Command;
 use anyhow::anyhow;
 
@@ -9,6 +8,7 @@ use crate::mtproto_uploader::thumbnail::generate_thumbnail;
 use crate::mtproto_uploader::metadata::get_video_metadata;
 use crate::mtproto_uploader::file_uploader::{upload_file_in_parts_with_reconnect, upload_small_file_with_reconnect};
 use crate::mtproto_uploader::message_sender::send_media_with_retry;
+use crate::utils::temp_file::TempFileGuard;
 
 impl MTProtoUploader {
     async fn ensure_faststart_video(&self, file_path: &Path) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
@@ -47,49 +47,20 @@ impl MTProtoUploader {
         caption: &str,
         progress_bar: &mut ProgressBar,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // RAII guard for automatic deletion of temporary faststart file
-        struct TempVideoGuard {
-            path: Option<std::path::PathBuf>,
-        }
-
-        impl TempVideoGuard {
-            fn new(path: std::path::PathBuf) -> Self {
-                Self { path: Some(path) }
-            }
-        }
-
-        impl Drop for TempVideoGuard {
-            fn drop(&mut self) {
-                if let Some(path) = &self.path {
-                    if std::thread::panicking() {
-                        log::warn!("Skipping faststart cleanup during panic: {}", path.display());
-                        return;
-                    }
-                    // Use blocking operation for guaranteed cleanup
-                    match std::fs::remove_file(path) {
-                        Ok(_) => log::debug!("Cleaned up temporary faststart file: {}", path.display()),
-                        Err(e) => log::warn!("Failed to cleanup faststart file {}: {}", path.display(), e),
-                    }
-                }
-            }
-        }
-
         // Create temporary faststart file with guard
-        let (video_path, temp_guard) = if file_path.extension().map_or(false, |ext| ext == "mp4") {
+        let (video_path, _video_guard) = if file_path.extension().map_or(false, |ext| ext == "mp4") {
             match self.ensure_faststart_video(file_path).await {
                 Ok(temp_path) => {
-                    let guard = TempVideoGuard::new(temp_path.clone());
-                    // Guard will automatically clean up the temp file when function exits
-                    // regardless of how it exits (panic or normal return)
+                    let guard = TempFileGuard::new(temp_path.clone());
                     (temp_path, Some(guard))
                 },
                 Err(e) => {
                     log::warn!("Failed to remux video with faststart, proceeding with original: {:?}", e);
-                    (file_path.to_path_buf(), None) // Use original file
+                    (file_path.to_path_buf(), None)
                 }
             }
         } else {
-            (file_path.to_path_buf(), None) // Use original file
+            (file_path.to_path_buf(), None)
         };
 
         // Upload the main video file using reconnect mechanism
@@ -110,6 +81,8 @@ impl MTProtoUploader {
             log::error!("Failed to generate thumbnail for {:?}: {:?}", file_path, e);
             e
         })?;
+
+        let _thumbnail_guard = TempFileGuard::new(thumbnail_path.clone());
 
         // Upload the thumbnail using the reconnect mechanism
         let (thumbnail_file_id, thumbnail_parts) = upload_small_file_with_reconnect(self, &thumbnail_path).await.map_err(|e| {
@@ -134,16 +107,6 @@ impl MTProtoUploader {
             caption,
         ).await.map_err(|e| {
             log::error!("Failed to send media: {:?}", e);
-            e
-        })?;
-
-        // Keep temp_guard in scope so it doesn't get dropped early
-        // Guard automatically cleans up the temporary faststart file at function exit
-        let _ = temp_guard; // Use the temp_guard to keep it in scope without warning
-
-        // Clean up the thumbnail file
-        fs::remove_file(&thumbnail_path).await.map_err(|e| {
-            log::warn!("Failed to remove thumbnail file {:?}: {:?}", thumbnail_path, e);
             e
         })?;
 

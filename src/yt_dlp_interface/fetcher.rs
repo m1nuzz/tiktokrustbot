@@ -40,6 +40,7 @@ impl YoutubeFetcher {
         };
 
         let mut cmd = Command::new(&self.yt_dlp_path);
+        cmd.kill_on_drop(true); // Guarantee process termination on drop
         cmd.arg("--extractor-args")
             .arg("tiktok:skip=feed")
             .arg("--output")
