@@ -12,6 +12,7 @@ pub mod payments;
 pub use admin_panel::{
     BTN_BROADCAST, admin_panel_text_handler, all_users_text_handler, stats_text_handler,
     top10_text_handler, premium_users_text_handler, add_premium_user_handler,
+    daily_stats_text_handler, admin_ads_text_handler,
 };
 pub use broadcast::{
     BroadcastState, handle_broadcast_confirmation, receive_broadcast_message, start_broadcast,

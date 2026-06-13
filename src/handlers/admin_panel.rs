@@ -27,16 +27,19 @@ pub async fn admin_panel_text_handler(
     }
 
     let ads_enabled = db_pool.get_setting("ads_enabled").await.map(|v| v == "true").unwrap_or(true);
+    let admin_ads_enabled = db_pool.get_setting("admin_ads_enabled").await.map(|v| v == "true").unwrap_or(false);
     let notify_success = db_pool.get_setting("notify_success").await.map(|v| v == "true").unwrap_or(true);
     let notify_fail = db_pool.get_setting("notify_fail").await.map(|v| v == "true").unwrap_or(true);
 
     let keyboard = KeyboardMarkup::new(vec![
-        vec![KeyboardButton::new("📊 Stats"), KeyboardButton::new("📢 Broadcast")],
+        vec![KeyboardButton::new("📊 Stats"), KeyboardButton::new("📈 Daily Stats")],
+        vec![KeyboardButton::new(BTN_BROADCAST), KeyboardButton::new("➕ Add Premium User")],
         vec![KeyboardButton::new("🏆 Top 10"), KeyboardButton::new("👥 All users")],
-        vec![KeyboardButton::new("💎 Premium Users"), KeyboardButton::new("➕ Add Premium User")],
+        vec![KeyboardButton::new("💎 Premium Users")],
         vec![KeyboardButton::new(BTN_SUBSCRIPTION)],
         vec![
             KeyboardButton::new(format!("{}{}", BTN_TOGGLE_ADS, if ads_enabled { "ON ✅" } else { "OFF ❌" })),
+            KeyboardButton::new(format!("🔔 Admin Ads: {}", if admin_ads_enabled { "ON ✅" } else { "OFF ❌" })),
         ],
         vec![
             KeyboardButton::new(format!("{}{}", BTN_TOGGLE_SUCCESS_NOTIFS, if notify_success { "ON ✅" } else { "OFF ❌" })),
@@ -97,6 +100,115 @@ pub async fn add_premium_user_handler(
     }
 
     Ok(())
+}
+
+/// Escape special characters for Telegram MarkdownV2
+pub fn escape_markdown_v2(s: &str) -> String {
+    s.replace("_", "\\_")
+     .replace("*", "\\*")
+     .replace("[", "\\[")
+     .replace("]", "\\]")
+     .replace("(", "\\(")
+     .replace(")", "\\)")
+     .replace("~", "\\~")
+     .replace("`", "\\`")
+     .replace(">", "\\>")
+     .replace("#", "\\#")
+     .replace("+", "\\+")
+     .replace("-", "\\-")
+     .replace("=", "\\=")
+     .replace("|", "\\|")
+     .replace("{", "\\{")
+     .replace("}", "\\}")
+     .replace(".", "\\.")
+     .replace("!", "\\!")
+}
+
+pub async fn daily_stats_text_handler(
+    bot: Bot,
+    msg: Message,
+    db_pool: Arc<DatabasePool>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !is_admin(&msg).await {
+        return Ok(());
+    }
+
+    match db_pool.get_rich_daily_stats().await {
+        Ok(s) => {
+            let user_conv = if s.unique_users > 0 { (s.unique_downloaders as f64 / s.unique_users as f64) * 100.0 } else { 0.0 };
+            let ad_pay_cr = if s.ad_impressions > 0 { (s.payments_count as f64 / s.ad_impressions as f64) * 100.0 } else { 0.0 };
+            let inv_pay_cr = if s.invoices_sent > 0 { (s.payments_count as f64 / s.invoices_sent as f64) * 100.0 } else { 0.0 };
+
+            let mut response = format!(
+                "📊 *Daily Report — {}*\n\n\
+                *Activity Today*\n\
+                👥 Unique Users:       {} \\({}{:+} vs yesterday\\)\n\
+                ⬇️ Unique Downloaders: {} \\({:.1}% of users\\)\n\
+                📦 Total Downloads:    {}\n\
+                👁 Ad Impressions:     {}\n\
+                🆕 New Users Today:    {}\n\
+                🔁 Returning Users:    {}\n\n\
+                *Monetization*\n\
+                💰 Payments Today:     {}\n\
+                ⭐ Revenue \\(Stars\\):    {}\n\
+                📈 Ad → Pay CR:        {:.1}%\n\
+                🔄 Invoices Sent:      {}\n\
+                💳 Invoice → Pay CR:   {:.1}%\n\n",
+                escape_markdown_v2(&s.date),
+                s.unique_users, if s.unique_users_delta >= 0 { "\\+" } else { "" }, s.unique_users_delta,
+                s.unique_downloaders, user_conv,
+                s.total_downloads,
+                s.ad_impressions,
+                s.new_users,
+                s.returning_users,
+                s.payments_count,
+                s.revenue_xtr,
+                ad_pay_cr,
+                s.invoices_sent,
+                inv_pay_cr
+            );
+
+            if let Some((hour, count)) = s.peak_hour {
+                response.push_str(&format!("🕐 *Peak Hour:* {:02}:00–{:02}:00 \\({} downloads\\)\n\n", hour, hour + 1, count));
+            }
+
+            response.push_str("🏆 *Top 10 Downloaders Today:*\n");
+            for (index, (user, count)) in s.top_downloaders.iter().enumerate() {
+                response.push_str(&format!("{}\\. `{}` — {} downloads\n", index + 1, user, count));
+            }
+            if s.top_downloaders.is_empty() { response.push_str("No activity yet\\.\n"); }
+
+            response.push_str("\n🕓 *Last Active Today:*\n");
+            for (index, (user, time)) in s.last_active_users.iter().enumerate() {
+                response.push_str(&format!("{}\\. `{}` — {}\n", index + 1, user, escape_markdown_v2(&time)));
+            }
+
+            bot.send_message(msg.chat.id, response)
+                .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                .await?;
+        }
+        Err(e) => {
+            log::error!("Daily stats error: {}", e);
+            bot.send_message(msg.chat.id, "❌ Error retrieving daily stats.").await?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn admin_ads_text_handler(
+    bot: Bot,
+    msg: Message,
+    db_pool: Arc<DatabasePool>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !is_admin(&msg).await {
+        return Ok(());
+    }
+
+    let curr = db_pool.get_setting("admin_ads_enabled").await.map(|v| v == "true").unwrap_or(false);
+    let next = if !curr { "true" } else { "false" };
+    db_pool.set_setting("admin_ads_enabled", next).await?;
+    
+    admin_panel_text_handler(bot, msg, db_pool).await
 }
 
 pub async fn premium_users_text_handler(
@@ -298,4 +410,16 @@ pub async fn all_users_text_handler(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_escape_markdown_v2() {
+        let input = "Hello (world) + [test] - 1.2! _ * ~ ` > # = | { }";
+        let expected = "Hello \\(world\\) \\+ \\[test\\] \\- 1\\.2\\! \\_ \\* \\~ \\` \\> \\# \\= \\| \\{ \\}";
+        assert_eq!(escape_markdown_v2(input), expected);
+    }
 }

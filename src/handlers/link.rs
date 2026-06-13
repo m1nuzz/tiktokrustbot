@@ -159,9 +159,19 @@ pub async fn link_handler(
             if !module_enabled {
                 log::info!("Ads disabled: Module is disabled in .env");
                 false
-            } else if is_user_admin && !is_test_mode {
-                log::info!("Ads disabled: User is admin");
-                false
+            } else if is_user_admin {
+                // If user is admin, check if admin ads are explicitly enabled via DB
+                let admin_ads = db_pool.get_setting("admin_ads_enabled").await.map(|val| val == "true").unwrap_or(false);
+                if admin_ads {
+                    log::info!("Ads enabled for admin: admin_ads_enabled is true");
+                    true
+                } else if is_test_mode {
+                    log::info!("Ads enabled for admin (Legacy Test Mode): TEST_MODE is true");
+                    true
+                } else {
+                    log::info!("Ads disabled: User is admin and ads are not forced");
+                    false
+                }
             } else if is_premium {
                 log::info!("Ads disabled: User {} has Premium", user_id);
                 false
@@ -210,7 +220,7 @@ pub async fn link_handler(
                                 log::info!("Ad invitation sent successfully to {}", user_id);
                                 
                                 // Send Premium Invoice directly
-                                let _ = crate::handlers::payments::send_premium_invoice(bot.clone(), msg.chat.id).await;
+                                let _ = crate::handlers::payments::send_premium_invoice(bot.clone(), msg.chat.id, db_pool.clone()).await;
 
                                 // STOP HERE. Do not download yet.
                                 // Cleanup URL_PROCESSING since we're not actually processing it yet (it's pending)

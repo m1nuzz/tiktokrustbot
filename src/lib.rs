@@ -19,6 +19,7 @@ use handlers::{
     settings_text_handler, format_text_handler, subscription_text_handler,
     back_text_handler, link_handler, BTN_BROADCAST,
     all_users_text_handler, stats_text_handler, top10_text_handler, premium_users_text_handler,
+    daily_stats_text_handler, admin_ads_text_handler,
 };
 use handlers::ui::{BTN_ADMIN_PANEL, BTN_BACK, BTN_FORMAT, BTN_SETTINGS, BTN_SUBSCRIPTION};
 use database::DatabasePool;
@@ -164,15 +165,16 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_ADMIN_PANEL)).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
                     admin_panel_text_handler(bot, msg, db_pool).await
                 }))
-                .branch(Update::filter_callback_query().filter(|q: CallbackQuery| q.data == Some("buy_premium".to_string())).endpoint(|bot: Bot, q: CallbackQuery| async move {
+                .branch(Update::filter_callback_query().filter(|q: CallbackQuery| q.data == Some("buy_premium".to_string())).endpoint(|bot: Bot, q: CallbackQuery, db_pool: Arc<DatabasePool>| async move {
                     let _ = bot.answer_callback_query(q.id).await;
-                    handlers::payments::send_premium_invoice(bot, q.from.id.into()).await
+                    handlers::payments::send_premium_invoice(bot, q.from.id.into(), db_pool).await
                 }))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(handlers::ui::BTN_TOGGLE_ADS))).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
                     let curr = db_pool.get_setting("ads_enabled").await.map(|v| v == "true").unwrap_or(true);
                     let _ = db_pool.set_setting("ads_enabled", if !curr { "true" } else { "false" }).await;
                     admin_panel_text_handler(bot, msg, db_pool).await
                 }))
+                .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with("🔔 Admin Ads:"))).endpoint(admin_ads_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(handlers::ui::BTN_TOGGLE_SUCCESS_NOTIFS))).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
                     let curr = db_pool.get_setting("notify_success").await.map(|v| v == "true").unwrap_or(true);
                     let _ = db_pool.set_setting("notify_success", if !curr { "true" } else { "false" }).await;
@@ -183,9 +185,10 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                     let _ = db_pool.set_setting("notify_fail", if !curr { "true" } else { "false" }).await;
                     admin_panel_text_handler(bot, msg, db_pool).await
                 }))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("Stats")).endpoint(stats_text_handler))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("Top 10")).endpoint(top10_text_handler))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("All users")).endpoint(all_users_text_handler))
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("📊 Stats")).endpoint(stats_text_handler))
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("📈 Daily Stats")).endpoint(daily_stats_text_handler))
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("🏆 Top 10")).endpoint(top10_text_handler))
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("👥 All users")).endpoint(all_users_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("💎 Premium Users")).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
                     premium_users_text_handler(bot, msg, db_pool).await
                 }))

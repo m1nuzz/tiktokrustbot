@@ -18,13 +18,16 @@ pub fn is_xtr_currency(currency: &str) -> bool {
 }
 
 /// 1. Send Invoice (Telegram Stars)
-pub async fn send_premium_invoice(bot: Bot, chat_id: ChatId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn send_premium_invoice(bot: Bot, chat_id: ChatId, db_pool: Arc<DatabasePool>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let price_val: u32 = env::var("PREMIUM_STARS_PRICE")
         .unwrap_or_else(|_| "50".to_string())
         .parse()
         .unwrap_or(50);
     
     log::info!("[PAYMENT_CHAIN] 1. Initiation: User={}, Amount={} Stars", chat_id, price_val);
+
+    // Log the invoice being sent
+    let _ = db_pool.log_invoice(chat_id.0, price_val as i64, PREMIUM_PAYLOAD).await;
 
     match bot.send_invoice(
         chat_id,
@@ -86,7 +89,7 @@ pub async fn process_successful_payment_logic(
     user_id: i64,
     payload: &str,
     currency: &str,
-    _amount: i32,
+    amount: i32,
     db_pool: &DatabasePool,
 ) -> Result<bool, anyhow::Error> {
     if !is_valid_premium_payload(payload) || !is_xtr_currency(currency) {
@@ -95,6 +98,10 @@ pub async fn process_successful_payment_logic(
 
     log::info!("[PAYMENT_CHAIN] 6. Granting premium in DB for user {}", user_id);
     db_pool.set_user_premium(user_id, 30).await?;
+    
+    // Log the successful payment
+    let _ = db_pool.log_payment(user_id, amount as i64, payload).await;
+    
     Ok(true)
 }
 

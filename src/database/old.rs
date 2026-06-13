@@ -37,12 +37,13 @@ pub fn init_database() -> Result<()> {
     let db_path = get_database_path();
     let conn = Connection::open(db_path)?;
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME)",
+        "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME)",
         (),
     )?;
-    // Add the quality_preference column to the users table if it doesn't exist, ignoring the error if it does.
+    // Add columns if they don't exist
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN last_active DATETIME DEFAULT CURRENT_TIMESTAMP", ());
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP", ());
     let _ = conn.execute("ALTER TABLE users ADD COLUMN quality_preference TEXT DEFAULT 'h264'", ());
-    // Add the premium_until column to the users table if it doesn't exist.
     let _ = conn.execute("ALTER TABLE users ADD COLUMN premium_until DATETIME", ());
 
     // Create the table with the new format
@@ -113,11 +114,31 @@ pub fn init_database() -> Result<()> {
         (),
     )?;
     conn.execute(
+        "CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY, user_id BIGINT NOT NULL, amount INTEGER NOT NULL, payload TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        (),
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS invoices (id INTEGER PRIMARY KEY, user_id BIGINT NOT NULL, amount INTEGER NOT NULL, payload TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        (),
+    )?;
+    
+    // Add indexes for performance
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)", ());
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_date ON downloads(download_date)", ());
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_date ON pending_downloads(created_at)", ());
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(timestamp)", ());
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(timestamp)", ());
+
+    conn.execute(
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('subscription_required', 'true')",
         (),
     )?;
     conn.execute(
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('ads_enabled', 'true')",
+        (),
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('admin_ads_enabled', 'false')",
         (),
     )?;
     Ok(())

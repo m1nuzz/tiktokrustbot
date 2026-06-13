@@ -18,6 +18,24 @@ pub struct UserInfo {
     pub last_updated: tokio::time::Instant,
 }
 
+#[derive(Debug, Clone)]
+pub struct RichDailyStats {
+    pub date: String,
+    pub unique_users: i64,
+    pub unique_users_delta: i64,
+    pub unique_downloaders: i64,
+    pub total_downloads: i64,
+    pub ad_impressions: i64,
+    pub new_users: i64,
+    pub returning_users: i64,
+    pub payments_count: i64,
+    pub revenue_xtr: i64,
+    pub invoices_sent: i64,
+    pub peak_hour: Option<(u32, i64)>,
+    pub top_downloaders: Vec<(i64, i64)>,
+    pub last_active_users: Vec<(i64, String)>,
+}
+
 impl DatabasePool {
     pub fn new(db_path: String, max_connections: usize) -> Self {
         Self {
@@ -283,6 +301,116 @@ impl DatabasePool {
             }
             Ok(users)
         }).await.map_err(|e| anyhow::anyhow!("Failed to query premium users: {}", e))
+    }
+
+    /// Log a successful payment
+    pub async fn log_payment(&self, user_id: i64, amount: i64, payload: &str) -> Result<(), anyhow::Error> {
+        let payload = payload.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "INSERT INTO payments (user_id, amount, payload) VALUES (?1, ?2, ?3)",
+                params![user_id, amount, payload],
+            )?;
+            Ok(())
+        }).await.map_err(|e| anyhow::anyhow!("Failed to log payment: {}", e))
+    }
+
+    /// Log an invoice sent
+    pub async fn log_invoice(&self, user_id: i64, amount: i64, payload: &str) -> Result<(), anyhow::Error> {
+        let payload = payload.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "INSERT INTO invoices (user_id, amount, payload) VALUES (?1, ?2, ?3)",
+                params![user_id, amount, payload],
+            )?;
+            Ok(())
+        }).await.map_err(|e| anyhow::anyhow!("Failed to log invoice: {}", e))
+    }
+
+    /// Get rich daily statistics
+    pub async fn get_rich_daily_stats(&self) -> Result<RichDailyStats, anyhow::Error> {
+        self.execute_with_timeout(|conn| {
+            // Basic counts today
+            let unique_users: i64 = conn.query_row(
+                "SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = date('now')",
+                [], |r| r.get(0)).unwrap_or(0);
+            
+            let yesterday_users: i64 = conn.query_row(
+                "SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = date('now', '-1 day')",
+                [], |r| r.get(0)).unwrap_or(0);
+            
+            let unique_downloaders: i64 = conn.query_row(
+                "SELECT COUNT(DISTINCT user_telegram_id) FROM downloads WHERE date(download_date) = date('now')",
+                [], |r| r.get(0)).unwrap_or(0);
+
+            let total_downloads: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM downloads WHERE date(download_date) = date('now')",
+                [], |r| r.get(0)).unwrap_or(0);
+
+            let ad_impressions: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pending_downloads WHERE date(created_at) = date('now')",
+                [], |r| r.get(0)).unwrap_or(0);
+
+            let new_users: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM users WHERE date(created_at) = date('now')",
+                [], |r| r.get(0)).unwrap_or(0);
+
+            // Payments & Revenue
+            let payments_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM payments WHERE date(timestamp) = date('now')",
+                [], |r| r.get(0)).unwrap_or(0);
+
+            let revenue_xtr: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE date(timestamp) = date('now')",
+                [], |r| r.get(0)).unwrap_or(0);
+
+            let invoices_sent: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM invoices WHERE date(timestamp) = date('now')",
+                [], |r| r.get(0)).unwrap_or(0);
+
+            // Peak hour
+            let peak_hour_data = conn.query_row(
+                "SELECT strftime('%H', download_date) as hr, COUNT(*) as cnt 
+                 FROM downloads WHERE date(download_date) = date('now')
+                 GROUP BY hr ORDER BY cnt DESC LIMIT 1",
+                [], |r| Ok((r.get::<_, String>(0)?.parse::<u32>().unwrap_or(0), r.get::<_, i64>(1)?))
+            ).ok();
+
+            // Top 10 downloaders
+            let mut stmt = conn.prepare(
+                "SELECT user_telegram_id, COUNT(*) as cnt 
+                 FROM downloads WHERE date(download_date) = date('now')
+                 GROUP BY user_telegram_id ORDER BY cnt DESC LIMIT 10"
+            )?;
+            let top_downloaders = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .filter_map(|r| r.ok()).collect();
+
+            // 10 Last active
+            let mut stmt = conn.prepare(
+                "SELECT telegram_id, strftime('%H:%M', last_active) 
+                 FROM users WHERE date(last_active) = date('now')
+                 ORDER BY last_active DESC LIMIT 10"
+            )?;
+            let last_active_users = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .filter_map(|r| r.ok()).collect();
+
+            Ok(RichDailyStats {
+                date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+                unique_users,
+                unique_users_delta: unique_users - yesterday_users,
+                unique_downloaders,
+                total_downloads,
+                ad_impressions,
+                new_users,
+                returning_users: unique_users - new_users,
+                payments_count,
+                revenue_xtr,
+                invoices_sent,
+                peak_hour: peak_hour_data,
+                top_downloaders,
+                last_active_users,
+            })
+        }).await.map_err(|e| anyhow::anyhow!("Failed to get rich daily stats: {}", e))
     }
 }
 
