@@ -32,6 +32,15 @@ The bot uses a unique "Double Lock" system to ensure high ad completion rates:
 2.  **Mini App Claim**: Users must click "Claim" in the Telegram Mini App to trigger the download after verification.
 3.  **Admin Bypass**: Admins can bypass verification during testing to ensure smooth flows.
 
+### Monetag S2S Configuration
+To ensure video delivery only after paid ad views, configure the **Postback URL** in your Monetag SSP Dashboard as follows:
+
+```text
+https://your-domain.com/api/monetag-postback?ymid={ymid}&reward_event_type={reward_event_type}
+```
+
+*Note: The bot only verifies `valued` impressions to maximize your revenue.*
+
 ## 🚀 Installation & Setup
 
 ### Prerequisites
