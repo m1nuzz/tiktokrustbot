@@ -139,11 +139,14 @@ pub async fn daily_stats_text_handler(
             let ad_pay_cr = if s.ad_impressions > 0 { (s.payments_count as f64 / s.ad_impressions as f64) * 100.0 } else { 0.0 };
             let inv_pay_cr = if s.invoices_sent > 0 { (s.payments_count as f64 / s.invoices_sent as f64) * 100.0 } else { 0.0 };
 
+            // Helper to escape anything
+            let e = |s: String| escape_markdown_v2(&s);
+
             let mut response = format!(
                 "📊 *Daily Report — {}*\n\n\
                 *Activity Today*\n\
-                👥 Unique Users:       {} \\({}{:+} vs yesterday\\)\n\
-                ⬇️ Unique Downloaders: {} \\({:.1}% of users\\)\n\
+                👥 Unique Users:       {} \\({}{} vs yesterday\\)\n\
+                ⬇️ Unique Downloaders: {} \\({}% of users\\)\n\
                 📦 Total Downloads:    {}\n\
                 👁 Ad Impressions:     {}\n\
                 🆕 New Users Today:    {}\n\
@@ -151,36 +154,48 @@ pub async fn daily_stats_text_handler(
                 *Monetization*\n\
                 💰 Payments Today:     {}\n\
                 ⭐ Revenue \\(Stars\\):    {}\n\
-                📈 Ad → Pay CR:        {:.1}%\n\
+                📈 Ad → Pay CR:        {}%\n\
                 🔄 Invoices Sent:      {}\n\
-                💳 Invoice → Pay CR:   {:.1}%\n\n",
-                escape_markdown_v2(&s.date),
-                s.unique_users, if s.unique_users_delta >= 0 { "\\+" } else { "" }, s.unique_users_delta,
-                s.unique_downloaders, user_conv,
-                s.total_downloads,
-                s.ad_impressions,
-                s.new_users,
-                s.returning_users,
-                s.payments_count,
-                s.revenue_xtr,
-                ad_pay_cr,
-                s.invoices_sent,
-                inv_pay_cr
+                💳 Invoice → Pay CR:   {}%\n\n",
+                e(s.date),
+                e(s.unique_users.to_string()), 
+                if s.unique_users_delta >= 0 { "\\+" } else { "" }, 
+                e(s.unique_users_delta.to_string()),
+                e(s.unique_downloaders.to_string()), 
+                e(format!("{:.1}", user_conv)),
+                e(s.total_downloads.to_string()),
+                e(s.ad_impressions.to_string()),
+                e(s.new_users.to_string()),
+                e(s.returning_users.to_string()),
+                e(s.payments_count.to_string()),
+                e(s.revenue_xtr.to_string()),
+                e(format!("{:.1}", ad_pay_cr)),
+                e(s.invoices_sent.to_string()),
+                e(format!("{:.1}", inv_pay_cr))
             );
 
             if let Some((hour, count)) = s.peak_hour {
-                response.push_str(&format!("🕐 *Peak Hour:* {:02}:00–{:02}:00 \\({} downloads\\)\n\n", hour, hour + 1, count));
+                response.push_str(&format!(
+                    "🕐 *Peak Hour:* {:02}:00–{:02}:00 \\({} downloads\\)\n\n", 
+                    hour, hour + 1, e(count.to_string())
+                ));
             }
 
             response.push_str("🏆 *Top 10 Downloaders Today:*\n");
             for (index, (user, count)) in s.top_downloaders.iter().enumerate() {
-                response.push_str(&format!("{}\\. `{}` — {} downloads\n", index + 1, user, count));
+                response.push_str(&format!(
+                    "{}\\. `{}` — {} downloads\n", 
+                    index + 1, e(user.to_string()), e(count.to_string())
+                ));
             }
             if s.top_downloaders.is_empty() { response.push_str("No activity yet\\.\n"); }
 
             response.push_str("\n🕓 *Last Active Today:*\n");
             for (index, (user, time)) in s.last_active_users.iter().enumerate() {
-                response.push_str(&format!("{}\\. `{}` — {}\n", index + 1, user, escape_markdown_v2(&time)));
+                response.push_str(&format!(
+                    "{}\\. `{}` — {}\n", 
+                    index + 1, e(user.to_string()), e(time.clone())
+                ));
             }
 
             bot.send_message(msg.chat.id, response)
