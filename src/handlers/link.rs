@@ -1,10 +1,12 @@
 use regex::Regex;
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, WebAppInfo};
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo};
 
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::time::Instant;
 use tokio::time::{Duration, timeout};
@@ -51,11 +53,31 @@ fn extract_url_from_text(text: &str) -> Option<String> {
 
 fn get_localized_ad_button_text(lang_code: Option<&str>) -> &'static str {
     match lang_code {
-        Some("ru") => "🇷🇺 Получить видео",
-        Some("es") => "🇪🇸 Descargar video",
-        Some("zh") | Some("zh-hans") | Some("zh-hant") => "🇨🇳 下载视频",
-        Some("ar") => "🇸🇦 تحميل الفيديو",
-        _ => "🇺🇸 Get the video",
+        Some("ru") => "🚀 Скачать видео (Бесплатно)",
+        Some("es") => "🚀 Descargar video (Gratis)",
+        Some("zh") | Some("zh-hans") | Some("zh-hant") => "🚀 下载视频 (免费)",
+        Some("ar") => "🚀 تحميل الفيديو (مجاني)",
+        _ => "🚀 Download video (Free)",
+    }
+}
+
+fn get_localized_premium_button_text(lang_code: Option<&str>) -> &'static str {
+    match lang_code {
+        Some("ru") => "⭐️ Убрать рекламу (Premium)",
+        Some("es") => "⭐️ Quitar anuncios (Premium)",
+        Some("zh") | Some("zh-hans") | Some("zh-hant") => "⭐️ 移除广告 (Premium)",
+        Some("ar") => "⭐️ إزالة الإعلانات (Premium)",
+        _ => "⭐️ Remove ads (Premium)",
+    }
+}
+
+fn get_localized_choice_text(lang_code: Option<&str>) -> &'static str {
+    match lang_code {
+        Some("ru") => "📥 Ваше видео готово к загрузке!\nВыберите вариант скачивания:",
+        Some("es") => "📥 ¡Tu video está listo para descargar!\nElige una opción de descarga:",
+        Some("zh") | Some("zh-hans") | Some("zh-hant") => "📥 您的视频已准备好下载！\n请选择下载选项：",
+        Some("ar") => "📥 الفيديو الخاص بك جاهز للتنزيل!\nاختر خيار التنزيل:",
+        _ => "📥 Your video is ready for download!\nChoose a download option:",
     }
 }
 
@@ -156,16 +178,20 @@ pub async fn link_handler(
                 final_url.query_pairs_mut().append_pair("ymid", &ymid);
 
                 let lang = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
-                let btn_text = get_localized_ad_button_text(lang);
-                let ad_button = InlineKeyboardButton::web_app(btn_text, WebAppInfo { url: final_url });
+                
+                let ad_btn_text = get_localized_ad_button_text(lang);
+                let prem_btn_text = get_localized_premium_button_text(lang);
+                let choice_text = get_localized_choice_text(lang);
 
-                // Send combined Premium Invoice and Ad button
-                let _ = crate::handlers::payments::send_premium_invoice(
-                    bot.clone(), 
-                    msg.chat.id, 
-                    db_pool.clone(),
-                    Some(ad_button)
-                ).await;
+                let keyboard = InlineKeyboardMarkup::new(vec![
+                    vec![InlineKeyboardButton::web_app(ad_btn_text, WebAppInfo { url: final_url })],
+                    vec![InlineKeyboardButton::callback(prem_btn_text, "buy_premium")],
+                ]);
+
+                // Send a friendly choice message instead of an invoice
+                let _ = bot.send_message(msg.chat.id, choice_text)
+                    .reply_markup(keyboard)
+                    .await;
 
                 // Stop processing
                 {
