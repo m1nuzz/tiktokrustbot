@@ -1,5 +1,8 @@
 use teloxide::prelude::*;
-use teloxide::types::{LabeledPrice, PreCheckoutQuery, Message};
+use teloxide::types::{
+    LabeledPrice, PreCheckoutQuery, Message, InlineKeyboardMarkup, 
+    InlineKeyboardButton, InlineKeyboardButtonKind, True
+};
 use std::sync::Arc;
 use crate::database::DatabasePool;
 use std::env;
@@ -18,7 +21,13 @@ pub fn is_xtr_currency(currency: &str) -> bool {
 }
 
 /// 1. Send Invoice (Telegram Stars)
-pub async fn send_premium_invoice(bot: Bot, chat_id: ChatId, db_pool: Arc<DatabasePool>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// optionally accepts an extra_button to combine invoice with other options (e.g. Free Ad-supported download)
+pub async fn send_premium_invoice(
+    bot: Bot, 
+    chat_id: ChatId, 
+    db_pool: Arc<DatabasePool>,
+    extra_button: Option<InlineKeyboardButton>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let price_val: u32 = env::var("PREMIUM_STARS_PRICE")
         .unwrap_or_else(|_| "50".to_string())
         .parse()
@@ -29,6 +38,22 @@ pub async fn send_premium_invoice(bot: Bot, chat_id: ChatId, db_pool: Arc<Databa
     // Log the invoice being sent
     let _ = db_pool.log_invoice(chat_id.0, price_val as i64, PREMIUM_PAYLOAD).await;
 
+    // Telegram API Rule: If a custom reply_markup is provided for an invoice, 
+    // the first button in the first row MUST be a Pay button.
+    let pay_button = InlineKeyboardButton::new(
+        format!("💳 Pay {} Stars", price_val),
+        InlineKeyboardButtonKind::Pay(True)
+    );
+
+    let mut rows = vec![vec![pay_button]];
+    
+    // Add the extra button (e.g. "Get Video") in the second row
+    if let Some(btn) = extra_button {
+        rows.push(vec![btn]);
+    }
+
+    let markup = InlineKeyboardMarkup::new(rows);
+
     match bot.send_invoice(
         chat_id,
         "Premium", // Header
@@ -37,6 +62,7 @@ pub async fn send_premium_invoice(bot: Bot, chat_id: ChatId, db_pool: Arc<Databa
         CURRENCY_XTR,
         vec![LabeledPrice::new("Premium Status", price_val)],
     )
+    .reply_markup(markup)
     .await {
         Ok(_) => {
             log::info!("[PAYMENT_CHAIN] 2. Invoice sent to user {}", chat_id);

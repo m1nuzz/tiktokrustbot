@@ -167,7 +167,7 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                 }))
                 .branch(Update::filter_callback_query().filter(|q: CallbackQuery| q.data == Some("buy_premium".to_string())).endpoint(|bot: Bot, q: CallbackQuery, db_pool: Arc<DatabasePool>| async move {
                     let _ = bot.answer_callback_query(q.id).await;
-                    handlers::payments::send_premium_invoice(bot, q.from.id.into(), db_pool).await
+                    handlers::payments::send_premium_invoice(bot, q.from.id.into(), db_pool, None).await
                 }))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(handlers::ui::BTN_TOGGLE_ADS))).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
                     let curr = db_pool.get_setting("ads_enabled").await.map(|v| v == "true").unwrap_or(true);
