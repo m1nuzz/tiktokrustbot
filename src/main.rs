@@ -128,14 +128,18 @@ async fn main() -> Result<(), Error> {
     log::info!("🗄️ Using database at: {}", db_path);
     let db_pool = Arc::new(DatabasePool::new(db_path, 3));
 
-    // Sync settings from .env to database
+    // Sync settings from .env to database (only as initial defaults, don't overwrite admin panel values)
     if let Ok(sub_req) = env::var("SUBSCRIPTION_REQUIRED") {
-        let val = if sub_req.to_lowercase() == "true" { "true" } else { "false" };
-        let _ = db_pool.set_setting("subscription_required", val).await;
+        if db_pool.get_setting("subscription_required").await.is_err() {
+            let val = if sub_req.to_lowercase() == "true" { "true" } else { "false" };
+            let _ = db_pool.set_setting("subscription_required", val).await;
+        }
     }
     if let Ok(ads_en) = env::var("ADS_ENABLED") {
-        let val = if ads_en.to_lowercase() == "true" { "true" } else { "false" };
-        let _ = db_pool.set_setting("ads_enabled", val).await;
+        if db_pool.get_setting("ads_enabled").await.is_err() {
+            let val = if ads_en.to_lowercase() == "true" { "true" } else { "false" };
+            let _ = db_pool.set_setting("ads_enabled", val).await;
+        }
     }
 
     let task_manager = Arc::new(tokio::sync::Mutex::new(TaskManager::new(2)));
