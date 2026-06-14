@@ -200,6 +200,18 @@ impl DatabasePool {
         }).await.map_err(|e| anyhow::anyhow!("Failed to verify download {}: {}", id, e))
     }
 
+    /// Mark as verified and return number of rows affected for better debugging
+    pub async fn mark_as_verified_with_logging(&self, id: &str) -> Result<usize, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let rows = conn.execute(
+                "UPDATE pending_downloads SET status = 'verified' WHERE id = ?1 AND status = 'pending'",
+                params![id_owned],
+            )?;
+            Ok(rows)
+        }).await.map_err(|e| anyhow::anyhow!("Failed to verify download {}: {}", id, e))
+    }
+
     /// Claim a verified download and trigger completion
     pub async fn claim_verified_download(&self, id: &str) -> Result<(i64, String), anyhow::Error> {
         let id_owned = id.to_string();

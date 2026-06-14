@@ -27,9 +27,11 @@ pub struct AppState {
     pub upload_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct PostbackQuery {
     pub ymid: String,
+    // Accept both "value" (per Monetag docs) and "reward_event_type" for backwards compatibility
+    #[serde(alias = "value", alias = "reward_event_type")]
     pub reward_event_type: String,
 }
 
@@ -65,8 +67,14 @@ pub async fn start_web_server(state: AppState, port: u16) {
     axum::serve(listener, app).await.expect("Failed to start axum server");
 }
 
-async fn serve_mini_app() -> Html<&'static str> {
-    Html(MINI_APP_HTML)
+async fn serve_mini_app() -> impl axum::response::IntoResponse {
+    // Get SmartLink from environment variable with fallback
+    let smartlink = std::env::var("MONETAG_SMARTLINK")
+        .unwrap_or_else(|_| "https://omg10.com/4/11148490".to_string());
+    
+    // Inject SmartLink URL into HTML
+    let html = MINI_APP_HTML.replace("// SMARTLINK_INJECT", &format!("const AD_CONFIG_SMARTLINK = \"{}\";", smartlink));
+    Html(html)
 }
 
 async fn get_ads_status(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -93,9 +101,11 @@ async fn monetag_postback(
     State(state): State<AppState>,
     Query(query): Query<PostbackQuery>,
 ) -> impl axum::response::IntoResponse {
-    log::info!("Received Monetag postback: ymid={}, type={}", query.ymid, query.reward_event_type);
+    let event_type = query.reward_event_type.to_lowercase();
+    log::info!("Received Monetag postback: ymid={}, type={}", query.ymid, event_type);
 
-    if query.reward_event_type == "valued" {
+    // Accept both valued and non_valued (for testing and fallback traffic)
+    if event_type == "valued" || event_type == "non_valued" {
         let db = state.db.clone();
         let ymid = query.ymid.clone();
         
@@ -103,10 +113,10 @@ async fn monetag_postback(
         if let Err(e) = db.mark_as_verified(&ymid).await {
             log::error!("Failed to mark download as verified for ymid {}: {}", ymid, e);
         } else {
-            log::info!("Download {} marked as VERIFIED (VALUED impression)", ymid);
+            log::info!("Download {} marked as VERIFIED (type: {})", ymid, query.reward_event_type);
         }
     } else {
-        log::warn!("Received non-monetized impression (non_valued) for ymid: {}", query.ymid);
+        log::warn!("Received unknown event_type='{}' for ymid: {}", event_type, query.ymid);
     }
 
     axum::http::StatusCode::OK

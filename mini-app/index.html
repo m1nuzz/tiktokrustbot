@@ -159,11 +159,12 @@
     </div>
 
     <script>
+        // SMARTLINK_INJECT
         // ========== КОНФИГУРАЦИЯ ==========
         const AD_CONFIG = {
             zone: '11093538',
             sdkFn: 'show_11093538',
-            smartLink: 'https://omg10.com/4/11148490',
+            smartLink: typeof AD_CONFIG_SMARTLINK !== 'undefined' ? AD_CONFIG_SMARTLINK : 'https://omg10.com/4/11148490',
             maxRetries: 8,
             retryInterval: 1200,
             pollInterval: 3000,
@@ -311,12 +312,13 @@
             loaderText.innerText = "Opening ad in browser...";
             loaderSubtext.innerText = "Return here after watching";
 
-            // SmartLink открывается БЕЗ параметров (Monetag будет использовать ymid из SDK вызова)
-            // Если нужно передавать ymid в SmartLink, проверьте настройку в Monetag Dashboard
+            // Add ymid parameter to SmartLink for fallback tracking
+            const smartLinkUrl = `${AD_CONFIG.smartLink}?ymid=${encodeURIComponent(ymid)}`;
+            
             if (window.Telegram?.WebApp) {
-                window.Telegram.WebApp.openLink(AD_CONFIG.smartLink);
+                window.Telegram.WebApp.openLink(smartLinkUrl);
             } else {
-                window.open(AD_CONFIG.smartLink, '_blank');
+                window.open(smartLinkUrl, '_blank');
             }
 
             // ВАЖНО: Запускаем polling СРАЗУ
