@@ -124,7 +124,9 @@ async fn main() -> Result<(), Error> {
         Err(e) => return Err(anyhow::anyhow!("{}", e)),
     };
 
-    let db_pool = Arc::new(DatabasePool::new(tiktokdownloader::database::get_database_path(), 3));
+    let db_path = tiktokdownloader::database::get_database_path();
+    log::info!("🗄️ Using database at: {}", db_path);
+    let db_pool = Arc::new(DatabasePool::new(db_path, 3));
 
     // Sync settings from .env to database
     if let Ok(sub_req) = env::var("SUBSCRIPTION_REQUIRED") {
@@ -138,6 +140,25 @@ async fn main() -> Result<(), Error> {
 
     let task_manager = Arc::new(tokio::sync::Mutex::new(TaskManager::new(2)));
     let upload_semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+
+    // --- Web Server Configuration ---
+    let web_server_state = tiktokdownloader::web_server::AppState {
+        db: db_pool.clone(),
+        bot: bot.clone(),
+        fetcher: fetcher.clone(),
+        mtproto_uploader: mtproto_uploader.clone(),
+        task_manager: task_manager.clone(),
+        upload_semaphore: upload_semaphore.clone(),
+    };
+
+    let web_port: u16 = env::var("WEB_SERVER_PORT")
+        .unwrap_or_else(|_| "8088".to_string())
+        .parse()
+        .unwrap_or(8088);
+
+    tokio::spawn(async move {
+        tiktokdownloader::web_server::start_web_server(web_server_state, web_port).await;
+    });
 
     let handler = build_handler();
 
