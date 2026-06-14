@@ -2,8 +2,9 @@ use axum::{
     extract::{State, Query},
     routing::{get, post},
     Json, Router,
+    response::Html,
 };
-use tower_http::{cors::CorsLayer, services::ServeDir};
+use tower_http::cors::CorsLayer;
 use std::sync::Arc;
 use crate::database::DatabasePool;
 use crate::yt_dlp_interface::YoutubeFetcher;
@@ -12,6 +13,9 @@ use crate::utils::task_manager::TaskManager;
 use serde::Deserialize;
 use serde_json::json;
 use teloxide::prelude::*;
+
+/// Mini-app HTML embedded at compile time — no need to deploy the folder separately
+const MINI_APP_HTML: &str = include_str!("../mini-app/index.html");
 
 #[derive(Clone)]
 pub struct AppState {
@@ -39,7 +43,7 @@ pub async fn start_web_server(state: AppState, port: u16) {
         .route("/api/ads-status", get(get_ads_status))
         .route("/api/monetag-postback", get(monetag_postback))
         .route("/api/claim-video", post(claim_video))
-        .fallback_service(ServeDir::new("mini-app"))
+        .fallback(serve_mini_app)
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -48,6 +52,10 @@ pub async fn start_web_server(state: AppState, port: u16) {
     
     let listener = tokio::net::TcpListener::bind(addr).await.expect("Failed to bind web server port");
     axum::serve(listener, app).await.expect("Failed to start axum server");
+}
+
+async fn serve_mini_app() -> Html<&'static str> {
+    Html(MINI_APP_HTML)
 }
 
 async fn get_ads_status(State(state): State<AppState>) -> Json<serde_json::Value> {
