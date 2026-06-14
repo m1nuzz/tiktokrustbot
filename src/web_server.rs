@@ -10,7 +10,7 @@ use crate::database::DatabasePool;
 use crate::yt_dlp_interface::YoutubeFetcher;
 use crate::mtproto_uploader::MTProtoUploader;
 use crate::utils::task_manager::TaskManager;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use teloxide::prelude::*;
 
@@ -38,10 +38,21 @@ pub struct ClaimRequest {
     pub ymid: String,
 }
 
+#[derive(Deserialize)]
+pub struct CheckStatusQuery {
+    pub ymid: String,
+}
+
+#[derive(Serialize)]
+pub struct CheckStatusResponse {
+    pub status: String,
+}
+
 pub async fn start_web_server(state: AppState, port: u16) {
     let app = Router::new()
         .route("/api/ads-status", get(get_ads_status))
         .route("/api/monetag-postback", get(monetag_postback))
+        .route("/api/check-status", get(check_ad_status))
         .route("/api/claim-video", post(claim_video))
         .fallback(serve_mini_app)
         .layer(CorsLayer::permissive())
@@ -99,6 +110,23 @@ async fn monetag_postback(
     }
 
     axum::http::StatusCode::OK
+}
+
+async fn check_ad_status(
+    State(state): State<AppState>,
+    Query(query): Query<CheckStatusQuery>,
+) -> Json<CheckStatusResponse> {
+    let db = state.db.clone();
+    let ymid = query.ymid.clone();
+
+    match db.get_pending_download_status(&ymid).await {
+        Ok(Some(status)) => Json(CheckStatusResponse { status }),
+        Ok(None) => Json(CheckStatusResponse { status: "not_found".to_string() }),
+        Err(e) => {
+            log::error!("Error checking status for ymid {}: {}", ymid, e);
+            Json(CheckStatusResponse { status: "error".to_string() })
+        }
+    }
 }
 
 async fn claim_video(

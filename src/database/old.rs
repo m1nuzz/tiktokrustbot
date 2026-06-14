@@ -126,6 +126,8 @@ pub fn init_database() -> Result<()> {
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)", ());
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_date ON downloads(download_date)", ());
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_date ON pending_downloads(created_at)", ());
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_downloads(status)", ());
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_user_id ON pending_downloads(user_id)", ());
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(timestamp)", ());
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(timestamp)", ());
 

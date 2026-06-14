@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>TikTok Downloader</title>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <script src='//libtl.com/sdk.js' data-zone='11093538' data-sdk='show_11093538'></script>
+    <script src='//libtl.com/sdk.js' data-zone='11093538' data-sdk='show_11093538' onerror="window._sdkLoadFailed = true" onload="window._sdkLoaded = true"></script>
     <style>
         :root {
             --bg-color: #0f172a;
@@ -159,69 +159,178 @@
     </div>
 
     <script>
+        // ========== КОНФИГУРАЦИЯ ==========
+        const AD_CONFIG = {
+            zone: '11093538',
+            sdkFn: 'show_11093538',
+            smartLink: 'https://omg10.com/4/11148490',
+            maxRetries: 8,
+            retryInterval: 1200,
+            pollInterval: 3000,
+            maxSmartLinkPolls: 20 // 60 секунд / 3 секунды
+        };
+
+        // ========== СОСТОЯНИЕ ==========
+        let retryCount = 0;
+        let retryTimerId = null;
+        let pollTimeoutId = null;
+        let isPolling = false;
+        let smartLinkPollCount = 0;
+        let currentAdSource = null; // 'sdk' или 'smartlink'
+
         const tg = window.Telegram.WebApp;
-        tg.ready();
-        tg.expand();
-
-        if (tg.themeParams.button_color) {
-            document.documentElement.style.setProperty('--accent-color', tg.themeParams.button_color);
-        }
-
         const loaderView = document.getElementById('loader-view');
         const loaderText = document.getElementById('loader-text');
         const loaderSubtext = document.getElementById('loader-subtext');
-        
         const contentView = document.getElementById('content-view');
         const adBtn = document.getElementById('ad-btn');
         const directBtn = document.getElementById('direct-btn');
         const statusMsg = document.getElementById('status-message');
         const description = document.getElementById('description');
-
-        const apiBase = window.location.origin;
         const urlParams = new URLSearchParams(window.location.search);
         const ymid = urlParams.get('ymid') || 'unknown_request';
+        const apiBase = window.location.origin;
 
-        async function init() {
-            try {
-                loaderText.innerText = "Checking Status";
-                const response = await fetch(`${apiBase}/api/ads-status`);
-                const data = await response.json();
-                
-                if (data.enabled) {
-                    loaderText.innerText = "Preparing Ad";
-                    loaderSubtext.innerText = "Please wait a moment...";
-                    startAdSequence();
-                } else {
-                    showFinalUI("Ready!", "Ads are currently disabled. You can go straight to the bot.", true);
-                }
-            } catch (e) {
-                console.error(e);
-                showFinalUI("Connection Error", "Could not reach the server.", true);
+        // ========== УТИЛИТЫ ==========
+        function cancelRetry() {
+            if (retryTimerId) {
+                clearTimeout(retryTimerId);
+                retryTimerId = null;
             }
         }
 
-        function startAdSequence() {
-            if (typeof show_11093538 === 'function') {
+        function stopPolling() {
+            isPolling = false;
+            if (pollTimeoutId) {
+                clearTimeout(pollTimeoutId);
+                pollTimeoutId = null;
+            }
+        }
+
+        function updateRetryUI(count) {
+            loaderText.innerText = "Loading Ad...";
+            loaderSubtext.innerText = `Please wait... (${count}/${AD_CONFIG.maxRetries})`;
+        }
+
+        function showError(message) {
+            loaderView.classList.add('hidden');
+            contentView.classList.remove('hidden');
+            document.getElementById('title').innerText = "Error";
+            description.innerText = message;
+            directBtn.classList.remove('hidden');
+        }
+
+        function showFinalUI(titleText, descText, showDirect) {
+            loaderView.classList.add('hidden');
+            contentView.classList.remove('hidden');
+            document.getElementById('title').innerText = titleText;
+            description.innerText = descText;
+            if (showDirect) directBtn.classList.remove('hidden');
+        }
+
+        // ========== POLLING МЕХАНИЗМ ==========
+        async function doPoll() {
+            if (!isPolling) return;
+
+            try {
+                const res = await fetch(`${apiBase}/api/check-status?ymid=${ymid}`);
+                const data = await res.json();
+
+                if (data.status === 'verified') {
+                    isPolling = false;
+                    onAdSuccess();
+                    return;
+                }
+
+                if (data.status === 'expired' || data.status === 'not_found') {
+                    isPolling = false;
+                    showError("Session expired. Please try again.");
+                    return;
+                }
+
+                // Для SmartLink: если слишком много попыток
+                if (currentAdSource === 'smartlink') {
+                    smartLinkPollCount++;
+                    if (smartLinkPollCount >= AD_CONFIG.maxSmartLinkPolls) {
+                        isPolling = false;
+                        showError("Ad verification may take longer with fallback. Please wait or try again later.");
+                        return;
+                    }
+                }
+
+                // Продолжаем polling
+                pollTimeoutId = setTimeout(doPoll, AD_CONFIG.pollInterval);
+            } catch (e) {
+                // При ошибке сети ждём дольше
+                pollTimeoutId = setTimeout(doPoll, AD_CONFIG.pollInterval * 2);
+            }
+        }
+
+        function startPolling() {
+            if (isPolling) return;
+            isPolling = true;
+            loaderText.innerText = "Waiting for verification...";
+            loaderSubtext.innerText = "Please keep the app open";
+            doPoll();
+        }
+
+        // ========== УРОВЕНЬ 1: SDK Ad ==========
+        function trySDKAd() {
+            if (typeof window[AD_CONFIG.sdkFn] === 'function') {
                 loaderText.innerText = "Starting Ad";
                 loaderSubtext.innerText = "Watch to support the bot!";
-                
-                show_11093538({ ymid: ymid })
+                currentAdSource = 'sdk';
+
+                // ✅ ИСПРАВЛЕНО: Используем ymid (а не subid1)
+                window[AD_CONFIG.sdkFn]({ ymid: ymid })
                     .then(() => {
-                        handleAdSuccess();
+                        // Запускаем polling - сервер подтвердит, когда получит Postback
+                        startPolling();
                     })
                     .catch((e) => {
                         console.error("Ad failed", e);
-                        showFinalUI("Manual Start Required", "The automatic start was blocked.", false);
-                        adBtn.classList.remove('hidden');
+                        trySmartLink();
                     });
             } else {
-                setTimeout(startAdSequence, 500);
+                retryCount++;
+                updateRetryUI(retryCount);
+
+                if (retryCount >= AD_CONFIG.maxRetries) {
+                    trySmartLink();
+                    return;
+                }
+                retryTimerId = setTimeout(trySDKAd, AD_CONFIG.retryInterval);
             }
         }
 
-        function handleAdSuccess() {
-            showFinalUI("Verification Complete", "Your video is ready to be sent to your chat.", false);
-            
+        // ========== УРОВЕНЬ 2: SmartLink ==========
+        function trySmartLink() {
+            cancelRetry();
+            currentAdSource = 'smartlink';
+            smartLinkPollCount = 0;
+            loaderText.innerText = "Opening ad in browser...";
+            loaderSubtext.innerText = "Return here after watching";
+
+            // SmartLink открывается БЕЗ параметров (Monetag будет использовать ymid из SDK вызова)
+            // Если нужно передавать ymid в SmartLink, проверьте настройку в Monetag Dashboard
+            if (window.Telegram?.WebApp) {
+                window.Telegram.WebApp.openLink(AD_CONFIG.smartLink);
+            } else {
+                window.open(AD_CONFIG.smartLink, '_blank');
+            }
+
+            // ВАЖНО: Запускаем polling СРАЗУ
+            startPolling();
+        }
+
+        // ========== УСПЕШНЫЙ ПРОСМОТР ==========
+        function onAdSuccess() {
+            stopPolling();
+            cancelRetry();
+
+            loaderView.classList.add('hidden');
+            contentView.classList.remove('hidden');
+
             tg.MainButton.setText("🚀 GET VIDEO NOW");
             tg.MainButton.show();
             tg.MainButton.onClick(async () => {
@@ -244,28 +353,60 @@
                 }
             });
 
-            if (tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
+            if (tg.HapticFeedback) {
+                tg.HapticFeedback.notificationOccurred('success');
+            }
         }
 
-        function showFinalUI(titleText, descText, showDirect) {
-            loaderView.classList.add('hidden');
-            contentView.classList.remove('hidden');
-            document.getElementById('title').innerText = titleText;
-            description.innerText = descText;
-            if (showDirect) directBtn.classList.remove('hidden');
+        // ========== ИНИЦИАЛИЗАЦИЯ ==========
+        tg.ready();
+        tg.expand();
+
+        if (tg.themeParams.button_color) {
+            document.documentElement.style.setProperty('--accent-color', tg.themeParams.button_color);
         }
 
+        // Проверяем статус рекламы
+        fetch(`${apiBase}/api/ads-status`)
+            .then(response => response.json())
+            .then(data => {
+                if (data.enabled) {
+                    loaderText.innerText = "Checking Status";
+                    loaderSubtext.innerText = "Please wait a moment...";
+                    trySDKAd();
+                } else {
+                    showFinalUI("Ready!", "Ads are currently disabled. You can go straight to the bot.", true);
+                }
+            })
+            .catch(e => {
+                console.error(e);
+                showError("Could not reach the server.");
+            });
+
+        // Обработчик кнопки Start Ad Manually
         adBtn.addEventListener('click', () => {
+            cancelRetry();
+            stopPolling();
+            retryCount = 0;
+            smartLinkPollCount = 0;
             adBtn.classList.add('hidden');
             loaderView.classList.remove('hidden');
-            startAdSequence();
+            contentView.classList.add('hidden');
+            trySDKAd();
         });
 
+        // Обработчик кнопки Continue to Bot
         directBtn.addEventListener('click', () => {
             tg.close();
         });
 
-        init();
+        // Visibility API: Мгновенный запрос при возврате в приложение
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible' && isPolling) {
+                clearTimeout(pollTimeoutId); // Отменяем ожидание
+                doPoll(); // Делаем запрос ПРЯМО СЕЙЧАС
+            }
+        });
     </script>
 </body>
 </html>

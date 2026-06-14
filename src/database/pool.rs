@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Result as SqliteResult, params};
+use rusqlite::{Connection, Result as SqliteResult, params, OptionalExtension};
 use tokio::sync::{Semaphore, Mutex};
 use tokio::time::{timeout, Duration};
 use std::sync::Arc;
@@ -249,6 +249,19 @@ impl DatabasePool {
             )?;
             Ok(user_id)
         }).await.map_err(|e| anyhow::anyhow!("Ymid {} not found: {}", id, e))
+    }
+
+    /// Get status for a pending download by ymid
+    pub async fn get_pending_download_status(&self, id: &str) -> Result<Option<String>, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let status: Option<String> = conn.query_row(
+                "SELECT status FROM pending_downloads WHERE id = ?1",
+                params![id_owned],
+                |row| row.get(0)
+            ).optional()?;
+            Ok(status)
+        }).await.map_err(|e| anyhow::anyhow!("Failed to get status for {}: {}", id, e))
     }
 
     /// Check if user has active premium status
