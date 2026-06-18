@@ -61,42 +61,203 @@ impl YoutubeFetcher {
         }
 
         // Video modes (h264 / h265 / best): download using 0-60% of the progress bar.
-        // This reserves 60-80% for a potential audio-fallback step if the chosen
-        // format turns out to be video-only (known yt-dlp/TikTok HEVC bug, #16950).
+        // This reserves 60-80% for fallback steps if the result is incomplete:
+        //   - missing video (TikTok hid the video, only audio served) -> tikwm fallback
+        //   - missing audio (yt-dlp HEVC video-only bug, #16950)        -> H.264 audio mux
         let primary_path = self
             .run_yt_dlp(&url, filename_stem, quality, fingerprint.clone(), progress_bar, 0, 60)
             .await?;
 
-        // Check whether the downloaded file actually contains an audio track.
-        match file_has_audio(&self.ffprobe_path(), &primary_path).await {
-            Ok(true) => {
-                log::info!("Downloaded file has audio track, no fallback needed: {:?}", primary_path);
-                progress_bar.update(80, Some("⬇️ Download completed")).await?;
-                Ok(primary_path)
-            }
-            Ok(false) => {
-                // TikTok served a video-only stream. Recover the audio by downloading an
-                // H.264 variant (which reliably has embedded audio) and muxing its audio
-                // track into the original (e.g. HEVC) video.
-                log::warn!(
-                    "Downloaded file is missing audio, attempting H.264 audio fallback: {:?}",
-                    primary_path
-                );
-                self.audio_fallback(&url, filename_stem, fingerprint.clone(), &primary_path, progress_bar)
-                    .await
-            }
+        let has_video = self.file_has_video(&primary_path).await;
+        let has_audio = matches!(file_has_audio(&self.ffprobe_path(), &primary_path).await, Ok(true));
+
+        // Case 1: no video stream at all — TikTok served an audio-only file (e.g. the post's
+        // video is restricted on the web API, playAddr is empty). The user asked for a video,
+        // so fall back to the tikwm API which exposes the real CDN video URL in these cases.
+        if !has_video {
+            log::warn!(
+                "Downloaded file has no video stream (audio-only); attempting tikwm fallback: {:?}",
+                primary_path
+            );
+            return self
+                .tikwm_video_fallback(&url, filename_stem, &primary_path, progress_bar)
+                .await;
+        }
+
+        // Case 2: video present but audio missing — HEVC video-only stream (yt-dlp #16950).
+        // Recover the audio from an H.264 variant and mux it in.
+        if !has_audio {
+            log::warn!(
+                "Downloaded file is missing audio, attempting H.264 audio fallback: {:?}",
+                primary_path
+            );
+            return self
+                .audio_fallback(&url, filename_stem, fingerprint.clone(), &primary_path, progress_bar)
+                .await;
+        }
+
+        // Both streams present — deliver as-is.
+        log::info!("Downloaded file has both video and audio, no fallback needed: {:?}", primary_path);
+        progress_bar.update(80, Some("⬇️ Download completed")).await?;
+        Ok(primary_path)
+    }
+
+    /// Checks whether a downloaded file actually contains a video stream.
+    ///
+    /// Some TikTok posts only expose an audio-only format via the web API (the post's
+    /// `playAddr` is empty server-side, often due to copyrighted music), so a "video"
+    /// download request can actually yield a bare `.mp3` file. This probe lets callers
+    /// detect that situation and recover the real video via the tikwm fallback.
+    pub async fn file_has_video(&self, file_path: &Path) -> bool {
+        match probe_stream_present(&self.ffprobe_path(), "v", file_path).await {
+            Ok(has) => has,
+            // If ffprobe itself fails, assume video is present so we don't accidentally
+            // trigger a redundant fallback on a real video.
             Err(e) => {
-                // If ffprobe itself fails, don't risk an incorrect fallback — just deliver the
-                // original file (preserves previous behavior) but warn about it.
                 log::warn!(
-                    "Could not probe audio for {:?} ({}); delivering file as-is",
-                    primary_path,
+                    "Could not probe video stream for {:?} ({}); assuming video present",
+                    file_path,
                     e
                 );
-                progress_bar.update(80, Some("⬇️ Download completed")).await?;
-                Ok(primary_path)
+                true
             }
         }
+    }
+
+    /// Fallback used when yt-dlp could only obtain an audio-only file for a post whose
+    /// video is hidden from the TikTok web API. Queries the tikwm public API, which
+    /// exposes the real CDN video URL, downloads that file (with audio) and returns it.
+    async fn tikwm_video_fallback(
+        &self,
+        url: &str,
+        filename_stem: &str,
+        primary_path: &Path,
+        progress_bar: &mut ProgressBar,
+    ) -> Result<PathBuf> {
+        progress_bar
+            .update(60, Some("🔧 Video unavailable via TikTok API — trying alternate source..."))
+            .await?;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+
+        let api_url = format!("https://www.tikwm.com/api/?url={}", url);
+        log::info!("Querying tikwm API: {}", api_url);
+
+        let resp = client
+            .get(&api_url)
+            .header("User-Agent", "Mozilla/5.0")
+            .header("Referer", "https://www.tikwm.com/")
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            log::error!("tikwm API returned HTTP {}, delivering original file", resp.status());
+            progress_bar.update(80, Some("⬇️ Download completed")).await?;
+            return Ok(primary_path.to_path_buf());
+        }
+
+        // Parse { "code": 0, "data": { "play": "<url>", "wmplay": "<url>", ... } }
+        let body: serde_json::Value = resp.json().await?;
+        if body.get("code").and_then(|v| v.as_i64()) != Some(0) {
+            log::error!(
+                "tikwm API returned non-zero code: {:?}; delivering original file",
+                body.get("code")
+            );
+            progress_bar.update(80, Some("⬇️ Download completed")).await?;
+            return Ok(primary_path.to_path_buf());
+        }
+
+        // Prefer the no-watermark "play" URL; fall back to "wmplay" if absent.
+        let video_url = body
+            .get("data")
+            .and_then(|d| d.get("play"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                body.get("data")
+                    .and_then(|d| d.get("wmplay"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+            });
+
+        let video_url = match video_url {
+            Some(u) => {
+                log::info!("tikwm provided video URL: {}", u);
+                u.to_string()
+            }
+            None => {
+                log::error!("tikwm API returned no video URL in data.play/wmplay; delivering original file");
+                progress_bar.update(80, Some("⬇️ Download completed")).await?;
+                return Ok(primary_path.to_path_buf());
+            }
+        };
+
+        // Download the alternate-source video into a fresh .mp4 file.
+        progress_bar.update(70, Some("⬇️ Downloading from alternate source...")).await?;
+        let fallback_path = self.output_dir.join(format!("{}_alt.mp4", filename_stem));
+        let mut fallback_guard = TempFileGuard::new(fallback_path.clone());
+
+        let download_resp = client
+            .get(&video_url)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+            .header("Referer", "https://www.tikwm.com/")
+            .header("Accept", "*/*")
+            .send()
+            .await?;
+
+        if !download_resp.status().is_success() {
+            log::error!(
+                "tikwm CDN returned HTTP {}, delivering original file",
+                download_resp.status()
+            );
+            progress_bar.update(80, Some("⬇️ Download completed")).await?;
+            return Ok(primary_path.to_path_buf());
+        }
+
+        let bytes = download_resp.bytes().await?;
+        if bytes.is_empty() {
+            log::error!("tikwm CDN returned empty body, delivering original file");
+            progress_bar.update(80, Some("⬇️ Download completed")).await?;
+            return Ok(primary_path.to_path_buf());
+        }
+        tokio::fs::write(&fallback_path, &bytes).await?;
+        log::info!("tikwm fallback downloaded {} bytes to {:?}", bytes.len(), fallback_path);
+
+        // Verify the alternate file actually has a video stream before using it.
+        if !self.file_has_video(&fallback_path).await {
+            log::error!("tikwm fallback file has no video stream, delivering original file");
+            progress_bar.update(80, Some("⬇️ Download completed")).await?;
+            return Ok(primary_path.to_path_buf());
+        }
+
+        // Replace the audio-only primary file with the real video. Try rename, fall back to
+        // copy across volumes, and ensure the primary extension becomes .mp4.
+        let final_path = primary_path.with_extension("mp4");
+        let cleanup_old = if final_path != *primary_path && primary_path.exists() {
+            Some(primary_path.to_path_buf())
+        } else {
+            None
+        };
+
+        if let Err(e) = tokio::fs::rename(&fallback_path, &final_path).await {
+            tokio::fs::copy(&fallback_path, &final_path).await?;
+            fallback_guard.forget();
+            log::debug!("Copied tikwm fallback to primary (rename failed: {})", e);
+        } else {
+            fallback_guard.forget();
+        }
+
+        // Remove the now-replaced audio-only file if it had a different extension.
+        if let Some(old) = cleanup_old {
+            if old.exists() {
+                let _ = tokio::fs::remove_file(&old).await;
+            }
+        }
+
+        progress_bar.update(80, Some("⬇️ Download completed")).await?;
+        Ok(final_path)
     }
 
     /// Downloads a fresh H.264 (avc) copy of the video, extracts its audio track, and
@@ -404,13 +565,18 @@ fn scale_to_range(percentage: f64, start_pct: u8, span: f64) -> u8 {
     scaled.round().clamp(0.0, 100.0) as u8
 }
 
-/// Uses ffprobe to determine whether the given file contains at least one audio stream.
-async fn file_has_audio(ffprobe_path: &Path, file_path: &Path) -> Result<bool> {
+/// Uses ffprobe to determine whether the given file contains at least one stream of the
+/// given type. `stream_type` is the ffprobe selector, e.g. `"a"` for audio, `"v"` for video.
+async fn probe_stream_present(
+    ffprobe_path: &Path,
+    stream_type: &str,
+    file_path: &Path,
+) -> Result<bool> {
     let output = Command::new(ffprobe_path)
         .arg("-v")
         .arg("error")
         .arg("-select_streams")
-        .arg("a")
+        .arg(stream_type)
         .arg("-show_entries")
         .arg("stream=index")
         .arg("-of")
@@ -429,8 +595,14 @@ async fn file_has_audio(ffprobe_path: &Path, file_path: &Path) -> Result<bool> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // If an audio stream exists, ffprobe prints at least one line with the stream index.
+    // If a stream of the requested type exists, ffprobe prints at least one line with the
+    // stream index.
     Ok(stdout.lines().any(|l| !l.trim().is_empty()))
+}
+
+/// Uses ffprobe to determine whether the given file contains at least one audio stream.
+async fn file_has_audio(ffprobe_path: &Path, file_path: &Path) -> Result<bool> {
+    probe_stream_present(ffprobe_path, "a", file_path).await
 }
 
 fn parse_progress_line(line: &str) -> Option<(f64, u64)> {
