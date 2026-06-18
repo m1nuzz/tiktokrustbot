@@ -683,4 +683,27 @@ mod tests {
         assert_eq!(percentage, 50.0);
         assert_eq!(total_size, 10_485_760); // 10 MiB
     }
+
+    #[test]
+    fn test_scale_to_range_full_span() {
+        // Scale 0-100% into 0-100 range
+        assert_eq!(scale_to_range(0.0, 0, 100.0), 0);
+        assert_eq!(scale_to_range(50.0, 0, 100.0), 50);
+        assert_eq!(scale_to_range(100.0, 0, 100.0), 100);
+    }
+
+    #[test]
+    fn test_scale_to_range_partial_span() {
+        // Scale 0-100% into 60-80 range (20% span)
+        assert_eq!(scale_to_range(0.0, 60, 20.0), 60);
+        assert_eq!(scale_to_range(50.0, 60, 20.0), 70);
+        assert_eq!(scale_to_range(100.0, 60, 20.0), 80);
+    }
+
+    #[test]
+    fn test_scale_to_range_clamping() {
+        // Values outside 0-100 should be clamped
+        assert_eq!(scale_to_range(-10.0, 0, 100.0), 0);
+        assert_eq!(scale_to_range(110.0, 0, 100.0), 100);
+    }
 }
