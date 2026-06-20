@@ -1,0 +1,23 @@
+{
+  "name": "tiktok-downloader-tests",
+  "version": "1.0.0",
+  "description": "Tests for TikTok Downloader Telegram Mini App",
+  "type": "module",
+  "scripts": {
+    "test": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest watch"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^1.0.0",
+    "jsdom": "^24.0.0",
+    "vitest": "^1.0.0"
+  },
+  "keywords": [
+    "telegram",
+    "mini-app",
+    "tests"
+  ],
+  "author": "m1nuzz",
+  "license": "MIT"
+}
