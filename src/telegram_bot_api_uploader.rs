@@ -50,7 +50,11 @@ pub async fn send_video_with_progress_botapi(
     progress_bar: &mut ProgressBar,
 ) -> anyhow::Result<()> {
     // Get paths for ffmpeg and ffprobe
-    let libraries_dir = std::env::current_dir()?.join("lib");
+    let exe_dir = std::env::current_exe()?
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get parent directory of executable"))?
+        .to_path_buf();
+    let libraries_dir = exe_dir.join("lib");
     let ffmpeg_dir = libraries_dir.join("ffmpeg");
     let ffmpeg_path = ffmpeg_dir.join(if cfg!(target_os = "windows") { "ffmpeg.exe" } else { "ffmpeg" });
     let ffprobe_path = ffmpeg_dir.join(if cfg!(target_os = "windows") { "ffprobe.exe" } else { "ffprobe" });
