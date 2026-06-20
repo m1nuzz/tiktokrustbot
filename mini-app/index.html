@@ -407,15 +407,10 @@
             loaderSubtext.innerText = "Return here after watching";
 
             // Add ymid parameter to SmartLink for fallback tracking
-            // Умное добавление inapp=1 + subid1 для встроенного браузера
-            const rawSmartLink = AD_CONFIG.smartLink;
-            const separator = rawSmartLink.includes('?') ? '&' : '?';
-            const smartLinkUrl = `${rawSmartLink}${separator}ymid=${encodeURIComponent(ymid)}&subid1=${encodeURIComponent(ymid)}&inapp=1`;
+            const smartLinkUrl = `${AD_CONFIG.smartLink}?ymid=${encodeURIComponent(ymid)}`;
             
             if (window.Telegram?.WebApp) {
-                // КРИТИЧНО: try_instant_view: false
-                // Отключаем Instant View, чтобы Monetag мог выполнить JS и цепочку редиректов
-                window.Telegram.WebApp.openLink(smartLinkUrl, { try_instant_view: false });
+                window.Telegram.WebApp.openLink(smartLinkUrl);
             } else {
                 window.open(smartLinkUrl, '_blank');
             }
