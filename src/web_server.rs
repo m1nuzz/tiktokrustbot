@@ -122,20 +122,19 @@ async fn monetag_postback(
         query.ymid, query.subid1, event_type
     );
 
-    // 3. Логика верификации (принимаем только valued события)
-    if event_type == "valued" || event_type == "conversion" || query.reward_event_type.is_none() {
+    // 3. Логика верификации - выдаем награду при ЛЮБОМ постбэке
+    // (и valued, и non_valued)
+    if !actual_ymid.is_empty() {
         let db = state.db.clone();
         let ymid = actual_ymid.clone();
         
         if let Err(e) = db.mark_as_verified(&ymid).await {
             log::error!("Failed to mark download as verified for ymid {}: {}", ymid, e);
         } else {
-            log::info!("✅ VALUED impression confirmed for ymid: {} (MONEY EARNED!)", ymid);
+            log::info!("✅ Impression confirmed for ymid: {} (type: {})", ymid, event_type);
         }
-    } else if event_type == "non_valued" {
-        log::warn!("⚠️ NON-VALUED event for ymid: {} - User did NOT generate revenue!", actual_ymid);
     } else {
-        log::warn!("Received unknown event_type='{}' for ymid: {}", event_type, actual_ymid);
+        log::warn!("⚠️ Postback without valid ID. Query: {:?}", query);
     }
 
     axum::http::StatusCode::OK
