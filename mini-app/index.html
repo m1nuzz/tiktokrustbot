@@ -313,10 +313,13 @@
             loaderSubtext.innerText = "Return here after watching";
 
             // Add ymid parameter to SmartLink for fallback tracking
-            const smartLinkUrl = `${AD_CONFIG.smartLink}?ymid=${encodeURIComponent(ymid)}`;
+            // Умное добавление inapp=1 для встроенного браузера
+            const rawSmartLink = AD_CONFIG.smartLink;
+            const separator = rawSmartLink.includes('?') ? '&' : '?';
+            const smartLinkUrl = `${rawSmartLink}${separator}ymid=${encodeURIComponent(ymid)}&inapp=1`;
             
             if (window.Telegram?.WebApp) {
-                window.Telegram.WebApp.openLink(smartLinkUrl);
+                window.Telegram.WebApp.openLink(smartLinkUrl, { try_instant_view: true });
             } else {
                 window.open(smartLinkUrl, '_blank');
             }
@@ -325,39 +328,79 @@
             startPolling();
         }
 
-        // ========== УСПЕШНЫЙ ПРОСМОТР ==========
+        // ========== АВТОМАТИЧЕСКАЯ ВЫДАЧА ВИДЕО ==========
+
+        // 🔹 Функция 1: Отдельный fetch для claim (используется при успехе и при Retry)
+        async function claimVideo() {
+            // Показываем спиннер
+            loaderView.classList.remove('hidden');
+            contentView.classList.add('hidden');
+            loaderText.innerText = "Отправляем ваше видео в чат...";
+            loaderSubtext.innerText = "Пожалуйста, подождите...";
+            
+            tg.MainButton.hide();
+            
+            try {
+                const claimRes = await fetch(`${apiBase}/api/claim-video`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ymid: ymid })
+                });
+                const claimData = await claimRes.json();
+                
+                if (claimData.success) {
+                    // УСПЕХ: галочка + автозакрытие через 1.5с
+                    loaderText.innerText = "✅ Видео успешно отправлено в чат!";
+                    loaderSubtext.innerText = "Возвращаемся в бот...";
+                    
+                    if (tg.HapticFeedback) {
+                        tg.HapticFeedback.notificationOccurred('success');
+                    }
+                    
+                    setTimeout(() => {
+                        tg.close();
+                    }, 1500);
+                } else {
+                    // ОШИБКА: показываем content-view с Retry
+                    showErrorView("Ошибка", "❌ " + (claimData.error || "Не удалось выдать видео"), true);
+                }
+            } catch (e) {
+                // СЕТЕВАЯ ОШИБКА
+                console.error('Claim error:', e);
+                showErrorView("Ошибка сети", "❌ Не удалось подключиться к серверу. Проверьте интернет.", true);
+            }
+        }
+
+        // 🔹 Функция 2: Вспомогательная для показа ошибки с кнопкой Retry
+        function showErrorView(titleText, descriptionText, showRetry) {
+            loaderView.classList.add('hidden');
+            contentView.classList.remove('hidden');
+            document.getElementById('title').innerText = titleText;
+            description.innerText = descriptionText;
+            
+            if (showRetry) {
+                directBtn.innerText = "🔄 Попробовать еще раз";
+                directBtn.classList.remove('hidden');
+                directBtn.onclick = function() {
+                    directBtn.classList.add('hidden');
+                    claimVideo(); // ВАЖНО: Только claimVideo(), БЕЗ рекурсии onAdSuccess
+                };
+            } else {
+                directBtn.classList.add('hidden');
+            }
+        }
+
+        // 🔹 Функция 3: Успех рекламы (вызывается после подтверждения polling-ом)
         function onAdSuccess() {
             stopPolling();
             cancelRetry();
-
-            loaderView.classList.add('hidden');
-            contentView.classList.remove('hidden');
-
-            tg.MainButton.setText("🚀 GET VIDEO NOW");
-            tg.MainButton.show();
-            tg.MainButton.onClick(async () => {
-                tg.MainButton.showProgress();
-                try {
-                    const claimRes = await fetch(`${apiBase}/api/claim-video`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ ymid: ymid })
-                    });
-                    const claimData = await claimRes.json();
-                    if (claimData.success) {
-                        tg.close();
-                    } else {
-                        statusMsg.innerText = "❌ " + (claimData.error || "Verification expired. Try again.");
-                        tg.MainButton.hideProgress();
-                    }
-                } catch (e) {
-                    tg.close();
-                }
-            });
-
+            
             if (tg.HapticFeedback) {
                 tg.HapticFeedback.notificationOccurred('success');
             }
+            
+            // Сразу запускаем claim (без ручного клика!)
+            claimVideo();
         }
 
         // ========== ИНИЦИАЛИЗАЦИЯ ==========
