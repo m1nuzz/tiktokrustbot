@@ -128,6 +128,16 @@ async fn main() -> Result<(), Error> {
     log::info!("🗄️ Using database at: {}", db_path);
     let db_pool = Arc::new(DatabasePool::new(db_path, 3));
 
+    // Автоматическая миграция БД: добавляем колонку estimated_price если её нет
+    // SQLite проигнорирует ALTER TABLE если колонка уже существует
+    if let Err(e) = db_pool.execute_with_timeout(|conn| {
+        // Пытаемся добавить колонку estimated_price в pending_downloads
+        let _ = conn.execute("ALTER TABLE pending_downloads ADD COLUMN estimated_price TEXT DEFAULT NULL", ());
+        Ok(())
+    }).await {
+        log::warn!("⚠️  Database migration warning: {}", e);
+    }
+
     // Sync settings from .env to database (only as initial defaults, don't overwrite admin panel values)
     if let Ok(sub_req) = env::var("SUBSCRIPTION_REQUIRED") {
         if db_pool.get_setting("subscription_required").await.is_err() {

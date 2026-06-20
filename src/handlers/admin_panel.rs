@@ -154,6 +154,7 @@ pub async fn daily_stats_text_handler(
                 *Monetization*\n\
                 💰 Payments Today:     {}\n\
                 ⭐ Revenue \\(Stars\\):    {}\n\
+                💵 Monetag Revenue:   *${:.4} USD*\n\
                 📈 Ad → Pay CR:        {}%\n\
                 🔄 Invoices Sent:      {}\n\
                 💳 Invoice → Pay CR:   {}%\n\n",
@@ -169,6 +170,7 @@ pub async fn daily_stats_text_handler(
                 e(s.returning_users.to_string()),
                 e(s.payments_count.to_string()),
                 e(s.revenue_xtr.to_string()),
+                e(format!("{:.4}", s.monetag_revenue_usd)),
                 e(format!("{:.1}", ad_pay_cr)),
                 e(s.invoices_sent.to_string()),
                 e(format!("{:.1}", inv_pay_cr))

@@ -29,12 +29,33 @@ pub struct AppState {
 
 #[derive(Deserialize, Debug)]
 pub struct PostbackQuery {
-    // Делаем оба параметра опциональными
+    // Основные идентификаторы
     pub ymid: Option<String>,
     pub subid1: Option<String>,
-    // Добавляем алиасы для совместимости с разными форматами Monetag
-    #[serde(alias = "value", alias = "reward_event_type", alias = "event_type", default)]
+    
+    // Параметры события (алиасы из официальной документации Monetag)
+    #[serde(alias = "event_type", alias = "event")]
+    pub event_type: Option<String>,
+    
+    #[serde(alias = "reward_event_type", alias = "value")]
     pub reward_event_type: Option<String>,
+    
+    #[serde(alias = "estimated_price", alias = "price", alias = "amount")]
+    pub estimated_price: Option<String>,
+    
+    // Параметры зон
+    #[serde(alias = "zone_id", alias = "zone")]
+    pub zone_id: Option<String>,
+    
+    #[serde(alias = "sub_zone_id", alias = "sub")]
+    pub sub_zone_id: Option<String>,
+    
+    // Дополнительные параметры
+    #[serde(alias = "request_var", alias = "source")]
+    pub request_var: Option<String>,
+    
+    #[serde(alias = "telegram_id")]
+    pub telegram_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -109,32 +130,62 @@ async fn monetag_postback(
         .unwrap_or_default();
 
     if actual_ymid.is_empty() {
-        log::warn!("⚠️ Постбек без ymid и subid1. Query: {:?}", query);
-        return axum::http::StatusCode::OK;
+        log::warn!("⚠️  Постбек без ymid и subid1. Full query: {:?}", query);
+        return axum::http::StatusCode::BAD_REQUEST;
     }
 
-    // 2. Определяем тип события
-    let event_type = query.reward_event_type.clone()
-        .unwrap_or_else(|| "valued".to_string())
-        .to_lowercase();
+    // 2. Получаем reward_event_type для логгирования
+    let reward_event_type = query.reward_event_type.clone()
+        .map(|v| v.to_lowercase())
+        .unwrap_or_default();
 
-    log::info!("📥 Received Monetag postback: ymid={:?}, subid1={:?}, type={}", 
-        query.ymid, query.subid1, event_type
+    // 3. Полное логгирование всех параметров (для отладки)
+    log::info!(
+        "📥 Monetag postback: ymid={}, subid1={:?}, event_type={:?}, reward_event_type={}, estimated_price={:?}, zone_id={:?}, sub_zone_id={:?}, request_var={:?}, telegram_id={:?}",
+        actual_ymid,
+        query.subid1,
+        query.event_type,
+        reward_event_type,
+        query.estimated_price,
+        query.zone_id,
+        query.sub_zone_id,
+        query.request_var,
+        query.telegram_id
     );
 
-    // 3. Логика верификации - выдаем награду при ЛЮБОМ постбэке
-    // (и valued, и non_valued)
-    if !actual_ymid.is_empty() {
-        let db = state.db.clone();
-        let ymid = actual_ymid.clone();
-        
-        if let Err(e) = db.mark_as_verified(&ymid).await {
-            log::error!("Failed to mark download as verified for ymid {}: {}", ymid, e);
-        } else {
-            log::info!("✅ Impression confirmed for ymid: {} (type: {})", ymid, event_type);
+    // 4. Логика верификации - выдаем награду при ЛЮБОМ постбэке
+    // (и valued, и non_valued) - согласно требованию пользователя
+    let db = state.db.clone();
+    let ymid = actual_ymid.clone();
+    
+    // Проверяем текущий статус для защиты от дубликатов
+    match db.get_pending_download_status(&ymid).await {
+        Ok(Some(status)) if status == "verified" || status == "completed" => {
+            log::info!("⏭️  Duplicate postback for ymid: {}. Status: {}", ymid, status);
+            return axum::http::StatusCode::OK;
+        },
+        Ok(_) => {
+            // Статус pending или не существует - обрабатываем
+            if let Err(e) = db.mark_as_verified(&ymid).await {
+                log::error!("❌ Failed to mark download as verified for ymid {}: {}", ymid, e);
+                return axum::http::StatusCode::INTERNAL_SERVER_ERROR;
+            }
+            
+            // Сохраняем estimated_price для аналитики
+            if let Some(ref price) = query.estimated_price {
+                if let Err(e) = db.save_estimated_price(&ymid, price).await {
+                    log::warn!("⚠️  Failed to save estimated_price for ymid {}: {}", ymid, e);
+                } else {
+                    log::debug!("💰 Saved estimated_price={} for ymid={}", price, ymid);
+                }
+            }
+            
+            log::info!("✅ Postback confirmed for ymid: {} (reward_event_type: {})", ymid, reward_event_type);
+        },
+        Err(e) => {
+            log::error!("❌ Database error checking status for ymid {}: {}", ymid, e);
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR;
         }
-    } else {
-        log::warn!("⚠️ Postback without valid ID. Query: {:?}", query);
     }
 
     axum::http::StatusCode::OK

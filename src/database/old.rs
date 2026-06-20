@@ -113,6 +113,8 @@ pub fn init_database() -> Result<()> {
         "CREATE TABLE IF NOT EXISTS pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
     )?;
+    // Add estimated_price column for Monetag revenue tracking if it doesn't exist
+    let _ = conn.execute("ALTER TABLE pending_downloads ADD COLUMN estimated_price TEXT DEFAULT NULL", ());
     conn.execute(
         "CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY, user_id BIGINT NOT NULL, amount INTEGER NOT NULL, payload TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),

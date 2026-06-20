@@ -34,6 +34,8 @@ pub struct RichDailyStats {
     pub peak_hour: Option<(u32, i64)>,
     pub top_downloaders: Vec<(i64, i64)>,
     pub last_active_users: Vec<(i64, String)>,
+    // Доход от Monetag postbacks (в USD)
+    pub monetag_revenue_usd: f64,
 }
 
 impl DatabasePool {
@@ -198,6 +200,19 @@ impl DatabasePool {
             )?;
             Ok(())
         }).await.map_err(|e| anyhow::anyhow!("Failed to verify download {}: {}", id, e))
+    }
+
+    /// Сохранить estimated_price из Monetag postback для аналитики
+    pub async fn save_estimated_price(&self, id: &str, price: &str) -> Result<(), anyhow::Error> {
+        let id_owned = id.to_string();
+        let price_owned = price.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "UPDATE pending_downloads SET estimated_price = ?1 WHERE id = ?2",
+                params![price_owned, id_owned],
+            )?;
+            Ok(())
+        }).await.map_err(|e| anyhow::anyhow!("Failed to save estimated_price for {}: {}", id, e))
     }
 
     /// Mark as verified and return number of rows affected for better debugging
@@ -376,6 +391,11 @@ impl DatabasePool {
                 "SELECT COUNT(*) FROM pending_downloads WHERE date(created_at) = date('now')",
                 [], |r| r.get(0)).unwrap_or(0);
 
+            // Monetag revenue от postbacks (сумма estimated_price за сегодня)
+            let monetag_revenue_usd: f64 = conn.query_row(
+                "SELECT COALESCE(SUM(CAST(estimated_price AS REAL)), 0) FROM pending_downloads WHERE date(created_at) = date('now')",
+                [], |r| r.get(0)).unwrap_or(0.0);
+
             let new_users: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM users WHERE date(created_at) = date('now')",
                 [], |r| r.get(0)).unwrap_or(0);
@@ -431,6 +451,7 @@ impl DatabasePool {
                 payments_count,
                 revenue_xtr,
                 invoices_sent,
+                monetag_revenue_usd,
                 peak_hour: peak_hour_data,
                 top_downloaders,
                 last_active_users,
@@ -452,7 +473,7 @@ mod tests {
         // Initialize all necessary tables
         pool.execute_with_timeout(|conn| {
             conn.execute(
-                "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME)",
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME)",
                 (),
             )?;
             conn.execute(
@@ -460,7 +481,25 @@ mod tests {
                 (),
             )?;
             conn.execute(
-                "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+                "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, estimated_price TEXT DEFAULT NULL)",
+                (),
+            )?;
+            // Создаем таблицы для Daily Stats (используются в get_rich_daily_stats)
+            conn.execute(
+                "CREATE TABLE downloads (id INTEGER PRIMARY KEY, user_telegram_id BIGINT, video_url TEXT NOT NULL, download_date DATETIME DEFAULT CURRENT_TIMESTAMP)",
+                (),
+            )?;
+            conn.execute(
+                "CREATE TABLE payments (id INTEGER PRIMARY KEY, user_id BIGINT NOT NULL, amount INTEGER NOT NULL, payload TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)",
+                (),
+            )?;
+            conn.execute(
+                "CREATE TABLE invoices (id INTEGER PRIMARY KEY, user_id BIGINT NOT NULL, amount INTEGER NOT NULL, payload TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)",
+                (),
+            )?;
+            // Создаем таблицу channels (используется в lib.rs)
+            conn.execute(
+                "CREATE TABLE channels (id INTEGER PRIMARY KEY, channel_id TEXT UNIQUE NOT NULL, channel_name TEXT)",
                 (),
             )?;
             Ok(())
