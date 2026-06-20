@@ -181,9 +181,8 @@ pub async fn link_handler(
 
                 let mut final_url = url_obj;
                 final_url.query_pairs_mut().append_pair("ymid", &ymid);
-
-                let lang = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
                 
+                let lang = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
                 let ad_btn_text = get_localized_ad_button_text(lang);
                 let prem_btn_text = get_localized_premium_button_text(lang);
                 let choice_text = get_localized_choice_text(lang);

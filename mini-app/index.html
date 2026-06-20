@@ -189,7 +189,19 @@
         const statusMsg = document.getElementById('status-message');
         const description = document.getElementById('description');
         const urlParams = new URLSearchParams(window.location.search);
-        const ymid = urlParams.get('ymid') || 'unknown_request';
+        const rawYmid = urlParams.get('ymid');
+
+        // 🛑 Предохранитель: если нет валидного ymid — прерываем flow
+        if (!rawYmid) {
+            showErrorView(
+                "Ошибка сессии",
+                "Не удалось определить ваш запрос. Ссылка устарела или открыта некорректно. Вернитесь в бот и нажмите кнопку скачивания еще раз.",
+                false  // без Retry — сессия мертва
+            );
+            throw new Error("Missing ymid in URL");
+        }
+
+        const ymid = rawYmid;
         const apiBase = window.location.origin;
 
         // ========== УТИЛИТЫ ==========
@@ -282,8 +294,11 @@
                 loaderSubtext.innerText = "Watch to support the bot!";
                 currentAdSource = 'sdk';
 
-                // ✅ ИСПРАВЛЕНО: Используем ymid (а не subid1)
-                window[AD_CONFIG.sdkFn]({ ymid: ymid })
+                // ✅ ИСПРАВЛЕНО: Используем ymid + requestVar для аналитики
+                window[AD_CONFIG.sdkFn]({
+                    ymid: ymid,
+                    requestVar: 'main_reward_button'
+                })
                     .then(() => {
                         // Запускаем polling - сервер подтвердит, когда получит Postback
                         startPolling();
@@ -313,13 +328,15 @@
             loaderSubtext.innerText = "Return here after watching";
 
             // Add ymid parameter to SmartLink for fallback tracking
-            // Умное добавление inapp=1 для встроенного браузера
+            // Умное добавление inapp=1 + subid1 для встроенного браузера
             const rawSmartLink = AD_CONFIG.smartLink;
             const separator = rawSmartLink.includes('?') ? '&' : '?';
-            const smartLinkUrl = `${rawSmartLink}${separator}ymid=${encodeURIComponent(ymid)}&inapp=1`;
+            const smartLinkUrl = `${rawSmartLink}${separator}ymid=${encodeURIComponent(ymid)}&subid1=${encodeURIComponent(ymid)}&inapp=1`;
             
             if (window.Telegram?.WebApp) {
-                window.Telegram.WebApp.openLink(smartLinkUrl, { try_instant_view: true });
+                // КРИТИЧНО: try_instant_view: false
+                // Отключаем Instant View, чтобы Monetag мог выполнить JS и цепочку редиректов
+                window.Telegram.WebApp.openLink(smartLinkUrl, { try_instant_view: false });
             } else {
                 window.open(smartLinkUrl, '_blank');
             }

@@ -104,8 +104,8 @@ async fn monetag_postback(
     let event_type = query.reward_event_type.to_lowercase();
     log::info!("Received Monetag postback: ymid={}, type={}", query.ymid, event_type);
 
-    // Accept both valued and non_valued (for testing and fallback traffic)
-    if event_type == "valued" || event_type == "non_valued" {
+    // ✅ ИСПРАВЛЕНО: Принимаем ТОЛЬКО valued (оплачиваемые) события
+    if event_type == "valued" {
         let db = state.db.clone();
         let ymid = query.ymid.clone();
         
@@ -113,8 +113,17 @@ async fn monetag_postback(
         if let Err(e) = db.mark_as_verified(&ymid).await {
             log::error!("Failed to mark download as verified for ymid {}: {}", ymid, e);
         } else {
-            log::info!("Download {} marked as VERIFIED (type: {})", ymid, query.reward_event_type);
+            log::info!("✅ VALUED impression confirmed for ymid: {} (MONEY EARNED!)", ymid);
         }
+    } else if event_type == "non_valued" {
+        // ⚠️ Monetag НЕ заплатит за этот трафик
+        log::warn!(
+            "⚠️ NON-VALUED event for ymid: {} (type: {}) - User did NOT generate revenue!",
+            query.ymid,
+            query.reward_event_type
+        );
+        // НЕ помечаем как verified — пользователь не получит видео
+        // и сможет попробовать ещё раз
     } else {
         log::warn!("Received unknown event_type='{}' for ymid: {}", event_type, query.ymid);
     }
