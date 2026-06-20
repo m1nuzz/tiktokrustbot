@@ -29,10 +29,12 @@ pub struct AppState {
 
 #[derive(Deserialize, Debug)]
 pub struct PostbackQuery {
-    pub ymid: String,
-    // Accept both "value" (per Monetag docs) and "reward_event_type" for backwards compatibility
-    #[serde(alias = "value", alias = "reward_event_type")]
-    pub reward_event_type: String,
+    // Делаем оба параметра опциональными
+    pub ymid: Option<String>,
+    pub subid1: Option<String>,
+    // Добавляем алиасы для совместимости с разными форматами Monetag
+    #[serde(alias = "value", alias = "reward_event_type", alias = "event_type", default)]
+    pub reward_event_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -101,31 +103,39 @@ async fn monetag_postback(
     State(state): State<AppState>,
     Query(query): Query<PostbackQuery>,
 ) -> impl axum::response::IntoResponse {
-    let event_type = query.reward_event_type.to_lowercase();
-    log::info!("Received Monetag postback: ymid={}, type={}", query.ymid, event_type);
+    // 1. Определяем реальный ID сессии (ymid от SDK ИЛИ subid1 от SmartLink)
+    let actual_ymid = query.ymid.clone()
+        .or_else(|| query.subid1.clone())
+        .unwrap_or_default();
 
-    // ✅ ИСПРАВЛЕНО: Принимаем ТОЛЬКО valued (оплачиваемые) события
-    if event_type == "valued" {
+    if actual_ymid.is_empty() {
+        log::warn!("⚠️ Постбек без ymid и subid1. Query: {:?}", query);
+        return axum::http::StatusCode::OK;
+    }
+
+    // 2. Определяем тип события
+    let event_type = query.reward_event_type.clone()
+        .unwrap_or_else(|| "valued".to_string())
+        .to_lowercase();
+
+    log::info!("📥 Received Monetag postback: ymid={:?}, subid1={:?}, type={}", 
+        query.ymid, query.subid1, event_type
+    );
+
+    // 3. Логика верификации (принимаем только valued события)
+    if event_type == "valued" || event_type == "conversion" || query.reward_event_type.is_none() {
         let db = state.db.clone();
-        let ymid = query.ymid.clone();
+        let ymid = actual_ymid.clone();
         
-        // Just mark as verified, do NOT trigger download yet
         if let Err(e) = db.mark_as_verified(&ymid).await {
             log::error!("Failed to mark download as verified for ymid {}: {}", ymid, e);
         } else {
             log::info!("✅ VALUED impression confirmed for ymid: {} (MONEY EARNED!)", ymid);
         }
     } else if event_type == "non_valued" {
-        // ⚠️ Monetag НЕ заплатит за этот трафик
-        log::warn!(
-            "⚠️ NON-VALUED event for ymid: {} (type: {}) - User did NOT generate revenue!",
-            query.ymid,
-            query.reward_event_type
-        );
-        // НЕ помечаем как verified — пользователь не получит видео
-        // и сможет попробовать ещё раз
+        log::warn!("⚠️ NON-VALUED event for ymid: {} - User did NOT generate revenue!", actual_ymid);
     } else {
-        log::warn!("Received unknown event_type='{}' for ymid: {}", event_type, query.ymid);
+        log::warn!("Received unknown event_type='{}' for ymid: {}", event_type, actual_ymid);
     }
 
     axum::http::StatusCode::OK
