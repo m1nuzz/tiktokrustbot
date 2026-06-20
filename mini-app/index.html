@@ -407,10 +407,12 @@
             loaderSubtext.innerText = "Return here after watching";
 
             // Add ymid parameter to SmartLink for fallback tracking
-            const smartLinkUrl = `${AD_CONFIG.smartLink}?ymid=${encodeURIComponent(ymid)}`;
+            const rawSmartLink = AD_CONFIG.smartLink;
+            const separator = rawSmartLink.includes('?') ? '&' : '?';
+            const smartLinkUrl = `${rawSmartLink}${separator}ymid=${encodeURIComponent(ymid)}`;
             
             if (window.Telegram?.WebApp) {
-                window.Telegram.WebApp.openLink(smartLinkUrl);
+                window.Telegram.WebApp.openLink(smartLinkUrl, { try_instant_view: false });
             } else {
                 window.open(smartLinkUrl, '_blank');
             }
