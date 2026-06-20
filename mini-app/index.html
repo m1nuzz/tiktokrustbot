@@ -190,12 +190,91 @@
         const description = document.getElementById('description');
         const urlParams = new URLSearchParams(window.location.search);
         const rawYmid = urlParams.get('ymid');
+        
+        // Автоопределение языка: из URL (от бота) или из Telegram WebApp
+        const langParam = urlParams.get('lang');
+        const tgLang = window.Telegram?.WebApp?.initDataUnsafe?.user?.language_code;
+        const userLang = langParam || tgLang || 'en';
+
+        // Переводы для 5 языков (как в Rust коде)
+        const translations = {
+            en: {
+                sessionError: "Session Error",
+                sessionErrorMsg: "Could not identify your request. The link has expired or was opened incorrectly. Return to the bot and press the download button again.",
+                sending: "Sending your video to chat...",
+                pleaseWait: "Please wait...",
+                success: "✅ Video successfully sent to chat!",
+                returning: "Returning to bot...",
+                error: "Error",
+                errorMsg: "❌ Failed to deliver video",
+                networkError: "Network Error",
+                networkErrorMsg: "❌ Could not connect to server. Check your internet.",
+                retry: "🔄 Try Again"
+            },
+            ru: {
+                sessionError: "Ошибка сессии",
+                sessionErrorMsg: "Не удалось определить ваш запрос. Ссылка устарела или открыта некорректно. Вернитесь в бот и нажмите кнопку скачивания еще раз.",
+                sending: "Отправляем ваше видео в чат...",
+                pleaseWait: "Пожалуйста, подождите...",
+                success: "✅ Видео успешно отправлено в чат!",
+                returning: "Возвращаемся в бот...",
+                error: "Ошибка",
+                errorMsg: "❌ Не удалось выдать видео",
+                networkError: "Ошибка сети",
+                networkErrorMsg: "❌ Не удалось подключиться к серверу. Проверьте интернет.",
+                retry: "🔄 Попробовать еще раз"
+            },
+            es: {
+                sessionError: "Error de sesión",
+                sessionErrorMsg: "No se pudo identificar su solicitud. El enlace ha caducado o se abrió incorrectamente. Regrese al bot y presione el botón de descarga nuevamente.",
+                sending: "Enviando su video al chat...",
+                pleaseWait: "Por favor, espere...",
+                success: "✅ Video enviado al chat con éxito!",
+                returning: "Volviendo al bot...",
+                error: "Error",
+                errorMsg: "❌ No se pudo entregar el video",
+                networkError: "Error de red",
+                networkErrorMsg: "❌ No se pudo conectar al servidor. Verifique su conexión a Internet.",
+                retry: "🔄 Reintentar"
+            },
+            zh: {
+                sessionError: "会话错误",
+                sessionErrorMsg: "无法确定您的请求。链接已过期或打开方式不正确。请返回机器人并再次点击下载按钮。",
+                sending: "正在将您的视频发送到聊天...",
+                pleaseWait: "请稍等...",
+                success: "✅ 视频成功发送到聊天！",
+                returning: "返回机器人...",
+                error: "错误",
+                errorMsg: "❌ 无法发放视频",
+                networkError: "网络错误",
+                networkErrorMsg: "❌ 无法连接到服务器。请检查您的互联网连接。",
+                retry: "🔄 重试"
+            },
+            ar: {
+                sessionError: "خطأ في الجلسة",
+                sessionErrorMsg: "تعذر تحديد طلبك. رابط منتهي الصلاحية أو تم فتحه بشكل غير صحيح. ارجع إلى البوت واضغط على زر التحميل مرة أخرى.",
+                sending: "إرسال الفيديو الخاص بك إلى الدردشة...",
+                pleaseWait: "الرجاء الانتظار...",
+                success: "✅ تم إرسال الفيديو إلى الدردشة بنجاح!",
+                returning: "العودة إلى البوت...",
+                error: "خطأ",
+                errorMsg: "❌ فشل تسليم الفيديو",
+                networkError: "خطأ في الشبكة",
+                networkErrorMsg: "❌ تعذر الاتصال بالخادم. تحقق من اتصال الإنترنت.",
+                retry: "🔄 إعادة المحاولة"
+            }
+        };
+
+        // Функция для получения локализованного текста
+        function t(key) {
+            return translations[userLang]?.[key] || translations.en[key] || key;
+        }
 
         // 🛑 Предохранитель: если нет валидного ymid — прерываем flow
         if (!rawYmid) {
             showErrorView(
-                "Ошибка сессии",
-                "Не удалось определить ваш запрос. Ссылка устарела или открыта некорректно. Вернитесь в бот и нажмите кнопку скачивания еще раз.",
+                t('sessionError'),
+                t('sessionErrorMsg'),
                 false  // без Retry — сессия мертва
             );
             throw new Error("Missing ymid in URL");
@@ -352,8 +431,8 @@
             // Показываем спиннер
             loaderView.classList.remove('hidden');
             contentView.classList.add('hidden');
-            loaderText.innerText = "Отправляем ваше видео в чат...";
-            loaderSubtext.innerText = "Пожалуйста, подождите...";
+            loaderText.innerText = t('sending');
+            loaderSubtext.innerText = t('pleaseWait');
             
             tg.MainButton.hide();
             
@@ -367,8 +446,8 @@
                 
                 if (claimData.success) {
                     // УСПЕХ: галочка + автозакрытие через 1.5с
-                    loaderText.innerText = "✅ Видео успешно отправлено в чат!";
-                    loaderSubtext.innerText = "Возвращаемся в бот...";
+                    loaderText.innerText = t('success');
+                    loaderSubtext.innerText = t('returning');
                     
                     if (tg.HapticFeedback) {
                         tg.HapticFeedback.notificationOccurred('success');
@@ -379,12 +458,12 @@
                     }, 1500);
                 } else {
                     // ОШИБКА: показываем content-view с Retry
-                    showErrorView("Ошибка", "❌ " + (claimData.error || "Не удалось выдать видео"), true);
+                    showErrorView(t('error'), "❌ " + (claimData.error || t('errorMsg')), true);
                 }
             } catch (e) {
                 // СЕТЕВАЯ ОШИБКА
                 console.error('Claim error:', e);
-                showErrorView("Ошибка сети", "❌ Не удалось подключиться к серверу. Проверьте интернет.", true);
+                showErrorView(t('networkError'), t('networkErrorMsg'), true);
             }
         }
 
@@ -396,7 +475,7 @@
             description.innerText = descriptionText;
             
             if (showRetry) {
-                directBtn.innerText = "🔄 Попробовать еще раз";
+                directBtn.innerText = t('retry');
                 directBtn.classList.remove('hidden');
                 directBtn.onclick = function() {
                     directBtn.classList.add('hidden');

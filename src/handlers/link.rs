@@ -183,6 +183,12 @@ pub async fn link_handler(
                 final_url.query_pairs_mut().append_pair("ymid", &ymid);
                 
                 let lang = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
+                
+                // Передаем язык в mini-app для автоопределения
+                if let Some(lang_code) = lang {
+                    final_url.query_pairs_mut().append_pair("lang", lang_code);
+                }
+                
                 let ad_btn_text = get_localized_ad_button_text(lang);
                 let prem_btn_text = get_localized_premium_button_text(lang);
                 let choice_text = get_localized_choice_text(lang);
