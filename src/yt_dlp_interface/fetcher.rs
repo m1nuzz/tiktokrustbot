@@ -53,20 +53,56 @@ impl YoutubeFetcher {
     ) -> Result<std::path::PathBuf> {
         log::info!("Starting download for URL: {} (quality: {})", url, quality);
 
-        // Audio mode: nothing to verify, just download directly using the full 0-80% range.
+        // Audio mode: download directly using the full 0-80% range.
+        // If yt-dlp fails, try tikwm music fallback.
         if quality == "audio" {
-            return self
+            let audio_result = self
                 .run_yt_dlp(&url, filename_stem, quality, fingerprint.clone(), progress_bar, 0, 80)
                 .await;
+            return match audio_result {
+                Ok(path) => Ok(path),
+                Err(e) => {
+                    log::warn!("yt-dlp failed for audio URL: {} ({}); trying tikwm music fallback", url, e);
+                    progress_bar
+                        .update(40, Some("🔧 yt-dlp failed — trying alternate audio source..."))
+                        .await?;
+                    self.tikwm_music_fallback(&url, filename_stem, progress_bar).await
+                }
+            };
         }
 
         // Video modes (h264 / h265 / best): download using 0-60% of the progress bar.
         // This reserves 60-80% for fallback steps if the result is incomplete:
         //   - missing video (TikTok hid the video, only audio served) -> tikwm fallback
         //   - missing audio (yt-dlp HEVC video-only bug, #16950)        -> H.264 audio mux
-        let primary_path = self
+        let primary_path = match self
             .run_yt_dlp(&url, filename_stem, quality, fingerprint.clone(), progress_bar, 0, 60)
-            .await?;
+            .await
+        {
+            Ok(path) => path,
+            Err(e) => {
+                log::warn!(
+                    "yt-dlp failed for URL: {} ({}); trying tikwm fallback",
+                    url, e
+                );
+                progress_bar
+                    .update(60, Some("🔧 yt-dlp failed — trying alternate source..."))
+                    .await?;
+                let result = self
+                    .tikwm_video_fallback(&url, filename_stem, None, progress_bar)
+                    .await;
+                return match result {
+                    Ok(path) => {
+                        progress_bar.update(80, Some("⬇️ Download completed")).await?;
+                        Ok(path)
+                    }
+                    Err(_fallback_err) => {
+                        log::error!("Both yt-dlp and tikwm fallback failed for URL: {}", url);
+                        Err(anyhow::anyhow!("Failed to download: {}", e))
+                    }
+                };
+            }
+        };
 
         let has_video = self.file_has_video(&primary_path).await;
         let has_audio = matches!(file_has_audio(&self.ffprobe_path(), &primary_path).await, Ok(true));
@@ -80,7 +116,7 @@ impl YoutubeFetcher {
                 primary_path
             );
             return self
-                .tikwm_video_fallback(&url, filename_stem, &primary_path, progress_bar)
+                .tikwm_video_fallback(&url, filename_stem, Some(&primary_path), progress_bar)
                 .await;
         }
 
@@ -125,13 +161,14 @@ impl YoutubeFetcher {
     }
 
     /// Fallback used when yt-dlp could only obtain an audio-only file for a post whose
-    /// video is hidden from the TikTok web API. Queries the tikwm public API, which
-    /// exposes the real CDN video URL, downloads that file (with audio) and returns it.
+    /// video is hidden from the TikTok web API, or when yt-dlp failed entirely.
+    /// Queries the tikwm public API, which exposes the real CDN video URL, downloads
+    /// that file (with audio) and returns it.
     async fn tikwm_video_fallback(
         &self,
         url: &str,
         filename_stem: &str,
-        primary_path: &Path,
+        primary_path: Option<&Path>,
         progress_bar: &mut ProgressBar,
     ) -> Result<PathBuf> {
         progress_bar
@@ -155,7 +192,7 @@ impl YoutubeFetcher {
         if !resp.status().is_success() {
             log::error!("tikwm API returned HTTP {}, delivering original file", resp.status());
             progress_bar.update(80, Some("⬇️ Download completed")).await?;
-            return Ok(primary_path.to_path_buf());
+            return Ok(primary_path.map(|p| p.to_path_buf()).unwrap_or_else(|| self.output_dir.join(format!("{}_fallback.mp4", filename_stem))));
         }
 
         // Parse { "code": 0, "data": { "play": "<url>", "wmplay": "<url>", ... } }
@@ -166,7 +203,7 @@ impl YoutubeFetcher {
                 body.get("code")
             );
             progress_bar.update(80, Some("⬇️ Download completed")).await?;
-            return Ok(primary_path.to_path_buf());
+            return Ok(primary_path.map(|p| p.to_path_buf()).unwrap_or_else(|| self.output_dir.join(format!("{}_fallback.mp4", filename_stem))));
         }
 
         // Prefer the no-watermark "play" URL; fall back to "wmplay" if absent.
@@ -190,7 +227,7 @@ impl YoutubeFetcher {
             None => {
                 log::error!("tikwm API returned no video URL in data.play/wmplay; delivering original file");
                 progress_bar.update(80, Some("⬇️ Download completed")).await?;
-                return Ok(primary_path.to_path_buf());
+                return Ok(primary_path.map(|p| p.to_path_buf()).unwrap_or_else(|| self.output_dir.join(format!("{}_fallback.mp4", filename_stem))));
             }
         };
 
@@ -213,14 +250,14 @@ impl YoutubeFetcher {
                 download_resp.status()
             );
             progress_bar.update(80, Some("⬇️ Download completed")).await?;
-            return Ok(primary_path.to_path_buf());
+            return Ok(primary_path.map(|p| p.to_path_buf()).unwrap_or_else(|| self.output_dir.join(format!("{}_fallback.mp4", filename_stem))));
         }
 
         let bytes = download_resp.bytes().await?;
         if bytes.is_empty() {
             log::error!("tikwm CDN returned empty body, delivering original file");
             progress_bar.update(80, Some("⬇️ Download completed")).await?;
-            return Ok(primary_path.to_path_buf());
+            return Ok(primary_path.map(|p| p.to_path_buf()).unwrap_or_else(|| self.output_dir.join(format!("{}_fallback.mp4", filename_stem))));
         }
         tokio::fs::write(&fallback_path, &bytes).await?;
         log::info!("tikwm fallback downloaded {} bytes to {:?}", bytes.len(), fallback_path);
@@ -229,35 +266,123 @@ impl YoutubeFetcher {
         if !self.file_has_video(&fallback_path).await {
             log::error!("tikwm fallback file has no video stream, delivering original file");
             progress_bar.update(80, Some("⬇️ Download completed")).await?;
-            return Ok(primary_path.to_path_buf());
+            return Ok(primary_path.map(|p| p.to_path_buf()).unwrap_or_else(|| self.output_dir.join(format!("{}_fallback.mp4", filename_stem))));
         }
 
-        // Replace the audio-only primary file with the real video. Try rename, fall back to
-        // copy across volumes, and ensure the primary extension becomes .mp4.
-        let final_path = primary_path.with_extension("mp4");
-        let cleanup_old = if final_path != *primary_path && primary_path.exists() {
-            Some(primary_path.to_path_buf())
+        // If we have a primary_path, try to replace it (rename/copy) so callers see the same file.
+        // Otherwise return the fallback path directly.
+        if let Some(primary) = primary_path {
+            let final_path = primary.with_extension("mp4");
+            let cleanup_old = if final_path != *primary && primary.exists() {
+                Some(primary.to_path_buf())
+            } else {
+                None
+            };
+
+            if let Err(e) = tokio::fs::rename(&fallback_path, &final_path).await {
+                tokio::fs::copy(&fallback_path, &final_path).await?;
+                fallback_guard.forget();
+                log::debug!("Copied tikwm fallback to primary (rename failed: {})", e);
+            } else {
+                fallback_guard.forget();
+            }
+
+            // Remove the now-replaced audio-only file if it had a different extension.
+            if let Some(old) = cleanup_old {
+                if old.exists() {
+                    let _ = tokio::fs::remove_file(&old).await;
+                }
+            }
+
+            progress_bar.update(80, Some("⬇️ Download completed")).await?;
+            Ok(final_path)
         } else {
-            None
+            // No primary_path: return the fallback file as-is.
+            fallback_guard.forget();
+            progress_bar.update(80, Some("⬇️ Download completed")).await?;
+            Ok(fallback_path)
+        }
+    }
+
+    /// Fallback used when yt-dlp fails to download audio.
+    /// Queries the tikwm public API for the `music` field and downloads it.
+    async fn tikwm_music_fallback(
+        &self,
+        url: &str,
+        filename_stem: &str,
+        progress_bar: &mut ProgressBar,
+    ) -> Result<PathBuf> {
+        progress_bar
+            .update(50, Some("🔧 Fetching audio from alternate source..."))
+            .await?;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+
+        let api_url = format!("https://www.tikwm.com/api/?url={}", url);
+        log::info!("Querying tikwm API for audio: {}", api_url);
+
+        let resp = client
+            .get(&api_url)
+            .header("User-Agent", "Mozilla/5.0")
+            .header("Referer", "https://www.tikwm.com/")
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(anyhow::anyhow!("tikwm API returned HTTP {}", resp.status()));
+        }
+
+        let body: serde_json::Value = resp.json().await?;
+        if body.get("code").and_then(|v| v.as_i64()) != Some(0) {
+            return Err(anyhow::anyhow!("tikwm API returned non-zero code: {:?}", body.get("code")));
+        }
+
+        // Extract the music URL from the response.
+        let music_url = body
+            .get("data")
+            .and_then(|d| d.get("music"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+
+        let music_url = match music_url {
+            Some(u) => {
+                log::info!("tikwm provided music URL: {}", u);
+                u.to_string()
+            }
+            None => {
+                return Err(anyhow::anyhow!("tikwm API returned no music URL in response"));
+            }
         };
 
-        if let Err(e) = tokio::fs::rename(&fallback_path, &final_path).await {
-            tokio::fs::copy(&fallback_path, &final_path).await?;
-            fallback_guard.forget();
-            log::debug!("Copied tikwm fallback to primary (rename failed: {})", e);
-        } else {
-            fallback_guard.forget();
+        // Download the audio file.
+        progress_bar.update(60, Some("⬇️ Downloading audio...")).await?;
+        let audio_path = self.output_dir.join(format!("{}.m4a", filename_stem));
+        let mut audio_guard = TempFileGuard::new(audio_path.clone());
+
+        let download_resp = client
+            .get(&music_url)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+            .header("Referer", "https://www.tikwm.com/")
+            .header("Accept", "*/*")
+            .send()
+            .await?;
+
+        if !download_resp.status().is_success() {
+            return Err(anyhow::anyhow!("tikwm CDN returned HTTP {} for audio", download_resp.status()));
         }
 
-        // Remove the now-replaced audio-only file if it had a different extension.
-        if let Some(old) = cleanup_old {
-            if old.exists() {
-                let _ = tokio::fs::remove_file(&old).await;
-            }
+        let bytes = download_resp.bytes().await?;
+        if bytes.is_empty() {
+            return Err(anyhow::anyhow!("tikwm CDN returned empty body for audio"));
         }
+        tokio::fs::write(&audio_path, &bytes).await?;
+        log::info!("tikwm music fallback downloaded {} bytes to {:?}", bytes.len(), audio_path);
 
+        audio_guard.forget();
         progress_bar.update(80, Some("⬇️ Download completed")).await?;
-        Ok(final_path)
+        Ok(audio_path)
     }
 
     /// Downloads a fresh H.264 (avc) copy of the video, extracts its audio track, and
@@ -277,9 +402,17 @@ impl YoutubeFetcher {
             .await?;
 
         let audio_src_stem = format!("{}_audio_src", filename_stem);
-        let h264_path = self
+        let h264_path = match self
             .run_yt_dlp(url, &audio_src_stem, "h264", fingerprint, progress_bar, 60, 78)
-            .await?;
+            .await
+        {
+            Ok(path) => path,
+            Err(e) => {
+                log::warn!("H.264 audio fetch failed for {} ({}); delivering original file without audio", url, e);
+                progress_bar.update(80, Some("⬇️ Download completed (no audio)")).await?;
+                return Ok(primary_path.to_path_buf());
+            }
+        };
 
         let _h264_guard = TempFileGuard::new(h264_path.clone());
 
