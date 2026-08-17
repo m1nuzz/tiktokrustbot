@@ -34,7 +34,7 @@ jobs:
             archive: tiktokdownloader-aarch64-apple-darwin.tar.gz
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
@@ -45,14 +45,14 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          # Бинарник
+          # Binary
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/release/${{ matrix.bin }}" dist/
           else
             cp "target/release/${{ matrix.bin }}" dist/
             chmod +x "dist/${{ matrix.bin }}"
           fi
-          # Полезные файлы
+          # Additional files
           [ -f README.md ] && cp README.md dist/
           [ -f .env.example ] && cp .env.example dist/
       - name: Package
@@ -64,10 +64,11 @@ jobs:
             tar -C dist -czf ${{ matrix.archive }} .
           fi
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.archive }}
+          if-no-files-found: error
       - name: Publish GitHub Release
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
