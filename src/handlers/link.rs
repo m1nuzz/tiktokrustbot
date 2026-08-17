@@ -2,9 +2,9 @@ use regex::Regex;
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::time::Instant;
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
@@ -25,11 +25,42 @@ use crate::yt_dlp_interface::YoutubeFetcher;
 // To track active link processing and avoid double-triggering
 lazy_static::lazy_static! {
     static ref LAST_SEND: Arc<tokio::sync::Mutex<HashMap<i64, Instant>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    static ref URL_PROCESSING: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    static ref URL_PROCESSING: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
 }
 
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes per download attempt
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes per upload attempt
 const TELEGRAM_BOT_API_FILE_LIMIT: u64 = 48 * 1024 * 1024; // 48MB
+
+/// Owns a URL claim and releases it even when processing exits with an error.
+struct UrlProcessingGuard {
+    url: String,
+}
+
+impl UrlProcessingGuard {
+    fn try_acquire(url: &str) -> Option<Self> {
+        let mut urls = URL_PROCESSING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if urls.insert(url.to_owned()) {
+            Some(Self {
+                url: url.to_owned(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for UrlProcessingGuard {
+    fn drop(&mut self) {
+        let mut urls = URL_PROCESSING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        urls.remove(&self.url);
+    }
+}
 
 // Add this function at the beginning of the file
 fn extract_url_from_text(text: &str) -> Option<String> {
@@ -129,15 +160,14 @@ pub async fn link_handler(
         None => return Ok(()),
     };
 
-    // Deduplication
-    {
-        let mut urls = URL_PROCESSING.lock().await;
-        if urls.contains(&url) {
+    // Deduplication. The guard releases the URL on every exit path, including errors.
+    let _url_processing_guard = match UrlProcessingGuard::try_acquire(&url) {
+        Some(guard) => guard,
+        None => {
             bot.send_message(msg.chat.id, "⏳ This video is already being processed.").await?;
             return Ok(());
         }
-        urls.insert(url.clone());
-    }
+    };
 
     // Mini App Ad invitation logic
     let is_user_admin = is_admin(&msg).await;
@@ -198,11 +228,6 @@ pub async fn link_handler(
                     .reply_markup(keyboard)
                     .await;
 
-                // Stop processing
-                {
-                    let mut urls = URL_PROCESSING.lock().await;
-                    urls.remove(&url);
-                }
                 return Ok(());
             }
         }
@@ -251,10 +276,6 @@ pub async fn process_video_request(
 
             if !admins.contains(&user_id) {
                 bot.send_message(chat_id, "To use the bot, please subscribe to our channels.").await?;
-                {
-                    let mut urls = URL_PROCESSING.lock().await;
-                    urls.remove(&url);
-                }
                 return Ok(());
             }
         }
@@ -289,10 +310,6 @@ pub async fn process_video_request(
         Err(e) => {
             progress_bar.delete().await?;
             bot.send_message(chat_id, format!("❌ Error: {}", e)).await?;
-            {
-                let mut urls = URL_PROCESSING.lock().await;
-                urls.remove(&url);
-            }
             return Ok(());
         }
     };
@@ -302,36 +319,62 @@ pub async fn process_video_request(
 
     if file_size > TELEGRAM_BOT_API_FILE_LIMIT {
         progress_bar.update(85, Some("📤 Uploading (Large)...")).await?;
-        let res = if is_audio {
-            mtproto_uploader.upload_audio(user_id, username, &path, "", &mut progress_bar).await
-        } else {
-            mtproto_uploader.upload_video(user_id, username, &path, "", &mut progress_bar).await
+        let upload_result = match timeout(UPLOAD_TIMEOUT, async {
+            if is_audio {
+                mtproto_uploader.upload_audio(user_id, username, &path, "", &mut progress_bar).await
+            } else {
+                mtproto_uploader.upload_video(user_id, username, &path, "", &mut progress_bar).await
+            }
+        }).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(anyhow::anyhow!("Large upload failed: {}", e)),
+            Err(_) => Err(anyhow::anyhow!(
+                "Large upload timed out after {} seconds",
+                UPLOAD_TIMEOUT.as_secs()
+            )),
         };
-        if res.is_ok() {
-            progress_bar.update(100, Some("✅ Done!")).await?;
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            progress_bar.delete().await?;
+
+        match upload_result {
+            Ok(()) => {
+                progress_bar.update(100, Some("✅ Done!")).await?;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                progress_bar.delete().await?;
+            }
+            Err(e) => {
+                log::error!("Large upload failed for {}: {}", url, e);
+                let _ = progress_bar.delete().await;
+                let _ = bot.send_message(chat_id, "❌ Upload failed. Please try again.").await;
+            }
         }
     } else {
-        let mut retries = 0;
-        let send_res = loop {
-            let res = if is_audio {
-                send_audio_with_progress_botapi(&bot.token(), chat_id, &path, None, &mut progress_bar).await
-            } else {
-                send_video_with_progress_botapi(&bot.token(), chat_id, &path, None, &mut progress_bar).await
-            };
-            match res {
-                Ok(_) => break Ok(()),
-                Err(e) => {
-                    retries += 1;
-                    if retries >= 3 { break Err(e); }
-                    tokio::time::sleep(Duration::from_millis(1000 * 2_u64.pow(retries - 1))).await;
+        let send_res = match timeout(UPLOAD_TIMEOUT, async {
+            let mut retries = 0;
+            loop {
+                let res = if is_audio {
+                    send_audio_with_progress_botapi(&bot.token(), chat_id, &path, None, &mut progress_bar).await
+                } else {
+                    send_video_with_progress_botapi(&bot.token(), chat_id, &path, None, &mut progress_bar).await
+                };
+                match res {
+                    Ok(_) => break Ok(()),
+                    Err(e) => {
+                        retries += 1;
+                        if retries >= 3 { break Err(e); }
+                        tokio::time::sleep(Duration::from_millis(1000 * 2_u64.pow(retries - 1))).await;
+                    }
                 }
             }
+        }).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "Upload timed out after {} seconds",
+                UPLOAD_TIMEOUT.as_secs()
+            )),
         };
-        if send_res.is_err() {
-            progress_bar.delete().await?;
-            bot.send_message(chat_id, "❌ Upload failed.").await?;
+        if let Err(e) = send_res {
+            log::error!("Bot API upload failed for {}: {}", url, e);
+            let _ = progress_bar.delete().await;
+            let _ = bot.send_message(chat_id, "❌ Upload failed. Please try again.").await;
         }
     }
 
@@ -343,9 +386,29 @@ pub async fn process_video_request(
         Ok(())
     }).await;
 
-    {
-        let mut urls = URL_PROCESSING.lock().await;
-        urls.remove(&url);
-    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn processing_guard_allows_retry_after_previous_request_finishes() {
+        let url = format!("https://vt.tiktok.com/test-{}", Uuid::new_v4());
+        let guard = UrlProcessingGuard::try_acquire(&url)
+            .expect("first request should claim the URL");
+
+        assert!(
+            UrlProcessingGuard::try_acquire(&url).is_none(),
+            "a duplicate request must be rejected while the first request is active"
+        );
+
+        drop(guard);
+
+        assert!(
+            UrlProcessingGuard::try_acquire(&url).is_some(),
+            "the URL must be claimable again after the first request exits"
+        );
+    }
 }
