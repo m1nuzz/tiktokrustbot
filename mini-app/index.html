@@ -168,8 +168,7 @@
             retryInterval: 1200,
             pollInterval: 3000,
             maxPolls: 60, // ~3 min safety cap, then error screen
-            popupMaxTries: 2,
-            inApp: { frequency: 2, capping: 0.1, interval: 30, timeout: 5, everyPage: false }
+            popupMaxTries: 2
         };
 
         // ========== СОСТОЯНИЕ ==========
@@ -178,7 +177,6 @@
         let pollTimeoutId = null;
         let isPolling = false;
         let pollCount = 0;
-        let inAppStarted = false;
         let popupTries = 0;
         let directAction = 'close'; // 'close' | 'popup'
         let currentAdSource = null; // 'sdk' или 'popup'
@@ -383,17 +381,6 @@
             directBtn.classList.remove('hidden');
             adBtn.innerText = "🔄 Try ad again";
             adBtn.classList.remove('hidden');
-            // Passive background income, started only on this idle screen:
-            // never overlaps an active rewarded flow, so ads can't stack.
-            if (!inAppStarted) {
-                inAppStarted = true;
-                try {
-                    window[AD_CONFIG.sdkFn]({
-                        type: 'inApp',
-                        inAppSettings: AD_CONFIG.inApp
-                    });
-                } catch (e) { console.error("In-App init failed", e); }
-            }
         }
 
         // Popup tries exhausted: deliver via the server timer backstop, no taps.
