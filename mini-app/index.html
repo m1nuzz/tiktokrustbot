@@ -178,9 +178,12 @@
         let pollTimeoutId = null;
         let isPolling = false;
         let pollCount = 0;
+        let pollStartTime = 0;
+        let timerClaimShown = false;
+        let inAppStarted = false;
         let popupTries = 0;
         let directAction = 'close'; // 'close' | 'popup'
-        let currentAdSource = null; // 'sdk' или 'smartlink'
+        let currentAdSource = null; // 'sdk' или 'popup'
 
         const tg = window.Telegram.WebApp;
         const loaderView = document.getElementById('loader-view');
@@ -209,6 +212,16 @@
                 clearTimeout(pollTimeoutId);
                 pollTimeoutId = null;
             }
+        }
+
+        // SDK-вызовы могут висеть вечно (нет рекламы, рваная сеть):
+        // гонка с таймаутом превращает висение в обычную ошибку
+        function sdkWithTimeout(promise, ms, label) {
+            let timer = null;
+            const timeout = new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error(label + ' timeout')), ms);
+            });
+            return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
         }
 
         function updateRetryUI(count) {
@@ -260,6 +273,15 @@
                     return;
                 }
 
+                // Timer backstop: after ~20s without verification, offer the
+                // claim button anyway (server enforces the real 20s age rule).
+                // Polling continues so a late valued postback still auto-fires.
+                if (!timerClaimShown && Date.now() - pollStartTime > 20000) {
+                    timerClaimShown = true;
+                    loaderSubtext.innerText = "You can take your video now";
+                    wireClaimButton();
+                }
+
                 // Продолжаем polling
                 pollTimeoutId = setTimeout(doPoll, AD_CONFIG.pollInterval);
             } catch (e) {
@@ -272,6 +294,7 @@
             if (isPolling) return;
             isPolling = true;
             pollCount = 0;
+            pollStartTime = Date.now();
             loaderText.innerText = "Waiting for verification...";
             loaderSubtext.innerText = "Please keep the app open";
             doPoll();
@@ -286,9 +309,18 @@
 
                 // catchIfNoFeed: a silent resolve with no actual ad must surface
                 // as an error, not a phantom success
-                window[AD_CONFIG.sdkFn]({ ymid: ymid, catchIfNoFeed: true, requestVar: 'sdk_interstitial' })
+                let adPromise;
+                try {
+                    adPromise = window[AD_CONFIG.sdkFn]({ ymid: ymid, catchIfNoFeed: true, requestVar: 'sdk_interstitial' });
+                } catch (e) {
+                    console.error("Ad threw", e);
+                    showNoAds();
+                    return;
+                }
+                sdkWithTimeout(adPromise, 25000, 'sdk')
                     .then(() => {
-                        // Запускаем polling - сервер подтвердит, когда получит Postback
+                        // Polling starts once the ad actually played - the server
+                        // confirms when the postback arrives
                         startPolling();
                     })
                     .catch((e) => {
@@ -321,12 +353,13 @@
             loaderText.innerText = "Opening quick offer...";
             loaderSubtext.innerText = "Look at the offer, then return here";
             try {
-                window[AD_CONFIG.sdkFn]({
+                const popupPromise = window[AD_CONFIG.sdkFn]({
                     ymid: ymid,
                     type: 'pop',
                     requestVar: 'popup_retry_' + popupTries,
                     catchIfNoFeed: true
-                })
+                });
+                sdkWithTimeout(popupPromise, 25000, 'popup')
                     .then(() => {
                         startPolling();
                     })
@@ -340,7 +373,9 @@
             }
         }
 
-        // Честный экран вместо мёртвого ожидания: рекламы нет прямо сейчас
+        // Honest screen instead of dead waiting: no ads right now.
+        // Offers the claim button too: by this point the server age rule
+        // usually already passes, otherwise the claim auto-retries.
         function showNoAds() {
             stopPolling();
             cancelRetry();
@@ -353,6 +388,18 @@
             directBtn.classList.remove('hidden');
             adBtn.innerText = "🔄 Try ad again";
             adBtn.classList.remove('hidden');
+            wireClaimButton();
+            // Passive background income, started only on this idle screen:
+            // never overlaps an active rewarded flow, so ads can't stack.
+            if (!inAppStarted) {
+                inAppStarted = true;
+                try {
+                    window[AD_CONFIG.sdkFn]({
+                        type: 'inApp',
+                        inAppSettings: AD_CONFIG.inApp
+                    });
+                } catch (e) { console.error("In-App init failed", e); }
+            }
         }
 
         // После исчерпания попыток: выдача по таймер-бэкстопу сервера
@@ -442,13 +489,8 @@
                 if (data.enabled) {
                     loaderText.innerText = "Checking Status";
                     loaderSubtext.innerText = "Please wait a moment...";
-                    // Пассивный фоновый доход: fire-and-forget, без гейта и UI
-                    try {
-                        window[AD_CONFIG.sdkFn]({
-                            type: 'inApp',
-                            inAppSettings: AD_CONFIG.inApp
-                        });
-                    } catch (e) { console.error("In-App init failed", e); }
+                    // In-App starts later, only on the idle no-ads screen,
+                    // so it can never stack over an active rewarded ad.
                     trySDKAd();
                 } else {
                     directAction = 'close';
