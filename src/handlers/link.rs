@@ -312,7 +312,7 @@ pub async fn process_video_request(
             if !meta.images.is_empty() {
                 let stem = format!("output/{}", Uuid::new_v4());
                 crate::handlers::photo::handle_photo_post(
-                    &bot, chat_id, fetcher, &meta, &stem, is_audio, &mut progress_bar,
+                    &bot, chat_id, &fetcher, &meta, &stem, is_audio, &mut progress_bar,
                 )
                 .await?;
                 progress_bar.update(100, Some("✅ Done!")).await?;
