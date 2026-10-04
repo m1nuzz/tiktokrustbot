@@ -335,7 +335,7 @@ pub async fn funnel_text_handler(
                     e(d.failed.to_string()),
                 ));
             }
-            response.push_str("S0=start · S1=sent link · S2=watched ad · S3=claimed · S4=delivered\\. Biggest drop = fix first\\.\n");
+            response.push_str("S0\\=start · S1\\=sent link · S2\\=watched ad · S3\\=claimed · S4\\=delivered\\. Biggest drop \\= fix first\\.\n");
             bot.send_message(msg.chat.id, response)
                 .parse_mode(teloxide::types::ParseMode::MarkdownV2)
                 .await?;
