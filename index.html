@@ -401,6 +401,27 @@
             transform: translateY(-3px);
         }
         
+        /* Content sections (how-it-works, faq): same card rhythm as the rest */
+        .how-it-works,
+        .faq {
+            padding: 3rem 2rem;
+            margin-bottom: 3rem;
+        }
+        
+        /* One section-heading pattern site-wide: centered, fluid size so long
+           question headings never overflow their cards on narrow screens */
+        .features > h2,
+        .how-it-works h2,
+        .faq h2 {
+            grid-column: 1 / -1;
+            text-align: center;
+            font-size: clamp(1.5rem, 1.1rem + 2vw, 2rem);
+            line-height: 1.3;
+            margin-bottom: 1.5rem;
+            overflow-wrap: break-word;
+            text-wrap: balance;
+        }
+        
         /* Footer */
         footer {
             text-align: center;
@@ -436,6 +457,11 @@
             .cta-button {
                 padding: 1rem 2rem;
                 font-size: 1rem;
+            }
+            
+            .how-it-works,
+            .faq {
+                padding: 2rem 1.25rem;
             }
         }
         
@@ -473,7 +499,7 @@
         </section>
         
         <section class="features">
-            <h2 style="margin-bottom: 1.5rem; font-size: 2rem; text-align: center; width: 100%;">Why Download TikTok Videos With TikYouBot?</h2>
+            <h2>Why Download TikTok Videos With TikYouBot?</h2>
             <article class="feature-card glass">
                 <span class="feature-icon">⚡</span>
                 <h3>Lightning Fast</h3>
@@ -523,7 +549,7 @@
         </section>
         
         <section class="how-it-works glass">
-            <h2 style="margin-bottom: 1.5rem; font-size: 2rem;">How to Download TikTok Videos Without Watermark?</h2>
+            <h2>How to Download TikTok Videos Without Watermark?</h2>
             <ol style="text-align: left; max-width: 560px; margin: 0 auto; color: #b0b0b0; line-height: 2;">
                 <li><strong style="color: #fff;">Copy the link</strong> — open TikTok, tap Share, then Copy Link.</li>
                 <li><strong style="color: #fff;">Send it to the bot</strong> — paste the link into a chat with <a href="https://t.me/tikyoubot?start=site" target="_blank" rel="noopener noreferrer">TikYouBot</a>.</li>
@@ -553,7 +579,7 @@
         </section>
         
         <section class="faq glass">
-            <h2 style="margin-bottom: 1.5rem; font-size: 2rem;">TikTok Downloader FAQ</h2>
+            <h2>TikTok Downloader FAQ</h2>
             <div style="text-align: left; max-width: 640px; margin: 0 auto; color: #b0b0b0; line-height: 1.7;">
                 <h3 style="color: #fff; font-size: 1.1rem; margin: 1.2rem 0 0.4rem;">How do I download a TikTok video without watermark?</h3>
                 <p>Copy the video link in TikTok (Share → Copy Link) and send it to TikYouBot on Telegram. The bot replies with the clean HD video in seconds.</p>
