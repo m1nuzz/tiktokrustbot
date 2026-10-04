@@ -91,17 +91,6 @@ pub fn init_database() -> Result<()> {
         log::warn!("Backfilled created_at for {backfilled} users");
     }
 
-    // Silently retire download requests abandoned before this startup (the
-    // user never finished watching the ad). They are marked notified so the
-    // expiry sweeper never messages them; only new rows get notified.
-    let retired = conn.execute(
-        "UPDATE pending_downloads SET status = 'expired', notified_at = CURRENT_TIMESTAMP WHERE status IN ('pending', 'verified') AND created_at < datetime('now', '-30 minutes')",
-        [],
-    )?;
-    if retired > 0 {
-        log::warn!("Retired {retired} stale pending downloads without notification");
-    }
-
     // Create the table with the new format
     conn.execute(
         "CREATE TABLE IF NOT EXISTS downloads (id INTEGER PRIMARY KEY, user_telegram_id BIGINT, video_url TEXT NOT NULL, download_date DATETIME DEFAULT CURRENT_TIMESTAMP)",
@@ -169,6 +158,17 @@ pub fn init_database() -> Result<()> {
         "CREATE TABLE IF NOT EXISTS pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL)",
         (),
     )?;
+    // Silently retire download requests abandoned before this startup (the
+    // user never finished watching the ad). They are marked notified so the
+    // expiry sweeper never messages them; only new rows get notified.
+    // Runs after the CREATE above so fresh databases don't error.
+    let retired = conn.execute(
+        "UPDATE pending_downloads SET status = 'expired', notified_at = CURRENT_TIMESTAMP WHERE status IN ('pending', 'verified') AND created_at < datetime('now', '-30 minutes')",
+        [],
+    )?;
+    if retired > 0 {
+        log::warn!("Retired {retired} stale pending downloads without notification");
+    }
     conn.execute(
         "CREATE TABLE IF NOT EXISTS blocks (id INTEGER PRIMARY KEY, telegram_id BIGINT NOT NULL, blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
