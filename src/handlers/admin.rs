@@ -2,18 +2,20 @@ use std::env;
 use teloxide::prelude::*;
 
 pub async fn is_admin(msg: &Message) -> bool {
-    let admin_ids_str = env::var("ADMIN_IDS").unwrap_or_default();
-    let admin_ids: Vec<i64> = admin_ids_str
-        .split(',')
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
-
-    // Check user ID instead of chat ID
     if let Some(user) = msg.from.as_ref() {
-        admin_ids.contains(&(user.id.0 as i64))
+        is_admin_id(user.id.0 as i64)
     } else {
         false
     }
+}
+
+/// Same ADMIN_IDS check by raw id, for flows without a Message (web server).
+pub fn is_admin_id(user_id: i64) -> bool {
+    let admin_ids_str = env::var("ADMIN_IDS").unwrap_or_default();
+    admin_ids_str
+        .split(',')
+        .filter_map(|s| s.trim().parse::<i64>().ok())
+        .any(|id| id == user_id)
 }
 
 #[cfg(test)]

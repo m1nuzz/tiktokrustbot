@@ -368,8 +368,9 @@
             document.documentElement.style.setProperty('--accent-color', tg.themeParams.button_color);
         }
 
-        // Проверяем статус рекламы
-        fetch(`${apiBase}/api/ads-status`)
+        // Проверяем статус рекламы (ymid — чтобы сервер решил персонально:
+        // админ с Admin Ads ON увидит реальную рекламу даже при глобальном OFF)
+        fetch(`${apiBase}/api/ads-status?ymid=${encodeURIComponent(ymid)}`)
             .then(response => response.json())
             .then(data => {
                 if (data.enabled) {

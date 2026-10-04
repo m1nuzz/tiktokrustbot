@@ -45,6 +45,11 @@ pub struct CheckStatusQuery {
     pub ymid: String,
 }
 
+#[derive(Deserialize)]
+pub struct AdsStatusQuery {
+    pub ymid: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct CheckStatusResponse {
     pub status: String,
@@ -77,7 +82,28 @@ async fn serve_mini_app() -> impl axum::response::IntoResponse {
     Html(html)
 }
 
-async fn get_ads_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn get_ads_status(
+    State(state): State<AppState>,
+    Query(query): Query<AdsStatusQuery>,
+) -> Json<serde_json::Value> {
+    // Per-user decision when the mini-app passes its ymid (same rules as the
+    // bot handler, so an admin testing with Admin Ads ON sees the real ad
+    // flow even while ads are globally OFF). Unknown/missing ymid falls back
+    // to the global switch (backwards compatible).
+    if let Some(ymid) = query.ymid.as_deref().filter(|s| !s.is_empty()) {
+        match state.db.get_user_id_by_ymid(ymid).await {
+            Ok(user_id) => {
+                let is_user_admin = crate::handlers::admin::is_admin_id(user_id);
+                let enabled =
+                    crate::handlers::link::ads_enabled_for(&state.db, user_id, is_user_admin).await;
+                return Json(json!({ "enabled": enabled }));
+            }
+            Err(e) => {
+                log::warn!("ads-status with unknown ymid {}: {}, using global", ymid, e);
+            }
+        }
+    }
+
     let module_enabled = std::env::var("MONETAG_MODULE_ENABLED")
         .map(|v| v.to_lowercase() == "true")
         .unwrap_or(true);

@@ -137,6 +137,34 @@ async fn get_subscription_required(
     Ok(result)
 }
 
+/// Single source of truth for "should this user see the ad flow?".
+/// Mirrors the admin-panel toggles: global `ads_enabled` gates regular users,
+/// `admin_ads_enabled` (or TEST_MODE) forces ads for admins to test.
+/// Used by both the bot handler and the mini-app status endpoint so they
+/// can never disagree with each other.
+pub async fn ads_enabled_for(db_pool: &DatabasePool, user_id: i64, is_user_admin: bool) -> bool {
+    let module_enabled = std::env::var("MONETAG_MODULE_ENABLED").map(|v| v.to_lowercase() == "true").unwrap_or(true);
+    let global_ads = db_pool.get_setting("ads_enabled").await.map(|val| val == "true").unwrap_or(true);
+    let is_test_mode = std::env::var("TEST_MODE").map(|v| v.to_lowercase() == "true").unwrap_or(false);
+    let admin_ads = db_pool.get_setting("admin_ads_enabled").await.map(|val| val == "true").unwrap_or(false);
+
+    if is_user_admin && (admin_ads || is_test_mode) {
+        log::info!("Ads enabled for admin (forced by setting or test mode)");
+        true
+    } else if !module_enabled || !global_ads {
+        log::info!("Ads disabled globally or by module flag");
+        false
+    } else if is_user_admin {
+        // Admin but has personal ads OFF and not in test mode
+        false
+    } else if db_pool.is_user_premium(user_id).await {
+        log::info!("Ads disabled: User {} has Premium", user_id);
+        false
+    } else {
+        true
+    }
+}
+
 pub async fn link_handler(
     bot: Bot,
     msg: Message,
@@ -182,32 +210,9 @@ pub async fn link_handler(
         }
     };
 
-    // Mini App Ad invitation logic
+    // Mini App Ad invitation logic (single source of truth, shared with /api/ads-status)
     let is_user_admin = is_admin(&msg).await;
-    let is_premium = db_pool.is_user_premium(user_id as i64).await;
-
-    let ads_enabled = {
-        let module_enabled = std::env::var("MONETAG_MODULE_ENABLED").map(|v| v.to_lowercase() == "true").unwrap_or(true);
-        let global_ads = db_pool.get_setting("ads_enabled").await.map(|val| val == "true").unwrap_or(true);
-        let is_test_mode = std::env::var("TEST_MODE").map(|v| v.to_lowercase() == "true").unwrap_or(false);
-        let admin_ads = db_pool.get_setting("admin_ads_enabled").await.map(|val| val == "true").unwrap_or(false);
-
-        if is_user_admin && (admin_ads || is_test_mode) {
-            log::info!("Ads enabled for admin (forced by setting or test mode)");
-            true
-        } else if !module_enabled || !global_ads {
-            log::info!("Ads disabled globally or by module flag");
-            false
-        } else if is_user_admin {
-            // Admin but has personal ads OFF and not in test mode
-            false
-        } else if is_premium {
-            log::info!("Ads disabled: User {} has Premium", user_id);
-            false
-        } else {
-            true
-        }
-    };
+    let ads_enabled = ads_enabled_for(&db_pool, user_id as i64, is_user_admin).await;
 
     if ads_enabled {
         let webapp_url = std::env::var("WEBAPP_URL").unwrap_or_default();
@@ -453,6 +458,72 @@ mod tests {
 
         let generic = anyhow::anyhow!("yt-dlp failed: ERROR: Video unavailable");
         assert_eq!(classify_download_error(&generic), crate::i18n::MsgKey::DownloadFailed);
+    }
+
+    async fn ads_test_db() -> (DatabasePool, tempfile::NamedTempFile) {
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap().to_string();
+        let pool = DatabasePool::new(db_path, 1);
+        pool.execute_with_timeout(|conn| {
+            conn.execute(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME, lang TEXT DEFAULT NULL, ref_code TEXT DEFAULT NULL)",
+                (),
+            )?;
+            conn.execute(
+                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                (),
+            )?;
+            conn.execute(
+                "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL)",
+                (),
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        (pool, temp_file)
+    }
+
+    #[tokio::test]
+    async fn ads_decision_matrix() {
+        let (pool, _file) = ads_test_db().await;
+        unsafe {
+            std::env::set_var("ADMIN_IDS", "999");
+            std::env::set_var("MONETAG_MODULE_ENABLED", "true");
+            std::env::remove_var("TEST_MODE");
+        }
+        pool.set_setting("ads_enabled", "true").await.unwrap();
+        pool.set_setting("admin_ads_enabled", "false").await.unwrap();
+
+        // Regular user, ads globally on -> sees ads.
+        assert!(ads_enabled_for(&pool, 111, false).await);
+        // Admin, global on, no override -> skips ads.
+        assert!(!ads_enabled_for(&pool, 999, true).await);
+        // Premium user, global on -> skips ads.
+        pool.set_user_premium(222, 30).await.unwrap();
+        assert!(!ads_enabled_for(&pool, 222, false).await);
+
+        // Global OFF: regular users see nothing...
+        pool.set_setting("ads_enabled", "false").await.unwrap();
+        assert!(!ads_enabled_for(&pool, 111, false).await);
+        // ...but an admin with Admin Ads ON gets the test flow (reported scenario).
+        pool.set_setting("admin_ads_enabled", "true").await.unwrap();
+        assert!(ads_enabled_for(&pool, 999, true).await);
+        // Admin without the override still skips.
+        pool.set_setting("admin_ads_enabled", "false").await.unwrap();
+        assert!(!ads_enabled_for(&pool, 999, true).await);
+
+        // ymid resolves to the requesting user (what /api/ads-status uses).
+        let ymid = pool
+            .create_pending_download(111, "https://vt.tiktok.com/x")
+            .await
+            .unwrap();
+        assert_eq!(pool.get_user_id_by_ymid(&ymid).await.unwrap(), 111);
+
+        unsafe {
+            std::env::remove_var("ADMIN_IDS");
+            std::env::remove_var("MONETAG_MODULE_ENABLED");
+        }
     }
 
 
