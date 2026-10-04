@@ -10,6 +10,8 @@ pub enum Command {
     Help,
     #[command(description = "start the bot.")]
     Start,
+    #[command(description = "change language.")]
+    Language,
 }
 
 #[derive(BotCommands, Clone, Debug)]

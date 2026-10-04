@@ -33,6 +33,7 @@ pub async fn admin_panel_text_handler(
 
     let keyboard = KeyboardMarkup::new(vec![
         vec![KeyboardButton::new("📊 Stats"), KeyboardButton::new("📈 Daily Stats")],
+        vec![KeyboardButton::new("📅 Week")],
         vec![KeyboardButton::new(BTN_BROADCAST), KeyboardButton::new("➕ Add Premium User")],
         vec![KeyboardButton::new("🏆 Top 10"), KeyboardButton::new("👥 All users")],
         vec![KeyboardButton::new("💎 Premium Users")],
@@ -205,6 +206,53 @@ pub async fn daily_stats_text_handler(
         Err(e) => {
             log::error!("Daily stats error: {}", e);
             bot.send_message(msg.chat.id, "❌ Error retrieving daily stats.").await?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn weekly_stats_text_handler(
+    bot: Bot,
+    msg: Message,
+    db_pool: Arc<DatabasePool>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !is_admin(&msg).await {
+        return Ok(());
+    }
+
+    match db_pool.get_weekly_stats(7).await {
+        Ok(days) => {
+            let e = |s: String| escape_markdown_v2(&s);
+            let mut response = String::from("📅 *Weekly Report — last 7 days*\n\n");
+            let (mut total_users, mut total_new, mut total_dl, mut total_blocks) = (0i64, 0i64, 0i64, 0i64);
+            for d in &days {
+                total_users += d.unique_users;
+                total_new += d.new_users;
+                total_dl += d.downloads;
+                total_blocks += d.blocks;
+                response.push_str(&format!(
+                    "{} 👥 {} \\(\\+{} new\\) 📦 {} 🚫 {}\n",
+                    e(d.date.clone()),
+                    e(d.unique_users.to_string()),
+                    e(d.new_users.to_string()),
+                    e(d.downloads.to_string()),
+                    e(d.blocks.to_string())
+                ));
+            }
+            response.push_str(&format!(
+                "\n*Total \\(sum of days\\):* 👥 {} 🆕 {} 📦 {} 🚫 {}\n",
+                e(total_users.to_string()),
+                e(total_new.to_string()),
+                e(total_dl.to_string()),
+                e(total_blocks.to_string())
+            ));
+            bot.send_message(msg.chat.id, response)
+                .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                .await?;
+        }
+        Err(e) => {
+            log::error!("Weekly stats error: {}", e);
+            bot.send_message(msg.chat.id, "❌ Error retrieving weekly stats.").await?;
         }
     }
     Ok(())

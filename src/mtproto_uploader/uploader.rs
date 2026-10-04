@@ -49,7 +49,7 @@ impl MTProtoUploader {
                 None
             },
             flood_sleep_threshold: 60,
-            update_queue_limit: Some(100),
+            update_queue_limit: Some(1000),
             ..Default::default()
         };
         
@@ -68,10 +68,16 @@ impl MTProtoUploader {
         // Wrap the client in Arc<Mutex<>> for reconnection capability
         let client = Arc::new(Mutex::new(client));
 
-        // Run keep-alive ping in a separate task
+        // Run keep-alive ping in a separate task. Frequent pings keep NAT /
+        // middleboxes from killing the idle TCP connection (which used to
+        // cause a full reconnect storm). A full reconnect replaces the live
+        // client and kills in-flight uploads, so it only happens after
+        // several consecutive ping failures, not on a single blip.
         let client_keepalive = client.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 minutes
+            // Frequent enough to keep idle connections alive through NAT.
+            let mut interval = tokio::time::interval(Duration::from_secs(120));
+            let mut consecutive_failures: u32 = 0;
             loop {
                 interval.tick().await;
 
@@ -82,11 +88,25 @@ impl MTProtoUploader {
                 };
 
                 match result {
-                    Ok(_) => log::debug!("Keep-alive ping successful"),
+                    Ok(_) => {
+                        consecutive_failures = 0;
+                        log::debug!("Keep-alive ping successful")
+                    },
                     Err(e) => {
-                        log::error!("Keep-alive ping failed: {:?}, reconnecting...", e);
-                        
-                        // Reconnection attempt
+                        consecutive_failures += 1;
+                        if consecutive_failures < 3 {
+                            log::warn!(
+                                "Keep-alive ping failed ({}/3): {:?}, retrying before reconnecting...",
+                                consecutive_failures, e
+                            );
+                            continue;
+                        }
+                        consecutive_failures = 0;
+                        log::error!("Keep-alive ping failed 3 times in a row: {:?}, reconnecting...", e);
+
+                        // Reconnection attempt. Note: replacing the client
+                        // drops the old one (grammers disconnects on drop),
+                        // so in-flight uploads fail over via with_reconnect_retry.
                         if let Err(reconnect_err) = MTProtoUploader::reconnect_client(&client_keepalive).await {
                             log::error!("Reconnection failed: {:?}", reconnect_err);
                         } else {
@@ -124,7 +144,7 @@ impl MTProtoUploader {
                 None
             },
             flood_sleep_threshold: 60,
-            update_queue_limit: Some(100),
+            update_queue_limit: Some(1000),
             ..Default::default()
         };
         

@@ -164,6 +164,36 @@ async fn main() -> Result<(), Error> {
         tiktokdownloader::web_server::start_web_server(web_server_state, web_port).await;
     });
 
+    // Expiry sweeper for abandoned download requests: every 60 seconds,
+    // expire rows older than 30 minutes and notify each user once in their
+    // own language. Legacy rows were retired silently at startup migration.
+    let sweep_db = db_pool.clone();
+    let sweep_bot = bot.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            match sweep_db.expire_stale_pending(1800).await {
+                Ok(stale) => {
+                    for (ymid, user_id) in stale {
+                        let lang = sweep_db.get_effective_lang(user_id, None).await;
+                        log::warn!("Expiring abandoned download {} for user {}", ymid, user_id);
+                        let _ = sweep_bot
+                            .send_message(
+                                ChatId(user_id),
+                                tiktokdownloader::i18n::t(
+                                    tiktokdownloader::i18n::MsgKey::DownloadFailed,
+                                    Some(lang.as_str()),
+                                ),
+                            )
+                            .await;
+                    }
+                }
+                Err(e) => log::error!("Expiry sweeper failed: {}", e),
+            }
+        }
+    });
+
     let handler = build_handler();
 
     log::info!("Bot initialized in {:.2?}", start_time.elapsed());

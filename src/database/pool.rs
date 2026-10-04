@@ -18,6 +18,16 @@ pub struct UserInfo {
     pub last_updated: tokio::time::Instant,
 }
 
+/// Per-day aggregates for the weekly admin report.
+#[derive(Debug, Clone)]
+pub struct WeeklyDayStats {
+    pub date: String,
+    pub unique_users: i64,
+    pub new_users: i64,
+    pub downloads: i64,
+    pub blocks: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct RichDailyStats {
     pub date: String,
@@ -148,6 +158,35 @@ impl DatabasePool {
         log::info!("Invalidated cached quality preference for user {}", user_id);
     }
 
+    /// Manual /language override for a user, if set.
+    pub async fn get_user_lang(&self, user_id: i64) -> Result<Option<String>, anyhow::Error> {
+        self.execute_with_timeout(move |conn| {
+            let lang: Option<String> = conn.query_row(
+                "SELECT lang FROM users WHERE telegram_id = ?1",
+                params![user_id],
+                |row| row.get(0)
+            ).optional()?;
+            Ok(lang)
+        }).await.map_err(|e| anyhow::anyhow!("Failed to get language for user {}: {}", user_id, e))
+    }
+
+    /// Persist the manual /language override for a user.
+    pub async fn set_user_lang(&self, user_id: i64, lang: &str) -> Result<(), anyhow::Error> {
+        let lang_owned = lang.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?1)", params![user_id])?;
+            conn.execute("UPDATE users SET lang = ?1 WHERE telegram_id = ?2", params![lang_owned, user_id])?;
+            Ok(())
+        }).await.map_err(|e| anyhow::anyhow!("Failed to set language for user {}: {}", user_id, e))
+    }
+
+    /// Effective locale: the stored /language override wins, else the Telegram
+    /// device tag, else English. Never fails.
+    pub async fn get_effective_lang(&self, user_id: i64, tg_lang: Option<&str>) -> String {
+        let stored = self.get_user_lang(user_id).await.ok().flatten();
+        crate::i18n::resolve_lang(stored.as_deref().or(tg_lang)).to_string()
+    }
+
     /// Get a setting from the settings table
     pub async fn get_setting(&self, key: &str) -> Result<String, anyhow::Error> {
         let key_owned = key.to_string();
@@ -212,6 +251,19 @@ impl DatabasePool {
         }).await.map_err(|e| anyhow::anyhow!("Failed to verify download {}: {}", id, e))
     }
 
+    /// Mark a pending row as terminally failed (download/upload error or job
+    /// budget exceeded). Notified immediately so the sweeper skips it.
+    pub async fn mark_pending_failed(&self, id: &str) -> Result<(), anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "UPDATE pending_downloads SET status = 'failed', notified_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                params![id_owned],
+            )?;
+            Ok(())
+        }).await.map_err(|e| anyhow::anyhow!("Failed to mark {} as failed: {}", id, e))
+    }
+
     /// Claim a verified download and trigger completion
     pub async fn claim_verified_download(&self, id: &str) -> Result<(i64, String), anyhow::Error> {
         let id_owned = id.to_string();
@@ -274,6 +326,64 @@ impl DatabasePool {
             ).optional()?;
             Ok(status)
         }).await.map_err(|e| anyhow::anyhow!("Failed to get status for {}: {}", id, e))
+    }
+
+    /// Record that a user blocked the bot (MyChatMember -> Banned).
+    pub async fn record_block(&self, user_id: i64) -> Result<(), anyhow::Error> {
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "INSERT INTO blocks (telegram_id) VALUES (?1)",
+                params![user_id],
+            )?;
+            Ok(())
+        }).await.map_err(|e| anyhow::anyhow!("Failed to record block for user {}: {}", user_id, e))
+    }
+
+    /// Per-day aggregates for the last `days` days, oldest first.
+    pub async fn get_weekly_stats(&self, days: i64) -> Result<Vec<WeeklyDayStats>, anyhow::Error> {
+        let mut out = Vec::new();
+        for d in (0..days).rev() {
+            let day = self.execute_with_timeout(move |conn| {
+                let day_sql = format!("date('now', '-{} days')", d);
+                let unique_users: i64 = conn.query_row(
+                    &format!("SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = {day_sql}"),
+                    [], |r| r.get(0)).unwrap_or(0);
+                let new_users: i64 = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM users WHERE date(created_at) = {day_sql}"),
+                    [], |r| r.get(0)).unwrap_or(0);
+                let downloads: i64 = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM downloads WHERE date(download_date) = {day_sql}"),
+                    [], |r| r.get(0)).unwrap_or(0);
+                let blocks: i64 = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM blocks WHERE date(blocked_at) = {day_sql}"),
+                    [], |r| r.get(0)).unwrap_or(0);
+                Ok((unique_users, new_users, downloads, blocks))
+            }).await?;
+            let date = (chrono::Local::now() - chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
+            out.push(WeeklyDayStats { date, unique_users: day.0, new_users: day.1, downloads: day.2, blocks: day.3 });
+        }
+        Ok(out)
+    }
+
+    /// Expire abandoned download requests older than `older_than_secs` and
+    /// return the ones that still need a user notification, marking them
+    /// notified atomically so a second run never double-notifies.
+    pub async fn expire_stale_pending(&self, older_than_secs: i64) -> Result<Vec<(String, i64)>, anyhow::Error> {
+        self.execute_with_timeout(move |conn| {
+            let cutoff = format!("datetime('now', '-{} seconds')", older_than_secs);
+            let mut stmt = conn.prepare(&format!(
+                "SELECT id, user_id FROM pending_downloads WHERE status IN ('pending', 'verified') AND notified_at IS NULL AND created_at < {cutoff}"
+            ))?;
+            let rows: Vec<(String, i64)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .filter_map(|r| r.ok()).collect();
+            for (id, _) in &rows {
+                conn.execute(
+                    "UPDATE pending_downloads SET status = 'expired', notified_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                    params![id],
+                )?;
+            }
+            Ok(rows)
+        }).await.map_err(|e| anyhow::anyhow!("Failed to expire stale pending downloads: {}", e))
     }
 
     /// Check if user has active premium status
@@ -452,7 +562,7 @@ mod tests {
         // Initialize all necessary tables
         pool.execute_with_timeout(|conn| {
             conn.execute(
-                "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME)",
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME, lang TEXT DEFAULT NULL, ref_code TEXT DEFAULT NULL)",
                 (),
             )?;
             conn.execute(
@@ -460,7 +570,15 @@ mod tests {
                 (),
             )?;
             conn.execute(
-                "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+                "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL)",
+                (),
+            )?;
+            conn.execute(
+                "CREATE TABLE blocks (id INTEGER PRIMARY KEY, telegram_id BIGINT NOT NULL, blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+                (),
+            )?;
+            conn.execute(
+                "CREATE TABLE downloads (id INTEGER PRIMARY KEY, user_telegram_id BIGINT, video_url TEXT NOT NULL, download_date DATETIME DEFAULT CURRENT_TIMESTAMP)",
                 (),
             )?;
             Ok(())
@@ -480,6 +598,67 @@ mod tests {
         pool.set_setting("test_key", "new_value").await.unwrap();
         let value = pool.get_setting("test_key").await.unwrap();
         assert_eq!(value, "new_value");
+    }
+
+    #[tokio::test]
+    async fn test_user_lang_override_and_effective() {
+        let (pool, _file) = setup_test_db().await;
+        let user_id = 555123456i64;
+
+        // No override yet: device tag wins, missing tag means English.
+        assert_eq!(pool.get_effective_lang(user_id, Some("ru")).await, "ru");
+        assert_eq!(pool.get_effective_lang(user_id, None).await, "en");
+
+        // Persist override: it wins over the device tag.
+        pool.set_user_lang(user_id, "uk").await.unwrap();
+        assert_eq!(pool.get_user_lang(user_id).await.unwrap(), Some("uk".to_string()));
+        assert_eq!(pool.get_effective_lang(user_id, Some("ru")).await, "uk");
+    }
+
+    #[tokio::test]
+    async fn test_record_block_and_weekly_stats() {
+        let (pool, _file) = setup_test_db().await;
+        pool.record_block(111).await.unwrap();
+        pool.record_block(222).await.unwrap();
+
+        let week = pool.get_weekly_stats(7).await.unwrap();
+        assert_eq!(week.len(), 7);
+        // Oldest first, newest last.
+        assert!(week.first().unwrap().date < week.last().unwrap().date);
+        let today = week.last().unwrap();
+        assert_eq!(today.blocks, 2);
+    }
+
+    #[tokio::test]
+    async fn test_expire_stale_pending_notifies_once() {
+        let (pool, _file) = setup_test_db().await;
+        pool.execute_with_timeout(|conn| {
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url) VALUES ('fresh', 1, 'http://x')",
+                (),
+            )?;
+            // Stale row: 31 minutes old, never notified.
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, created_at) VALUES ('stale', 2, 'http://y', datetime('now', '-31 minutes'))",
+                (),
+            )?;
+            Ok(())
+        }).await.unwrap();
+
+        let first = pool.expire_stale_pending(1800).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, "stale");
+        assert_eq!(first[0].1, 2);
+
+        // Second run: nothing left to notify.
+        let second = pool.expire_stale_pending(1800).await.unwrap();
+        assert!(second.is_empty());
+
+        // Stale row is expired now, fresh row still pending.
+        let status = pool.get_pending_download_status("stale").await.unwrap();
+        assert_eq!(status, Some("expired".to_string()));
+        let status = pool.get_pending_download_status("fresh").await.unwrap();
+        assert_eq!(status, Some("pending".to_string()));
     }
 
     #[tokio::test]

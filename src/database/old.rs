@@ -33,18 +33,74 @@ fn log_download(telegram_id: i64, video_url: &str) -> Result<()> {
     Ok(())
 }
 
+/// True when `table.column` already exists. Makes migrations idempotent.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for col in cols {
+        if col? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// ADD COLUMN only when missing. Logs loudly instead of swallowing the error,
+/// which is what hid the missing `users.created_at` column in production.
+fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
+    if column_exists(conn, table, column)? {
+        return Ok(());
+    }
+    log::info!("Migrating {table}.{column} ...");
+    conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"), [])?;
+    log::info!("Migrated {table}.{column}");
+    Ok(())
+}
+
 pub fn init_database() -> Result<()> {
     let db_path = get_database_path();
     let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME)",
+        "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME, lang TEXT DEFAULT NULL)",
         (),
     )?;
-    // Add columns if they don't exist
-    let _ = conn.execute("ALTER TABLE users ADD COLUMN last_active DATETIME DEFAULT CURRENT_TIMESTAMP", ());
-    let _ = conn.execute("ALTER TABLE users ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP", ());
-    let _ = conn.execute("ALTER TABLE users ADD COLUMN quality_preference TEXT DEFAULT 'h264'", ());
-    let _ = conn.execute("ALTER TABLE users ADD COLUMN premium_until DATETIME", ());
+    // Add columns if they don't exist (idempotent, errors propagate loudly).
+    // NOTE: created_at uses DEFAULT NULL (not CURRENT_TIMESTAMP) because
+    // SQLite refuses ADD COLUMN with a volatile default on non-empty tables
+    // ("Cannot add a column with non-constant default"); the backfill below
+    // fills real values. Fresh DBs still get CURRENT_TIMESTAMP via CREATE.
+    ensure_column(&conn, "users", "last_active", "last_active DATETIME DEFAULT CURRENT_TIMESTAMP")?;
+    ensure_column(&conn, "users", "created_at", "created_at DATETIME DEFAULT NULL")?;
+    ensure_column(&conn, "users", "quality_preference", "quality_preference TEXT DEFAULT 'h264'")?;
+    ensure_column(&conn, "users", "premium_until", "premium_until DATETIME")?;
+    ensure_column(&conn, "users", "lang", "lang TEXT DEFAULT NULL")?;
+    ensure_column(&conn, "users", "ref_code", "ref_code TEXT DEFAULT NULL")?;
+    ensure_column(&conn, "pending_downloads", "notified_at", "notified_at DATETIME DEFAULT NULL")?;
+
+    // Backfill created_at for rows that predate the column (NULL after the
+    // ADD COLUMN above) or carry a naive ALTER timestamp (always *after*
+    // last_active). Genuine registrations always satisfy
+    // created_at <= last_active, so this only touches broken rows and is
+    // safe to run on every startup.
+    let backfilled = conn.execute(
+        "UPDATE users SET created_at = last_active WHERE created_at IS NULL OR created_at > last_active",
+        [],
+    )?;
+    if backfilled > 0 {
+        log::warn!("Backfilled created_at for {backfilled} users");
+    }
+
+    // Silently retire download requests abandoned before this startup (the
+    // user never finished watching the ad). They are marked notified so the
+    // expiry sweeper never messages them; only new rows get notified.
+    let retired = conn.execute(
+        "UPDATE pending_downloads SET status = 'expired', notified_at = CURRENT_TIMESTAMP WHERE status IN ('pending', 'verified') AND created_at < datetime('now', '-30 minutes')",
+        [],
+    )?;
+    if retired > 0 {
+        log::warn!("Retired {retired} stale pending downloads without notification");
+    }
 
     // Create the table with the new format
     conn.execute(
@@ -110,7 +166,11 @@ pub fn init_database() -> Result<()> {
         (),
     )?;
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL)",
+        (),
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS blocks (id INTEGER PRIMARY KEY, telegram_id BIGINT NOT NULL, blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
     )?;
     conn.execute(
@@ -130,6 +190,7 @@ pub fn init_database() -> Result<()> {
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_user_id ON pending_downloads(user_id)", ());
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(timestamp)", ());
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(timestamp)", ());
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_date ON blocks(blocked_at)", ());
 
     conn.execute(
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('subscription_required', 'true')",
@@ -247,6 +308,181 @@ mod tests {
         ).unwrap();
         
         assert_eq!(count, 1);
+        unsafe {
+            env::remove_var("DATABASE_PATH");
+        }
+    }
+
+    fn user_columns(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn.prepare("PRAGMA table_info(users)").unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn test_migration_adds_missing_columns() {        // Simulate a legacy DB that predates created_at/lang/ref_code.
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        unsafe {
+            env::set_var("DATABASE_PATH", db_path.to_str().unwrap());
+        }
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME)",
+                (),
+            ).unwrap();
+        }
+
+        init_database().unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let cols = user_columns(&conn);
+        for expected in ["created_at", "lang", "ref_code", "last_active", "quality_preference", "premium_until"] {
+            assert!(cols.contains(&expected.to_string()), "missing column {expected}");
+        }
+        // blocks table must exist too.
+        let blocks: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='blocks'",
+            [],
+            |row| row.get(0)
+        ).unwrap();
+        assert_eq!(blocks, 1);
+        unsafe {
+            env::remove_var("DATABASE_PATH");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_created_at_migration_on_nonempty_legacy_table() {
+        // Exact production scenario: a NON-EMPTY users table without
+        // created_at. SQLite rejects ADD COLUMN with a volatile default
+        // here, so the migration must use DEFAULT NULL + backfill and,
+        // crucially, must not fail (a failure would abort bot startup).
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        unsafe {
+            env::set_var("DATABASE_PATH", db_path.to_str().unwrap());
+        }
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME)",
+                (),
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO users (telegram_id, last_active) VALUES (1, datetime('now', '-5 days')), (2, datetime('now', '-1 hour'))",
+                (),
+            ).unwrap();
+        }
+
+        // Must succeed on a non-empty table.
+        init_database().unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let filled: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM users WHERE created_at IS NOT NULL", [], |r| r.get(0)).unwrap();
+        assert_eq!(filled, 2);
+        // Backfilled from last_active, not from "now".
+        let old: String = conn.query_row(
+            "SELECT created_at FROM users WHERE telegram_id = 1", [], |r| r.get(0)).unwrap();
+        let active: String = conn.query_row(
+            "SELECT last_active FROM users WHERE telegram_id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(old, active);
+        unsafe {
+            env::remove_var("DATABASE_PATH");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_created_at_backfill_only_touches_broken_rows() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        unsafe {
+            env::set_var("DATABASE_PATH", db_path.to_str().unwrap());
+        }
+
+        init_database().unwrap();
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            // Healthy row: registered yesterday, active today.
+            conn.execute(
+                "INSERT INTO users (telegram_id, last_active, created_at) VALUES (1, datetime('now'), datetime('now', '-1 day'))",
+                (),
+            ).unwrap();
+            // Broken row (naive ADD COLUMN fill): created_at after last_active.
+            conn.execute(
+                "INSERT INTO users (telegram_id, last_active, created_at) VALUES (2, datetime('now', '-10 days'), datetime('now'))",
+                (),
+            ).unwrap();
+        }
+
+        // Snapshot the healthy row before the second migration run.
+        let healthy_before: String = Connection::open(&db_path).unwrap().query_row(
+            "SELECT created_at FROM users WHERE telegram_id = 1", [], |r| r.get(0)).unwrap();
+
+        // Re-running init must fix only the broken row (idempotent).
+        init_database().unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let healthy: String = conn.query_row(
+            "SELECT created_at FROM users WHERE telegram_id = 1", [], |r| r.get(0)).unwrap();
+        let fixed: String = conn.query_row(
+            "SELECT created_at FROM users WHERE telegram_id = 2", [], |r| r.get(0)).unwrap();
+        let fixed_active: String = conn.query_row(
+            "SELECT last_active FROM users WHERE telegram_id = 2", [], |r| r.get(0)).unwrap();
+        // Broken row repaired to its last_active ...
+        assert_eq!(fixed, fixed_active);
+        // ... while the healthy row is untouched.
+        assert_eq!(healthy, healthy_before);
+        unsafe {
+            env::remove_var("DATABASE_PATH");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_stale_pending_retired_silently() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        unsafe {
+            env::set_var("DATABASE_PATH", db_path.to_str().unwrap());
+        }
+
+        init_database().unwrap();
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url) VALUES ('fresh', 1, 'http://x')",
+                (),
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, created_at) VALUES ('stale', 2, 'http://y', datetime('now', '-31 minutes'))",
+                (),
+            ).unwrap();
+        }
+
+        init_database().unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let stale_status: String = conn.query_row(
+            "SELECT status FROM pending_downloads WHERE id = 'stale'", [], |r| r.get(0)).unwrap();
+        let stale_notified: Option<String> = conn.query_row(
+            "SELECT notified_at FROM pending_downloads WHERE id = 'stale'", [], |r| r.get(0)).unwrap();
+        let fresh_status: String = conn.query_row(
+            "SELECT status FROM pending_downloads WHERE id = 'fresh'", [], |r| r.get(0)).unwrap();
+        assert_eq!(stale_status, "expired");
+        assert!(stale_notified.is_some());
+        assert_eq!(fresh_status, "pending");
         unsafe {
             env::remove_var("DATABASE_PATH");
         }

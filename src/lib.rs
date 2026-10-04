@@ -3,6 +3,7 @@ pub mod commands;
 pub mod config;
 pub mod database;
 pub mod handlers;
+pub mod i18n;
 pub mod mtproto_uploader;
 pub mod peers;
 pub mod telegram_bot_api_uploader;
@@ -19,7 +20,8 @@ use handlers::{
     settings_text_handler, format_text_handler, subscription_text_handler,
     back_text_handler, link_handler, BTN_BROADCAST,
     all_users_text_handler, stats_text_handler, top10_text_handler, premium_users_text_handler,
-    daily_stats_text_handler, admin_ads_text_handler,
+    daily_stats_text_handler, admin_ads_text_handler, language_button_handler,
+    weekly_stats_text_handler, start_with_payload_handler,
 };
 use handlers::ui::{BTN_ADMIN_PANEL, BTN_BACK, BTN_FORMAT, BTN_SETTINGS, BTN_SUBSCRIPTION};
 use database::DatabasePool;
@@ -32,6 +34,7 @@ use tokio::sync::Mutex;
 use teloxide::dispatching::dialogue;
 use teloxide::dptree;
 use teloxide::types::CallbackQuery;
+use teloxide::types::{ChatMemberKind, ChatMemberUpdated};
 use teloxide::dispatching::DpHandlerDescription;
 use commands::{AdminCommand, Command};
 
@@ -51,6 +54,17 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
         // Payment handlers must be outside dialogue::enter because PreCheckoutQuery has no ChatId
         .branch(Update::filter_pre_checkout_query().endpoint(handlers::payments::handle_pre_checkout))
         .branch(Update::filter_message().filter(|msg: Message| msg.successful_payment().is_some()).endpoint(handlers::payments::handle_successful_payment))
+        .branch(Update::filter_my_chat_member().endpoint(|_bot: Bot, upd: ChatMemberUpdated, db_pool: Arc<DatabasePool>| async move {
+            // A user blocked the bot (private chat member -> Banned).
+            if matches!(upd.new_chat_member.kind, ChatMemberKind::Banned(_)) {
+                let user_id = upd.from.id.0 as i64;
+                log::warn!("User {} blocked the bot", user_id);
+                if let Err(e) = db_pool.record_block(user_id).await {
+                    log::error!("Failed to record block: {}", e);
+                }
+            }
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        }))
         .branch(
             dialogue::enter::<Update, dialogue::InMemStorage<BroadcastState>, BroadcastState, _>()
                 .branch(
@@ -159,6 +173,9 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                     let ytdlp = exe_dir.join("lib").join("yt-dlp").to_string_lossy().to_string();
                     handlers::fingerprint::set_fingerprint_handler(bot, msg, db_pool, fp, &ytdlp).await
                 }))
+                .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| crate::handlers::command::parse_start_payload(t).is_some())).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+                    start_with_payload_handler(bot, msg, db_pool).await
+                }))
                 .branch(Update::filter_message().filter_command::<Command>().endpoint(command_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_SETTINGS)).endpoint(settings_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_FORMAT)).endpoint(format_text_handler))
@@ -187,6 +204,7 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                 }))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("📊 Stats")).endpoint(stats_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("📈 Daily Stats")).endpoint(daily_stats_text_handler))
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("📅 Week")).endpoint(weekly_stats_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("🏆 Top 10")).endpoint(top10_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("👥 All users")).endpoint(all_users_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("💎 Premium Users")).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
@@ -214,6 +232,9 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                     db_pool.invalidate_user_quality_cache(id).await;
                     bot.send_message(msg.chat.id, "Quality: audio").reply_markup(handlers::command::get_main_reply_keyboard()).await?;
                     Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+                }))
+                .branch(Update::filter_message().filter(|msg: Message| msg.text().map(|t| crate::i18n::is_language_button(t)).unwrap_or(false)).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+                    language_button_handler(bot, msg, db_pool).await
                 }))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text().map(|t| !handlers::ui::is_system_button(t)).unwrap_or(false)).endpoint(|bot: Bot, msg: Message, fetcher: Arc<YoutubeFetcher>, mtproto_uploader: Arc<MTProtoUploader>, db_pool: Arc<DatabasePool>, task_manager: Arc<tokio::sync::Mutex<TaskManager>>, upload_semaphore: Arc<tokio::sync::Semaphore>| async move {
                     let key = format!("{}:{}:{}", msg.chat.id.0, msg.id.0, msg.text().unwrap_or(""));

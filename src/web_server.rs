@@ -177,6 +177,10 @@ async fn claim_video(
     match claim_result {
         Ok((user_id, url)) => {
             log::info!("Claim success! Triggering download for user {}: {}", user_id, url);
+
+            // Resolve locale from the stored /language override (no Telegram
+            // User object in this flow, so no device language available).
+            let lang = state.db.get_effective_lang(user_id, None).await;
             
             // Process in background
             tokio::spawn(async move {
@@ -190,7 +194,9 @@ async fn claim_video(
                     state.task_manager,
                     state.upload_semaphore,
                     None,
-                    ChatId(user_id)
+                    ChatId(user_id),
+                    Some(lang),
+                    Some(ymid)
                 ).await {
                     log::error!("Error processing claimed download: {}", e);
                 }

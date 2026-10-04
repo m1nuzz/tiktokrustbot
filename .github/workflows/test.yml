@@ -1,0 +1,20 @@
+name: Tests
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+  workflow_dispatch:
+jobs:
+  test:
+    name: cargo test (ubuntu)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --all-targets

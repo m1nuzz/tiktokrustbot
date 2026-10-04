@@ -34,6 +34,200 @@ impl YoutubeFetcher {
     }
 }
 
+/// tikwm metadata for one TikTok post: carousel images + soundtrack URL.
+#[derive(Debug, Clone, Default)]
+pub struct TikwmMeta {
+    pub images: Vec<String>,
+    pub music: Option<String>,
+}
+
+/// Files produced by [`YoutubeFetcher::download_photo_post`].
+#[derive(Debug, Clone, Default)]
+pub struct PhotoPostFiles {
+    pub images: Vec<std::path::PathBuf>,
+    pub audio: Option<std::path::PathBuf>,
+}
+
+/// Pull image URLs out of a tikwm `data` object (plain strings, or `{url}` objects).
+fn extract_image_urls(data: &serde_json::Value) -> Vec<String> {
+    data.get("images")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    if let Some(s) = item.as_str() {
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s.to_string())
+                        }
+                    } else {
+                        item.get("url")
+                            .and_then(|u| u.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string())
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Guess an image extension from magic bytes so Telegram sniffs it correctly.
+fn image_ext(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"\xFF\xD8\xFF") {
+        "jpg"
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "png"
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        "webp"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "gif"
+    } else {
+        "jpg"
+    }
+}
+
+/// GET a CDN URL with browser-ish headers and return the raw bytes.
+async fn fetch_url_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+    let resp = client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+        .header("Referer", "https://www.tikwm.com/")
+        .header("Accept", "*/*")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!("CDN returned HTTP {} for {}", resp.status(), url));
+    }
+    Ok(resp.bytes().await?.to_vec())
+}
+
+impl YoutubeFetcher {
+    /// Query the tikwm public API once and extract carousel/music metadata.
+    /// Never fails: empty metadata means "regular video, or tikwm is down",
+    /// and the caller falls back to the yt-dlp flow.
+    pub async fn probe_tikwm(&self, url: &str) -> TikwmMeta {
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("tikwm probe: cannot build HTTP client: {}", e);
+                return TikwmMeta::default();
+            }
+        };
+
+        let api_url = format!("https://www.tikwm.com/api/?url={}", url);
+        let resp = match client
+            .get(&api_url)
+            .header("User-Agent", "Mozilla/5.0")
+            .header("Referer", "https://www.tikwm.com/")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("tikwm probe failed for {}: {}", url, e);
+                return TikwmMeta::default();
+            }
+        };
+
+        if !resp.status().is_success() {
+            log::warn!("tikwm probe HTTP {} for {}", resp.status(), url);
+            return TikwmMeta::default();
+        }
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("tikwm probe bad JSON for {}: {}", url, e);
+                return TikwmMeta::default();
+            }
+        };
+
+        if body.get("code").and_then(|v| v.as_i64()) != Some(0) {
+            return TikwmMeta::default();
+        }
+        let data = match body.get("data") {
+            Some(d) => d,
+            None => return TikwmMeta::default(),
+        };
+
+        TikwmMeta {
+            images: extract_image_urls(data).into_iter().take(35).collect(),
+            music: data
+                .get("music")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+        }
+    }
+
+    /// Download a TikTok photo post: every carousel image plus the soundtrack.
+    /// `audio_only` skips the images (user asked for audio quality).
+    pub async fn download_photo_post(
+        &self,
+        meta: &TikwmMeta,
+        filename_stem: &str,
+        audio_only: bool,
+        progress_bar: &mut ProgressBar,
+    ) -> Result<PhotoPostFiles> {
+        const MAX_PHOTOS: usize = 35;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+
+        let mut files = PhotoPostFiles::default();
+
+        if !audio_only {
+            let total = meta.images.len().min(MAX_PHOTOS).max(1) as f64;
+            for (i, img_url) in meta.images.iter().take(MAX_PHOTOS).enumerate() {
+                match fetch_url_bytes(&client, img_url).await {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        let path = self
+                            .output_dir
+                            .join(format!("{}_{}.{}", filename_stem, i, image_ext(&bytes)));
+                        tokio::fs::write(&path, &bytes).await?;
+                        log::info!(
+                            "Photo post image {} downloaded ({} bytes) to {:?}",
+                            i,
+                            bytes.len(),
+                            path
+                        );
+                        files.images.push(path);
+                    }
+                    _ => log::warn!("Skipping photo post image {} (download failed)", i),
+                }
+                let pct = ((i + 1) as f64 / total * 60.0) as u8;
+                progress_bar.update(pct.min(60), Some("🖼️ Downloading photos...")).await?;
+            }
+            if files.images.is_empty() {
+                return Err(anyhow::anyhow!("tikwm listed images but none could be downloaded"));
+            }
+        }
+
+        if let Some(music_url) = &meta.music {
+            progress_bar.update(70, Some("⬇️ Downloading audio...")).await?;
+            let bytes = fetch_url_bytes(&client, music_url).await?;
+            if bytes.is_empty() {
+                return Err(anyhow::anyhow!("tikwm CDN returned empty body for audio"));
+            }
+            let path = self.output_dir.join(format!("{}_music.m4a", filename_stem));
+            tokio::fs::write(&path, &bytes).await?;
+            log::info!("Photo post audio downloaded ({} bytes) to {:?}", bytes.len(), path);
+            files.audio = Some(path);
+        } else if audio_only {
+            return Err(anyhow::anyhow!("tikwm returned no music URL for this post"));
+        }
+
+        progress_bar.update(80, Some("⬇️ Download completed")).await?;
+        Ok(files)
+    }
+}
+
 impl YoutubeFetcher {
     pub fn new(yt_dlp_path: PathBuf, output_dir: PathBuf, ffmpeg_dir: PathBuf) -> Result<Self> {
         Ok(YoutubeFetcher {
@@ -787,6 +981,40 @@ fn parse_size_string(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_image_urls_handles_shapes() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"images": ["https://a/1.jpg", "", {"url": "https://b/2.png"}, {"nope": 1}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            extract_image_urls(&v),
+            vec![
+                "https://a/1.jpg".to_string(),
+                "https://b/2.png".to_string()
+            ]
+        );
+
+        let v: serde_json::Value = serde_json::from_str(r#"{"play": "x"}"#).unwrap();
+        assert!(extract_image_urls(&v).is_empty());
+
+        let v: serde_json::Value = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(extract_image_urls(&v).is_empty());
+    }
+
+    #[test]
+    fn image_ext_sniffs_magic() {
+        assert_eq!(image_ext(&[0xFF, 0xD8, 0xFF, 0x00]), "jpg");
+        assert_eq!(image_ext(b"\x89PNG\r\n\x1a\nrest"), "png");
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[0, 0, 0, 0]);
+        webp.extend_from_slice(b"WEBP");
+        assert_eq!(image_ext(&webp), "webp");
+        assert_eq!(image_ext(b"GIF89a..."), "gif");
+        assert_eq!(image_ext(b"nope"), "jpg");
+        assert_eq!(image_ext(&[]), "jpg");
+    }
 
     #[test]
     fn test_parse_size_string_mb() {
