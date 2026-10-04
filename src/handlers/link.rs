@@ -192,14 +192,23 @@ pub async fn link_handler(
         return Ok(());
     }
 
-    let url = match extract_url_from_text(text) {
-        Some(url) => url,
-        None => return Ok(()),
-    };
-
     // Effective locale: manual /language override wins, else Telegram tag.
+    // Computed before URL parsing: the guide reply below needs it too.
     let tg_lang = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
     let lang = db_pool.get_effective_lang(user_id as i64, tg_lang).await;
+
+    let url = match extract_url_from_text(text) {
+        Some(url) => {
+            db_pool.log_funnel_event(user_id as i64, "link_received").await;
+            url
+        }
+        None => {
+            // Not a link: guide the user instead of staying silent.
+            db_pool.log_funnel_event(user_id as i64, "text_no_link").await;
+            bot.send_message(msg.chat.id, i18n::t(MsgKey::SendLinkGuide, Some(lang.as_str()))).await?;
+            return Ok(());
+        }
+    };
 
     // Deduplication. The guard releases the URL on every exit path, including errors.
     let _url_processing_guard = match UrlProcessingGuard::try_acquire(&url) {

@@ -21,6 +21,7 @@ pub enum MsgKey {
     UploadFailed,
     LanguageChoose,
     LanguageSet,
+    SendLinkGuide,
 }
 
 /// Every [`MsgKey`] variant, used by the coverage test.
@@ -38,6 +39,7 @@ pub const ALL_KEYS: &[MsgKey] = &[
     MsgKey::UploadFailed,
     MsgKey::LanguageChoose,
     MsgKey::LanguageSet,
+    MsgKey::SendLinkGuide,
 ];
 
 /// Language codes with full translations, as returned by [`resolve_lang`].
@@ -497,6 +499,31 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::LanguageSet, "fa") => "✅ زبان به‌روزرسانی شد.",
         (MsgKey::LanguageSet, "pl") => "✅ Zaktualizowano język.",
         (MsgKey::LanguageSet, _) => "✅ Language updated.",
+        // ---- SendLinkGuide ----
+        (MsgKey::SendLinkGuide, "ru") => "🎬 Пришлите ссылку на TikTok, чтобы скачать видео, фото или музыку.",
+        (MsgKey::SendLinkGuide, "es") => "🎬 Envíame un enlace de TikTok para descargar video, fotos o música.",
+        (MsgKey::SendLinkGuide, "ar") => "🎬 أرسل لي رابط تيك توك لتنزيل الفيديو أو الصور أو الموسيقى.",
+        (MsgKey::SendLinkGuide, "zh-hans") => "🎬 请给我发送 TikTok 链接以下载视频、照片或音乐。",
+        (MsgKey::SendLinkGuide, "zh-hant") => "🎬 請給我發送 TikTok 連結以下載影片、照片或音樂。",
+        (MsgKey::SendLinkGuide, "pt-br") => "🎬 Envie-me um link do TikTok para baixar vídeo, fotos ou música.",
+        (MsgKey::SendLinkGuide, "tr") => "🎬 Video, fotoğraf veya müzik indirmek için bana bir TikTok bağlantısı gönder.",
+        (MsgKey::SendLinkGuide, "uk") => "🎬 Надішліть посилання на TikTok, щоб завантажити відео, фото чи музику.",
+        (MsgKey::SendLinkGuide, "id") => "🎬 Kirimkan saya tautan TikTok untuk mengunduh video, foto, atau musik.",
+        (MsgKey::SendLinkGuide, "vi") => "🎬 Hãy gửi cho tôi một liên kết TikTok để tải video, ảnh hoặc nhạc.",
+        (MsgKey::SendLinkGuide, "th") => "🎬 ส่งลิงก์ TikTok มาให้ฉันเพื่อดาวน์โหลดวิดีโอ รูปภาพ หรือเพลง",
+        (MsgKey::SendLinkGuide, "my") => "🎬 ဗီဒီယို၊ ဓာတ်ပုံ ဒါမှမဟုတ် သီချင်းဒေါင်းလုဒ်လုပ်ဖို့ TikTok လင့်ခ်ပို့ပေးပါ။",
+        (MsgKey::SendLinkGuide, "km") => "🎬 សូមផ្ញើលីង TikTok មកឱ្យខ្ញុំដើម្បីទាញយកវីដេអូ រូបភាព ឬតន្ត្រី។",
+        (MsgKey::SendLinkGuide, "fr") => "🎬 Envoyez-moi un lien TikTok pour télécharger vidéo, photos ou musique.",
+        (MsgKey::SendLinkGuide, "de") => "🎬 Sende mir einen TikTok-Link, um Videos, Fotos oder Musik herunterzuladen.",
+        (MsgKey::SendLinkGuide, "it") => "🎬 Inviami un link di TikTok per scaricare video, foto o musica.",
+        (MsgKey::SendLinkGuide, "nl") => "🎬 Stuur me een TikTok-link om video, foto's of muziek te downloaden.",
+        (MsgKey::SendLinkGuide, "ko") => "🎬 동영상, 사진 또는 음악을 다운로드하려면 TikTok 링크를 보내주세요.",
+        (MsgKey::SendLinkGuide, "ms") => "🎬 Hantar saya pautan TikTok untuk memuat turun video, foto atau muzik.",
+        (MsgKey::SendLinkGuide, "hi") => "🎬 वीडियो, फोटो या संगीत डाउनलोड करने के लिए मुझे TikTok लिंक भेजें।",
+        (MsgKey::SendLinkGuide, "bn") => "🎬 ভিডিও, ছবি বা গান ডাউনলোড করতে আমাকে TikTok লিঙ্ক পাঠান।",
+        (MsgKey::SendLinkGuide, "fa") => "🎬 برای دانلود ویدیو، عکس یا موسیقی یک لینک تیک‌تاک برایم بفرستید.",
+        (MsgKey::SendLinkGuide, "pl") => "🎬 Wyślij mi link do TikToka, aby pobrać film, zdjęcia lub muzykę.",
+        (MsgKey::SendLinkGuide, _) => "🎬 Send me a TikTok link to download video, photo or music.",
     }
 }
 

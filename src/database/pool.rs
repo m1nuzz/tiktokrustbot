@@ -28,6 +28,20 @@ pub struct WeeklyDayStats {
     pub blocks: i64,
 }
 
+/// One day of the conversion funnel. Drop-off reasons come from
+/// `pending_downloads` statuses; button-level steps from `funnel_events`.
+#[derive(Debug, Clone)]
+pub struct FunnelDayStats {
+    pub date: String,
+    pub started: i64,
+    pub link_sent: i64,
+    pub ad_watched: i64,
+    pub claimed: i64,
+    pub delivered: i64,
+    pub expired: i64,
+    pub failed: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct RichDailyStats {
     pub date: String,
@@ -44,6 +58,22 @@ pub struct RichDailyStats {
     pub peak_hour: Option<(u32, i64)>,
     pub top_downloaders: Vec<(i64, i64)>,
     pub last_active_users: Vec<(i64, String)>,
+}
+
+/// SQL fragment excluding admin ids from a telegram-id column.
+/// Ids are formatted as plain integers (parsed i64, injection-impossible),
+/// so no query parameters are needed. Empty list disables the filter.
+fn admin_filter_sql(column: &str, exclude_admins: &[i64]) -> String {
+    if exclude_admins.is_empty() {
+        String::new()
+    } else {
+        let ids = exclude_admins
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(" AND {} NOT IN ({})", column, ids)
+    }
 }
 
 impl DatabasePool {
@@ -340,19 +370,24 @@ impl DatabasePool {
     }
 
     /// Per-day aggregates for the last `days` days, oldest first.
-    pub async fn get_weekly_stats(&self, days: i64) -> Result<Vec<WeeklyDayStats>, anyhow::Error> {
+    /// Pass admin ids to exclude admin (test/self) traffic.
+    pub async fn get_weekly_stats(&self, days: i64, exclude_admins: &[i64]) -> Result<Vec<WeeklyDayStats>, anyhow::Error> {
+        let excl_u = admin_filter_sql("telegram_id", exclude_admins);
+        let excl_d = admin_filter_sql("user_telegram_id", exclude_admins);
         let mut out = Vec::new();
         for d in (0..days).rev() {
+            let excl_u = excl_u.clone();
+            let excl_d = excl_d.clone();
             let day = self.execute_with_timeout(move |conn| {
                 let day_sql = format!("date('now', '-{} days')", d);
                 let unique_users: i64 = conn.query_row(
-                    &format!("SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = {day_sql}"),
+                    &format!("SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = {day_sql}{excl_u}"),
                     [], |r| r.get(0)).unwrap_or(0);
                 let new_users: i64 = conn.query_row(
-                    &format!("SELECT COUNT(*) FROM users WHERE date(created_at) = {day_sql}"),
+                    &format!("SELECT COUNT(*) FROM users WHERE date(created_at) = {day_sql}{excl_u}"),
                     [], |r| r.get(0)).unwrap_or(0);
                 let downloads: i64 = conn.query_row(
-                    &format!("SELECT COUNT(*) FROM downloads WHERE date(download_date) = {day_sql}"),
+                    &format!("SELECT COUNT(*) FROM downloads WHERE date(download_date) = {day_sql}{excl_d}"),
                     [], |r| r.get(0)).unwrap_or(0);
                 let blocks: i64 = conn.query_row(
                     &format!("SELECT COUNT(*) FROM blocks WHERE date(blocked_at) = {day_sql}"),
@@ -363,6 +398,69 @@ impl DatabasePool {
             out.push(WeeklyDayStats { date, unique_users: day.0, new_users: day.1, downloads: day.2, blocks: day.3 });
         }
         Ok(out)
+    }
+
+    /// Conversion funnel for the last `days` days, oldest first.
+    /// S0 registrations, S1 links sent, S2 ads watched, S3 claimed,
+    /// S4 delivered, plus drop-off reasons. Admin traffic excluded via
+    /// `exclude_admins` (the funnel diagnoses real users).
+    pub async fn get_funnel_stats(&self, days: i64, exclude_admins: &[i64]) -> Result<Vec<FunnelDayStats>, anyhow::Error> {
+        let excl_u = admin_filter_sql("telegram_id", exclude_admins);
+        let excl_p = admin_filter_sql("user_id", exclude_admins);
+        let excl_d = admin_filter_sql("user_telegram_id", exclude_admins);
+        let mut out = Vec::new();
+        for d in (0..days).rev() {
+            let excl_u = excl_u.clone();
+            let excl_p = excl_p.clone();
+            let excl_d = excl_d.clone();
+            let day = self.execute_with_timeout(move |conn| {
+                let day_sql = format!("date('now', '-{} days')", d);
+                let started: i64 = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM users WHERE date(created_at) = {day_sql}{excl_u}"),
+                    [], |r| r.get(0)).unwrap_or(0);
+                let link_sent: i64 = conn.query_row(
+                    &format!("SELECT COUNT(DISTINCT user_id) FROM pending_downloads WHERE date(created_at) = {day_sql}{excl_p}"),
+                    [], |r| r.get(0)).unwrap_or(0);
+                let ad_watched: i64 = conn.query_row(
+                    &format!("SELECT COUNT(DISTINCT user_id) FROM pending_downloads WHERE date(created_at) = {day_sql} AND status IN ('verified', 'completed'){excl_p}"),
+                    [], |r| r.get(0)).unwrap_or(0);
+                let claimed: i64 = conn.query_row(
+                    &format!("SELECT COUNT(DISTINCT user_id) FROM pending_downloads WHERE date(created_at) = {day_sql} AND status = 'completed'{excl_p}"),
+                    [], |r| r.get(0)).unwrap_or(0);
+                let delivered: i64 = conn.query_row(
+                    &format!("SELECT COUNT(DISTINCT user_telegram_id) FROM downloads WHERE date(download_date) = {day_sql}{excl_d}"),
+                    [], |r| r.get(0)).unwrap_or(0);
+                let expired: i64 = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM pending_downloads WHERE date(created_at) = {day_sql} AND status = 'expired'{excl_p}"),
+                    [], |r| r.get(0)).unwrap_or(0);
+                let failed: i64 = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM pending_downloads WHERE date(created_at) = {day_sql} AND status = 'failed'{excl_p}"),
+                    [], |r| r.get(0)).unwrap_or(0);
+                Ok((started, link_sent, ad_watched, claimed, delivered, expired, failed))
+            }).await?;
+            let date = (chrono::Local::now() - chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
+            out.push(FunnelDayStats {
+                date, started: day.0, link_sent: day.1, ad_watched: day.2,
+                claimed: day.3, delivered: day.4, expired: day.5, failed: day.6,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Fire-and-forget funnel event (button presses, non-link texts, ...).
+    /// Never fails the caller: errors are logged and swallowed.
+    pub async fn log_funnel_event(&self, user_id: i64, event: &str) {
+        let event_owned = event.to_string();
+        let result: Result<(), anyhow::Error> = self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "INSERT INTO funnel_events (user_telegram_id, event) VALUES (?1, ?2)",
+                params![user_id, event_owned],
+            )?;
+            Ok(())
+        }).await.map_err(|e| anyhow::anyhow!("Failed to log funnel event: {}", e));
+        if let Err(e) = result {
+            log::warn!("Funnel event dropped: {}", e);
+        }
     }
 
     /// Top /start ref_codes by registrations in the last `days` days.
@@ -479,68 +577,73 @@ impl DatabasePool {
     }
 
     /// Get rich daily statistics
-    pub async fn get_rich_daily_stats(&self) -> Result<RichDailyStats, anyhow::Error> {
-        self.execute_with_timeout(|conn| {
+    /// Rich daily stats. Pass admin ids in `exclude_admins` to get the same
+    /// numbers without admin (test/self) traffic; empty slice = everyone.
+    pub async fn get_rich_daily_stats(&self, exclude_admins: &[i64]) -> Result<RichDailyStats, anyhow::Error> {
+        let excl_u = admin_filter_sql("telegram_id", exclude_admins);
+        let excl_d = admin_filter_sql("user_telegram_id", exclude_admins);
+        let excl_p = admin_filter_sql("user_id", exclude_admins);
+        self.execute_with_timeout(move |conn| {
             // Basic counts today
             let unique_users: i64 = conn.query_row(
-                "SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = date('now')",
+                &format!("SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = date('now'){excl_u}"),
                 [], |r| r.get(0)).unwrap_or(0);
             
             let yesterday_users: i64 = conn.query_row(
-                "SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = date('now', '-1 day')",
+                &format!("SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = date('now', '-1 day'){excl_u}"),
                 [], |r| r.get(0)).unwrap_or(0);
             
             let unique_downloaders: i64 = conn.query_row(
-                "SELECT COUNT(DISTINCT user_telegram_id) FROM downloads WHERE date(download_date) = date('now')",
+                &format!("SELECT COUNT(DISTINCT user_telegram_id) FROM downloads WHERE date(download_date) = date('now'){excl_d}"),
                 [], |r| r.get(0)).unwrap_or(0);
 
             let total_downloads: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM downloads WHERE date(download_date) = date('now')",
+                &format!("SELECT COUNT(*) FROM downloads WHERE date(download_date) = date('now'){excl_d}"),
                 [], |r| r.get(0)).unwrap_or(0);
 
             let ad_impressions: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM pending_downloads WHERE date(created_at) = date('now')",
+                &format!("SELECT COUNT(*) FROM pending_downloads WHERE date(created_at) = date('now'){excl_p}"),
                 [], |r| r.get(0)).unwrap_or(0);
 
             let new_users: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM users WHERE date(created_at) = date('now')",
+                &format!("SELECT COUNT(*) FROM users WHERE date(created_at) = date('now'){excl_u}"),
                 [], |r| r.get(0)).unwrap_or(0);
 
             // Payments & Revenue
             let payments_count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM payments WHERE date(timestamp) = date('now')",
+                &format!("SELECT COUNT(*) FROM payments WHERE date(timestamp) = date('now'){excl_p}"),
                 [], |r| r.get(0)).unwrap_or(0);
 
             let revenue_xtr: i64 = conn.query_row(
-                "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE date(timestamp) = date('now')",
+                &format!("SELECT COALESCE(SUM(amount), 0) FROM payments WHERE date(timestamp) = date('now'){excl_p}"),
                 [], |r| r.get(0)).unwrap_or(0);
 
             let invoices_sent: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM invoices WHERE date(timestamp) = date('now')",
+                &format!("SELECT COUNT(*) FROM invoices WHERE date(timestamp) = date('now'){excl_p}"),
                 [], |r| r.get(0)).unwrap_or(0);
 
             // Peak hour
             let peak_hour_data = conn.query_row(
-                "SELECT strftime('%H', download_date) as hr, COUNT(*) as cnt 
-                 FROM downloads WHERE date(download_date) = date('now')
-                 GROUP BY hr ORDER BY cnt DESC LIMIT 1",
+                &format!("SELECT strftime('%H', download_date) as hr, COUNT(*) as cnt 
+                 FROM downloads WHERE date(download_date) = date('now'){excl_d}
+                 GROUP BY hr ORDER BY cnt DESC LIMIT 1"),
                 [], |r| Ok((r.get::<_, String>(0)?.parse::<u32>().unwrap_or(0), r.get::<_, i64>(1)?))
             ).ok();
 
             // Top 10 downloaders
             let mut stmt = conn.prepare(
-                "SELECT user_telegram_id, COUNT(*) as cnt 
-                 FROM downloads WHERE date(download_date) = date('now')
-                 GROUP BY user_telegram_id ORDER BY cnt DESC LIMIT 10"
+                &format!("SELECT user_telegram_id, COUNT(*) as cnt 
+                 FROM downloads WHERE date(download_date) = date('now'){excl_d}
+                 GROUP BY user_telegram_id ORDER BY cnt DESC LIMIT 10")
             )?;
             let top_downloaders = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .filter_map(|r| r.ok()).collect();
 
             // 10 Last active
             let mut stmt = conn.prepare(
-                "SELECT telegram_id, strftime('%H:%M', last_active) 
-                 FROM users WHERE date(last_active) = date('now')
-                 ORDER BY last_active DESC LIMIT 10"
+                &format!("SELECT telegram_id, strftime('%H:%M', last_active) 
+                 FROM users WHERE date(last_active) = date('now'){excl_u}
+                 ORDER BY last_active DESC LIMIT 10")
             )?;
             let last_active_users = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .filter_map(|r| r.ok()).collect();
@@ -594,6 +697,10 @@ mod tests {
                 (),
             )?;
             conn.execute(
+                "CREATE TABLE funnel_events (id INTEGER PRIMARY KEY, user_telegram_id BIGINT NOT NULL, event TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+                (),
+            )?;
+            conn.execute(
                 "CREATE TABLE downloads (id INTEGER PRIMARY KEY, user_telegram_id BIGINT, video_url TEXT NOT NULL, download_date DATETIME DEFAULT CURRENT_TIMESTAMP)",
                 (),
             )?;
@@ -637,7 +744,7 @@ mod tests {
         pool.record_block(111).await.unwrap();
         pool.record_block(222).await.unwrap();
 
-        let week = pool.get_weekly_stats(7).await.unwrap();
+        let week = pool.get_weekly_stats(7, &[]).await.unwrap();
         assert_eq!(week.len(), 7);
         // Oldest first, newest last.
         assert!(week.first().unwrap().date < week.last().unwrap().date);
@@ -693,6 +800,80 @@ mod tests {
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0], (Some("site".to_string()), 2));
         assert_eq!(refs[1], (None, 1));
+    }
+
+    #[tokio::test]
+    async fn test_funnel_events_and_stats_with_admin_filter() {
+        let (pool, _file) = setup_test_db().await;
+        // Users 1..3: full journey for user 1, link-only for user 2,
+        // silent starter for user 3. User 999 is admin noise.
+        for u in [1i64, 2, 3, 999] {
+            pool.execute_with_timeout(move |conn| {
+                conn.execute(
+                    "INSERT INTO users (telegram_id) VALUES (?1)",
+                    params![u],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        pool.log_funnel_event(1, "start").await;
+        pool.log_funnel_event(2, "text_no_link").await;
+        pool.execute_with_timeout(|conn| {
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('a', 1, 'http://x', 'completed')",
+                (),
+            )?;
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('b', 2, 'http://y', 'expired')",
+                (),
+            )?;
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('c', 999, 'http://z', 'completed')",
+                (),
+            )?;
+            conn.execute(
+                "INSERT INTO downloads (user_telegram_id, video_url) VALUES (1, 'http://x')",
+                (),
+            )?;
+            conn.execute(
+                "INSERT INTO downloads (user_telegram_id, video_url) VALUES (999, 'http://z')",
+                (),
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // Funnel events recorded (fire-and-forget API).
+        let n: i64 = pool
+            .execute_with_timeout(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM funnel_events WHERE user_telegram_id = 1 AND event = 'start'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // All traffic: S0=4 starters.
+        let all = &pool.get_funnel_stats(7, &[]).await.unwrap()[6];
+        assert_eq!(all.started, 4);
+        assert_eq!(all.link_sent, 3);
+        assert_eq!(all.delivered, 2);
+
+        // Without admin: admin rows vanish from every stage.
+        let clean = &pool.get_funnel_stats(7, &[999]).await.unwrap()[6];
+        assert_eq!(clean.started, 3);
+        assert_eq!(clean.link_sent, 2);
+        assert_eq!(clean.ad_watched, 1);
+        assert_eq!(clean.claimed, 1);
+        assert_eq!(clean.delivered, 1);
+        assert_eq!(clean.expired, 1);
+        assert_eq!(clean.failed, 0);
     }
 
     #[tokio::test]

@@ -54,6 +54,7 @@ pub async fn language_button_handler(
     if let Err(e) = db_pool.set_user_lang(user_id, code).await {
         log::error!("Failed to save language for user {}: {}", user_id, e);
     }
+    db_pool.log_funnel_event(user_id, "language_set").await;
 
     bot.send_message(msg.chat.id, i18n::t(MsgKey::LanguageSet, Some(code)))
         .reply_markup(crate::handlers::command::get_main_reply_keyboard())

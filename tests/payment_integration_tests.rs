@@ -165,7 +165,7 @@ async fn test_rich_daily_stats_logic() {
     }).await.unwrap();
 
     // 3. Get stats
-    let stats = pool.get_rich_daily_stats().await.unwrap();
+    let stats = pool.get_rich_daily_stats(&[]).await.unwrap();
 
     // 4. Verify
     assert_eq!(stats.unique_users, 2); // 101 and 201

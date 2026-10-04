@@ -68,6 +68,7 @@ pub async fn start_with_payload_handler(
     if let Some(r) = &payload {
         log::info!("User {} started with ref '{}'", user_id, r);
     }
+    db_pool.log_funnel_event(user_id, "start").await;
 
     let tg_lang = msg
         .from

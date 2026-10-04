@@ -176,6 +176,10 @@ pub fn init_database() -> Result<()> {
         (),
     )?;
     conn.execute(
+        "CREATE TABLE IF NOT EXISTS funnel_events (id INTEGER PRIMARY KEY, user_telegram_id BIGINT NOT NULL, event TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        (),
+    )?;
+    conn.execute(
         "CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY, user_id BIGINT NOT NULL, amount INTEGER NOT NULL, payload TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
     )?;
@@ -193,6 +197,8 @@ pub fn init_database() -> Result<()> {
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(timestamp)", ());
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(timestamp)", ());
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_date ON blocks(blocked_at)", ());
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_funnel_event ON funnel_events(event, created_at)", ());
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_funnel_user ON funnel_events(user_telegram_id)", ());
 
     conn.execute(
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('subscription_required', 'true')",

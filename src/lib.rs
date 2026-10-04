@@ -21,7 +21,7 @@ use handlers::{
     back_text_handler, link_handler, BTN_BROADCAST,
     all_users_text_handler, stats_text_handler, top10_text_handler, premium_users_text_handler,
     daily_stats_text_handler, admin_ads_text_handler, language_button_handler,
-    weekly_stats_text_handler, start_with_payload_handler,
+    weekly_stats_text_handler, start_with_payload_handler, funnel_text_handler,
 };
 use handlers::ui::{BTN_ADMIN_PANEL, BTN_BACK, BTN_FORMAT, BTN_SETTINGS, BTN_SUBSCRIPTION};
 use database::DatabasePool;
@@ -184,6 +184,7 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                 }))
                 .branch(Update::filter_callback_query().filter(|q: CallbackQuery| q.data == Some("buy_premium".to_string())).endpoint(|bot: Bot, q: CallbackQuery, db_pool: Arc<DatabasePool>| async move {
                     let _ = bot.answer_callback_query(q.id).await;
+                    db_pool.log_funnel_event(q.from.id.0 as i64, "premium_click").await;
                     handlers::payments::send_premium_invoice(bot, q.from.id.into(), db_pool, None).await
                 }))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(handlers::ui::BTN_TOGGLE_ADS))).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
@@ -205,6 +206,7 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("📊 Stats")).endpoint(stats_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("📈 Daily Stats")).endpoint(daily_stats_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("📅 Week")).endpoint(weekly_stats_text_handler))
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("🔻 Funnel")).endpoint(funnel_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("🏆 Top 10")).endpoint(top10_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("👥 All users")).endpoint(all_users_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("💎 Premium Users")).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
@@ -216,6 +218,7 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                     let id = msg.chat.id.0;
                     let _ = db_pool.execute_with_timeout(move |c| c.execute("UPDATE users SET quality_preference = 'h265' WHERE telegram_id = ?1", [&id])).await;
                     db_pool.invalidate_user_quality_cache(id).await;
+                    db_pool.log_funnel_event(id, "quality_change").await;
                     bot.send_message(msg.chat.id, "Quality: h265").reply_markup(handlers::command::get_main_reply_keyboard()).await?;
                     Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
                 }))
@@ -223,6 +226,7 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                     let id = msg.chat.id.0;
                     let _ = db_pool.execute_with_timeout(move |c| c.execute("UPDATE users SET quality_preference = 'h264' WHERE telegram_id = ?1", [&id])).await;
                     db_pool.invalidate_user_quality_cache(id).await;
+                    db_pool.log_funnel_event(id, "quality_change").await;
                     bot.send_message(msg.chat.id, "Quality: h264").reply_markup(handlers::command::get_main_reply_keyboard()).await?;
                     Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
                 }))
@@ -230,6 +234,7 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                     let id = msg.chat.id.0;
                     let _ = db_pool.execute_with_timeout(move |c| c.execute("UPDATE users SET quality_preference = 'audio' WHERE telegram_id = ?1", [&id])).await;
                     db_pool.invalidate_user_quality_cache(id).await;
+                    db_pool.log_funnel_event(id, "quality_change").await;
                     bot.send_message(msg.chat.id, "Quality: audio").reply_markup(handlers::command::get_main_reply_keyboard()).await?;
                     Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
                 }))

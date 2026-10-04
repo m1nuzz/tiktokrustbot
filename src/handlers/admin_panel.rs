@@ -33,7 +33,7 @@ pub async fn admin_panel_text_handler(
 
     let keyboard = KeyboardMarkup::new(vec![
         vec![KeyboardButton::new("📊 Stats"), KeyboardButton::new("📈 Daily Stats")],
-        vec![KeyboardButton::new("📅 Week")],
+        vec![KeyboardButton::new("📅 Week"), KeyboardButton::new("🔻 Funnel")],
         vec![KeyboardButton::new(BTN_BROADCAST), KeyboardButton::new("➕ Add Premium User")],
         vec![KeyboardButton::new("🏆 Top 10"), KeyboardButton::new("👥 All users")],
         vec![KeyboardButton::new("💎 Premium Users")],
@@ -134,8 +134,14 @@ pub async fn daily_stats_text_handler(
         return Ok(());
     }
 
-    match db_pool.get_rich_daily_stats().await {
-        Ok(s) => {
+    match db_pool.get_rich_daily_stats(&[]).await {
+        Ok(all) => {
+            // Same numbers without admin (test/self) traffic.
+            let admins = crate::handlers::admin::admin_ids();
+            let s = db_pool
+                .get_rich_daily_stats(&admins)
+                .await
+                .unwrap_or_else(|_| all.clone());
             let user_conv = if s.unique_users > 0 { (s.unique_downloaders as f64 / s.unique_users as f64) * 100.0 } else { 0.0 };
             let ad_pay_cr = if s.ad_impressions > 0 { (s.payments_count as f64 / s.ad_impressions as f64) * 100.0 } else { 0.0 };
             let inv_pay_cr = if s.invoices_sent > 0 { (s.payments_count as f64 / s.invoices_sent as f64) * 100.0 } else { 0.0 };
@@ -144,8 +150,9 @@ pub async fn daily_stats_text_handler(
             let e = |s: String| escape_markdown_v2(&s);
 
             let mut response = format!(
-                "📊 *Daily Report — {}*\n\n\
-                *Activity Today*\n\
+                "📊 *Daily Report — {}*\n\
+                📌 *С админом:* 👥 {} · ⬇️ {} · 📦 {}\n\n\
+                *Activity Today \\(без админа\\)*\n\
                 👥 Unique Users:       {} \\({}{} vs yesterday\\)\n\
                 ⬇️ Unique Downloaders: {} \\({}% of users\\)\n\
                 📦 Total Downloads:    {}\n\
@@ -159,6 +166,9 @@ pub async fn daily_stats_text_handler(
                 🔄 Invoices Sent:      {}\n\
                 💳 Invoice → Pay CR:   {}%\n\n",
                 e(s.date),
+                e(all.unique_users.to_string()),
+                e(all.unique_downloaders.to_string()),
+                e(all.total_downloads.to_string()),
                 e(s.unique_users.to_string()), 
                 if s.unique_users_delta >= 0 { "\\+" } else { "" }, 
                 e(s.unique_users_delta.to_string()),
@@ -220,10 +230,12 @@ pub async fn weekly_stats_text_handler(
         return Ok(());
     }
 
-    match db_pool.get_weekly_stats(7).await {
+    let admins = crate::handlers::admin::admin_ids();
+    let days_all = db_pool.get_weekly_stats(7, &[]).await;
+    match db_pool.get_weekly_stats(7, &admins).await {
         Ok(days) => {
             let e = |s: String| escape_markdown_v2(&s);
-            let mut response = String::from("📅 *Weekly Report — last 7 days*\n\n");
+            let mut response = String::from("📅 *Weekly Report — last 7 days \\(без админа\\)*\n\n");
             let (mut total_users, mut total_new, mut total_dl, mut total_blocks) = (0i64, 0i64, 0i64, 0i64);
             for d in &days {
                 total_users += d.unique_users;
@@ -246,6 +258,22 @@ pub async fn weekly_stats_text_handler(
                 e(total_dl.to_string()),
                 e(total_blocks.to_string())
             ));
+            if let Ok(all_days) = days_all {
+                let (mut au, mut an, mut ad, mut ab) = (0i64, 0i64, 0i64, 0i64);
+                for d in &all_days {
+                    au += d.unique_users;
+                    an += d.new_users;
+                    ad += d.downloads;
+                    ab += d.blocks;
+                }
+                response.push_str(&format!(
+                    "📌 *С админом \\(Σ\\):* 👥 {} 🆕 {} 📦 {} 🚫 {}\n",
+                    e(au.to_string()),
+                    e(an.to_string()),
+                    e(ad.to_string()),
+                    e(ab.to_string())
+                ));
+            }
             match db_pool.get_ref_stats(7).await {
                 Ok(refs) if !refs.is_empty() => {
                     response.push_str("\n🔗 *Top refs \\(new users, 7d\\):*\n");
@@ -266,6 +294,55 @@ pub async fn weekly_stats_text_handler(
         Err(e) => {
             log::error!("Weekly stats error: {}", e);
             bot.send_message(msg.chat.id, "❌ Error retrieving weekly stats.").await?;
+        }
+    }
+    Ok(())
+}
+
+fn funnel_conv(step: i64, prev: i64) -> String {
+    if prev > 0 {
+        format!("{:.1}%", step as f64 / prev as f64 * 100.0)
+    } else {
+        "—".to_string()
+    }
+}
+
+pub async fn funnel_text_handler(
+    bot: Bot,
+    msg: Message,
+    db_pool: Arc<DatabasePool>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !is_admin(&msg).await {
+        return Ok(());
+    }
+
+    // Funnel diagnoses real users: admin (test/self) traffic excluded.
+    let admins = crate::handlers::admin::admin_ids();
+    match db_pool.get_funnel_stats(7, &admins).await {
+        Ok(days) => {
+            let e = |s: String| escape_markdown_v2(&s);
+            let mut response = String::from("🔻 *Conversion Funnel — last 7 days \\(без админа\\)*\n\n");
+            for d in &days {
+                response.push_str(&format!(
+                    "*{}*\nS0 start {} → S1 link {} \\({}\\) → S2 ad {} \\({}\\) → S3 claim {} \\({}\\) → S4 got video {} \\({}\\)\n💀 expired {} · failed {}\n\n",
+                    e(d.date.clone()),
+                    e(d.started.to_string()),
+                    e(d.link_sent.to_string()), e(funnel_conv(d.link_sent, d.started)),
+                    e(d.ad_watched.to_string()), e(funnel_conv(d.ad_watched, d.link_sent)),
+                    e(d.claimed.to_string()), e(funnel_conv(d.claimed, d.ad_watched)),
+                    e(d.delivered.to_string()), e(funnel_conv(d.delivered, d.claimed)),
+                    e(d.expired.to_string()),
+                    e(d.failed.to_string()),
+                ));
+            }
+            response.push_str("S0=start · S1=sent link · S2=watched ad · S3=claimed · S4=delivered\\. Biggest drop = fix first\\.\n");
+            bot.send_message(msg.chat.id, response)
+                .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                .await?;
+        }
+        Err(e) => {
+            log::error!("Funnel stats error: {}", e);
+            bot.send_message(msg.chat.id, "❌ Error retrieving funnel stats.").await?;
         }
     }
     Ok(())

@@ -11,11 +11,16 @@ pub async fn is_admin(msg: &Message) -> bool {
 
 /// Same ADMIN_IDS check by raw id, for flows without a Message (web server).
 pub fn is_admin_id(user_id: i64) -> bool {
-    let admin_ids_str = env::var("ADMIN_IDS").unwrap_or_default();
-    admin_ids_str
+    admin_ids().contains(&user_id)
+}
+
+/// Raw admin id list from ADMIN_IDS env (empty when unset).
+pub fn admin_ids() -> Vec<i64> {
+    env::var("ADMIN_IDS")
+        .unwrap_or_default()
         .split(',')
         .filter_map(|s| s.trim().parse::<i64>().ok())
-        .any(|id| id == user_id)
+        .collect()
 }
 
 #[cfg(test)]
