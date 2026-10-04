@@ -6,7 +6,7 @@ use axum::{
 };
 use tower_http::cors::CorsLayer;
 use std::sync::Arc;
-use crate::database::DatabasePool;
+use crate::database::{ClaimVia, DatabasePool};
 use crate::yt_dlp_interface::YoutubeFetcher;
 use crate::mtproto_uploader::MTProtoUploader;
 use crate::utils::task_manager::TaskManager;
@@ -33,6 +33,13 @@ pub struct PostbackQuery {
     // Accept both "value" (per Monetag docs) and "reward_event_type" for backwards compatibility
     #[serde(alias = "value", alias = "reward_event_type")]
     pub reward_event_type: String,
+    #[serde(default)]
+    pub event_type: Option<String>,
+    #[serde(default)]
+    pub estimated_price: Option<f64>,
+    // Optional shared secret (MONETAG_POSTBACK_SECRET env must match when set)
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -123,26 +130,105 @@ async fn get_ads_status(
     Json(json!({ "enabled": enabled }))
 }
 
+/// Shared download spawner for manual claims and valued auto-delivery.
+/// Logs the delivery reason so the funnel can split paid vs timer giveaways.
+async fn spawn_download_job(
+    state: AppState,
+    user_id: i64,
+    url: String,
+    ymid: String,
+    via: ClaimVia,
+) {
+    let reason = match via {
+        ClaimVia::Verified => "delivered_valued",
+        ClaimVia::Timer => "delivered_timer",
+        ClaimVia::Admin => "delivered_admin",
+    };
+    state.db.log_funnel_event(user_id, reason).await;
+    // Resolve locale from the stored /language override (no Telegram
+    // User object in this flow, so no device language available).
+    let lang = state.db.get_effective_lang(user_id, None).await;
+    tokio::spawn(async move {
+        if let Err(e) = crate::handlers::link::process_video_request(
+            state.bot,
+            user_id,
+            url,
+            state.fetcher,
+            state.mtproto_uploader,
+            state.db,
+            state.task_manager,
+            state.upload_semaphore,
+            None,
+            ChatId(user_id),
+            Some(lang),
+            Some(ymid)
+        ).await {
+            log::error!("Error processing claimed download: {}", e);
+        }
+    });
+}
+
 async fn monetag_postback(
     State(state): State<AppState>,
     Query(query): Query<PostbackQuery>,
 ) -> impl axum::response::IntoResponse {
-    let event_type = query.reward_event_type.to_lowercase();
-    log::info!("Received Monetag postback: ymid={}, type={}", query.ymid, event_type);
+    let reward = query.reward_event_type.to_lowercase();
+    log::info!(
+        "Received Monetag postback: ymid={}, type={}, event={:?}, price={:?}",
+        query.ymid, reward, query.event_type, query.estimated_price
+    );
 
-    // Accept both valued and non_valued (for testing and fallback traffic)
-    if event_type == "valued" || event_type == "non_valued" {
-        let db = state.db.clone();
-        let ymid = query.ymid.clone();
-        
-        // Just mark as verified, do NOT trigger download yet
-        if let Err(e) = db.mark_as_verified(&ymid).await {
-            log::error!("Failed to mark download as verified for ymid {}: {}", ymid, e);
-        } else {
-            log::info!("Download {} marked as VERIFIED (type: {})", ymid, query.reward_event_type);
+    // Optional shared secret: when MONETAG_POSTBACK_SECRET is set, requests
+    // without a matching ?secret= are rejected (nobody can self-verify ymids
+    // with curl). Unset = accept all (backwards compatible with SSP configs
+    // that don't send the secret yet).
+    if let Ok(secret_env) = std::env::var("MONETAG_POSTBACK_SECRET") {
+        if !secret_env.is_empty() && query.secret.as_deref() != Some(secret_env.as_str()) {
+            log::warn!("Postback with bad/missing secret for ymid {}", query.ymid);
+            return axum::http::StatusCode::FORBIDDEN;
         }
-    } else {
-        log::warn!("Received unknown event_type='{}' for ymid: {}", event_type, query.ymid);
+    }
+
+    // Journal EVERYTHING (even unknown ymids and non_valued): the Ads counters
+    // and mismatch alerts are computed from this table.
+    if let Err(e) = state
+        .db
+        .log_postback(
+            &query.ymid,
+            query.event_type.as_deref(),
+            &reward,
+            query.estimated_price,
+        )
+        .await
+    {
+        log::error!("Failed to journal postback for ymid {}: {}", query.ymid, e);
+    }
+
+    // Gate: only valued unlocks. Non-valued is counted above, nothing more.
+    if reward != "valued" {
+        log::info!("Non-valued postback for ymid {}, no unlock", query.ymid);
+        return axum::http::StatusCode::OK;
+    }
+
+    let db = state.db.clone();
+    let ymid = query.ymid.clone();
+    if let Err(e) = db.mark_as_verified(&ymid).await {
+        log::error!("Failed to mark download as verified for ymid {}: {}", ymid, e);
+        return axum::http::StatusCode::OK;
+    }
+    log::info!("Download {} marked as VERIFIED (valued)", ymid);
+
+    // Instant auto-delivery: the user may already browse another app/site.
+    // claim_verified_download is atomic single-use: if the user already
+    // claimed via mini-app, this returns Err and we skip (no doubles).
+    match db.claim_verified_download(&ymid).await {
+        Ok((user_id, url)) => {
+            log::info!("Auto-delivering download for user {} (valued postback)", user_id);
+            spawn_download_job(state, user_id, url, ymid, ClaimVia::Verified).await;
+        }
+        Err(e) => {
+            log::info!("Auto-delivery skipped for ymid {} (likely already claimed): {}", ymid, e);
+        }
     }
 
     axum::http::StatusCode::OK
@@ -192,42 +278,21 @@ async fn claim_video(
     
     let is_admin = admins.contains(&user_id);
 
-    // 3. Attempt to claim
+    // 3. Attempt to claim: admin bypass, else verified-first then timer backstop
+    // (pending older than ~20s: the user waited out the ad window).
     let claim_result = if is_admin {
         log::info!("Admin detected (user {}), using bypass claim for ymid {}", user_id, ymid);
-        db.claim_any_download(&ymid).await
+        db.claim_any_download(&ymid)
+            .await
+            .map(|(u, url)| (u, url, ClaimVia::Admin))
     } else {
-        db.claim_verified_download(&ymid).await
+        db.claim_if_unlocked(&ymid).await
     };
 
     match claim_result {
-        Ok((user_id, url)) => {
-            log::info!("Claim success! Triggering download for user {}: {}", user_id, url);
-
-            // Resolve locale from the stored /language override (no Telegram
-            // User object in this flow, so no device language available).
-            let lang = state.db.get_effective_lang(user_id, None).await;
-            
-            // Process in background
-            tokio::spawn(async move {
-                if let Err(e) = crate::handlers::link::process_video_request(
-                    state.bot,
-                    user_id,
-                    url,
-                    state.fetcher,
-                    state.mtproto_uploader,
-                    state.db,
-                    state.task_manager,
-                    state.upload_semaphore,
-                    None,
-                    ChatId(user_id),
-                    Some(lang),
-                    Some(ymid)
-                ).await {
-                    log::error!("Error processing claimed download: {}", e);
-                }
-            });
-
+        Ok((user_id, url, via)) => {
+            log::info!("Claim success ({:?})! Triggering download for user {}: {}", via, user_id, url);
+            spawn_download_job(state, user_id, url, ymid, via).await;
             Json(json!({ "success": true }))
         },
         Err(e) => {

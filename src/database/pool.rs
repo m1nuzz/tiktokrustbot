@@ -18,6 +18,16 @@ pub struct UserInfo {
     pub last_updated: tokio::time::Instant,
 }
 
+/// How a download request was unlocked (for delivery-reason stats).
+/// Verified = valued postback arrived; Timer = 20s age rule backstop;
+/// Admin = admin bypass (no ad needed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimVia {
+    Verified,
+    Timer,
+    Admin,
+}
+
 /// Per-day aggregates for the weekly admin report.
 #[derive(Debug, Clone)]
 pub struct WeeklyDayStats {
@@ -40,6 +50,8 @@ pub struct FunnelDayStats {
     pub delivered: i64,
     pub expired: i64,
     pub failed: i64,
+    pub delivered_paid: i64,
+    pub delivered_free: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +306,79 @@ impl DatabasePool {
         }).await.map_err(|e| anyhow::anyhow!("Failed to mark {} as failed: {}", id, e))
     }
 
+    /// Record every Monetag postback hit, even unknown ymids and non_valued:
+    /// the journal backing the Ads revenue counters and mismatch alerts.
+    pub async fn log_postback(
+        &self,
+        ymid: &str,
+        event_type: Option<&str>,
+        reward_event_type: &str,
+        estimated_price: Option<f64>,
+    ) -> Result<(), anyhow::Error> {
+        let ymid_owned = ymid.to_string();
+        let event_owned = event_type.map(|s| s.to_string());
+        let reward_owned = reward_event_type.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "INSERT INTO monetag_postbacks (ymid, event_type, reward_event_type, estimated_price) VALUES (?1, ?2, ?3, ?4)",
+                params![ymid_owned, event_owned, reward_owned, estimated_price],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to log postback: {}", e))
+    }
+
+    /// Claim a download when unlocked: verified first, else the timer backstop
+    /// (pending older than ~20s). Atomic per attempt: concurrent claimants
+    /// (user tap vs valued auto-delivery) can't both succeed.
+    pub async fn claim_if_unlocked(&self, id: &str) -> Result<(i64, String, ClaimVia), anyhow::Error> {
+        // Strict path: a valued postback marked this row verified.
+        if let Ok((user_id, url)) = self.claim_verified_download(id).await {
+            return Ok((user_id, url, ClaimVia::Verified));
+        }
+        // Timer backstop: the user waited out the ad window.
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let (user_id, url): (i64, String) = conn.query_row(
+                "SELECT user_id, video_url FROM pending_downloads WHERE id = ?1 AND status = 'pending' AND created_at < datetime('now', '-20 seconds')",
+                params![id_owned],
+                |row| Ok((row.get(0)?, row.get(1)?))
+            )?;
+            conn.execute(
+                "UPDATE pending_downloads SET status = 'completed' WHERE id = ?1",
+                params![id_owned],
+            )?;
+            Ok((user_id, url, ClaimVia::Timer))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Download not unlocked yet for {}: {}", id, e))
+    }
+
+    /// (valued, non_valued) postback counts for the last `days` days.
+    pub async fn get_postback_stats(&self, days: i64) -> Result<(i64, i64), anyhow::Error> {
+        self.execute_with_timeout(move |conn| {
+            let since = format!("date('now', '-{} days')", days - 1);
+            let valued: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM monetag_postbacks WHERE date(created_at) >= {since} AND reward_event_type = 'valued'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let non_valued: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM monetag_postbacks WHERE date(created_at) >= {since} AND reward_event_type != 'valued'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            Ok((valued, non_valued))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get postback stats: {}", e))
+    }
+
     /// Claim a verified download and trigger completion
     pub async fn claim_verified_download(&self, id: &str) -> Result<(i64, String), anyhow::Error> {
         let id_owned = id.to_string();
@@ -408,11 +493,13 @@ impl DatabasePool {
         let excl_u = admin_filter_sql("telegram_id", exclude_admins);
         let excl_p = admin_filter_sql("user_id", exclude_admins);
         let excl_d = admin_filter_sql("user_telegram_id", exclude_admins);
+        let excl_f = admin_filter_sql("f.user_telegram_id", exclude_admins);
         let mut out = Vec::new();
         for d in (0..days).rev() {
             let excl_u = excl_u.clone();
             let excl_p = excl_p.clone();
             let excl_d = excl_d.clone();
+            let excl_f = excl_f.clone();
             let day = self.execute_with_timeout(move |conn| {
                 let day_sql = format!("date('now', '-{} days')", d);
                 let started: i64 = conn.query_row(
@@ -436,12 +523,19 @@ impl DatabasePool {
                 let failed: i64 = conn.query_row(
                     &format!("SELECT COUNT(*) FROM pending_downloads WHERE date(created_at) = {day_sql} AND status = 'failed'{excl_p}"),
                     [], |r| r.get(0)).unwrap_or(0);
-                Ok((started, link_sent, ad_watched, claimed, delivered, expired, failed))
+                let delivered_paid: i64 = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM funnel_events f WHERE date(f.created_at) = {day_sql} AND f.event = 'delivered_valued'{excl_f}"),
+                    [], |r| r.get(0)).unwrap_or(0);
+                let delivered_free: i64 = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM funnel_events f WHERE date(f.created_at) = {day_sql} AND f.event IN ('delivered_timer', 'delivered_admin'){excl_f}"),
+                    [], |r| r.get(0)).unwrap_or(0);
+                Ok((started, link_sent, ad_watched, claimed, delivered, expired, failed, delivered_paid, delivered_free))
             }).await?;
             let date = (chrono::Local::now() - chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
             out.push(FunnelDayStats {
                 date, started: day.0, link_sent: day.1, ad_watched: day.2,
                 claimed: day.3, delivered: day.4, expired: day.5, failed: day.6,
+                delivered_paid: day.7, delivered_free: day.8,
             });
         }
         Ok(out)
@@ -874,6 +968,15 @@ mod tests {
         assert_eq!(clean.delivered, 1);
         assert_eq!(clean.expired, 1);
         assert_eq!(clean.failed, 0);
+        assert_eq!(clean.delivered_paid, 0);
+        assert_eq!(clean.delivered_free, 0);
+
+        // Delivery reasons split paid vs free giveaways.
+        pool.log_funnel_event(1, "delivered_valued").await;
+        pool.log_funnel_event(2, "delivered_timer").await;
+        let split = &pool.get_funnel_stats(7, &[999]).await.unwrap()[6];
+        assert_eq!(split.delivered_paid, 1);
+        assert_eq!(split.delivered_free, 1);
     }
 
     #[tokio::test]

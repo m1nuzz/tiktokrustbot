@@ -180,6 +180,10 @@ pub fn init_database() -> Result<()> {
         (),
     )?;
     conn.execute(
+        "CREATE TABLE IF NOT EXISTS monetag_postbacks (id INTEGER PRIMARY KEY, ymid TEXT NOT NULL, event_type TEXT DEFAULT NULL, reward_event_type TEXT NOT NULL, estimated_price REAL DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        (),
+    )?;
+    conn.execute(
         "CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY, user_id BIGINT NOT NULL, amount INTEGER NOT NULL, payload TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
     )?;
@@ -199,6 +203,7 @@ pub fn init_database() -> Result<()> {
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_date ON blocks(blocked_at)", ());
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_funnel_event ON funnel_events(event, created_at)", ());
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_funnel_user ON funnel_events(user_telegram_id)", ());
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_postback_ymid ON monetag_postbacks(ymid, created_at)", ());
 
     conn.execute(
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('subscription_required', 'true')",

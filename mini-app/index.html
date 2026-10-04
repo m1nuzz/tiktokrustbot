@@ -164,11 +164,12 @@
         const AD_CONFIG = {
             zone: '11093538',
             sdkFn: 'show_11093538',
-            smartLink: typeof AD_CONFIG_SMARTLINK !== 'undefined' ? AD_CONFIG_SMARTLINK : 'https://omg10.com/4/11148490',
             maxRetries: 8,
             retryInterval: 1200,
             pollInterval: 3000,
-            maxSmartLinkPolls: 20 // 60 секунд / 3 секунды
+            maxPolls: 60, // ~3 min safety cap, then error screen
+            popupMaxTries: 2,
+            inApp: { frequency: 2, capping: 0.1, interval: 30, timeout: 5, everyPage: false }
         };
 
         // ========== СОСТОЯНИЕ ==========
@@ -176,7 +177,9 @@
         let retryTimerId = null;
         let pollTimeoutId = null;
         let isPolling = false;
-        let smartLinkPollCount = 0;
+        let pollCount = 0;
+        let popupTries = 0;
+        let directAction = 'close'; // 'close' | 'popup'
         let currentAdSource = null; // 'sdk' или 'smartlink'
 
         const tg = window.Telegram.WebApp;
@@ -249,14 +252,12 @@
                     return;
                 }
 
-                // Для SmartLink: если слишком много попыток
-                if (currentAdSource === 'smartlink') {
-                    smartLinkPollCount++;
-                    if (smartLinkPollCount >= AD_CONFIG.maxSmartLinkPolls) {
-                        isPolling = false;
-                        showError("Ad verification may take longer with fallback. Please wait or try again later.");
-                        return;
-                    }
+                // Safety cap: don't poll forever if the backend never confirms
+                pollCount++;
+                if (pollCount >= AD_CONFIG.maxPolls) {
+                    isPolling = false;
+                    showError("Taking too long. Please try again.");
+                    return;
                 }
 
                 // Продолжаем polling
@@ -270,6 +271,7 @@
         function startPolling() {
             if (isPolling) return;
             isPolling = true;
+            pollCount = 0;
             loaderText.innerText = "Waiting for verification...";
             loaderSubtext.innerText = "Please keep the app open";
             doPoll();
@@ -282,47 +284,127 @@
                 loaderSubtext.innerText = "Watch to support the bot!";
                 currentAdSource = 'sdk';
 
-                // ✅ ИСПРАВЛЕНО: Используем ymid (а не subid1)
-                window[AD_CONFIG.sdkFn]({ ymid: ymid })
+                // catchIfNoFeed: a silent resolve with no actual ad must surface
+                // as an error, not a phantom success
+                window[AD_CONFIG.sdkFn]({ ymid: ymid, catchIfNoFeed: true, requestVar: 'sdk_interstitial' })
                     .then(() => {
                         // Запускаем polling - сервер подтвердит, когда получит Postback
                         startPolling();
                     })
                     .catch((e) => {
                         console.error("Ad failed", e);
-                        trySmartLink();
+                        showNoAds();
                     });
             } else {
                 retryCount++;
                 updateRetryUI(retryCount);
 
                 if (retryCount >= AD_CONFIG.maxRetries) {
-                    trySmartLink();
+                    showNoAds();
                     return;
                 }
                 retryTimerId = setTimeout(trySDKAd, AD_CONFIG.retryInterval);
             }
         }
 
-        // ========== УРОВЕНЬ 2: SmartLink ==========
-        function trySmartLink() {
+        // ========== УРОВЕНЬ 2: Popup (быстрый оффер вместо SmartLink) ==========
+        // Вызывается ТОЛЬКО из клика (требование popup-blocker'ов).
+        // Постбэк impression прилетает как обычно; claim — общий.
+        function tryPopup() {
             cancelRetry();
-            currentAdSource = 'smartlink';
-            smartLinkPollCount = 0;
-            loaderText.innerText = "Opening ad in browser...";
-            loaderSubtext.innerText = "Return here after watching";
-
-            // Add ymid parameter to SmartLink for fallback tracking
-            const smartLinkUrl = `${AD_CONFIG.smartLink}?ymid=${encodeURIComponent(ymid)}`;
-            
-            if (window.Telegram?.WebApp) {
-                window.Telegram.WebApp.openLink(smartLinkUrl);
-            } else {
-                window.open(smartLinkUrl, '_blank');
+            stopPolling();
+            if (popupTries >= AD_CONFIG.popupMaxTries) {
+                showGuaranteedClaim();
+                return;
             }
+            popupTries++;
+            loaderText.innerText = "Opening quick offer...";
+            loaderSubtext.innerText = "Look at the offer, then return here";
+            try {
+                window[AD_CONFIG.sdkFn]({
+                    ymid: ymid,
+                    type: 'pop',
+                    requestVar: 'popup_retry_' + popupTries,
+                    catchIfNoFeed: true
+                })
+                    .then(() => {
+                        startPolling();
+                    })
+                    .catch((e) => {
+                        console.error("Popup failed", e);
+                        showNoAds();
+                    });
+            } catch (e) {
+                console.error("Popup threw", e);
+                showNoAds();
+            }
+        }
 
-            // ВАЖНО: Запускаем polling СРАЗУ
-            startPolling();
+        // Честный экран вместо мёртвого ожидания: рекламы нет прямо сейчас
+        function showNoAds() {
+            stopPolling();
+            cancelRetry();
+            loaderView.classList.add('hidden');
+            contentView.classList.remove('hidden');
+            document.getElementById('title').innerText = "No ads right now 😕";
+            description.innerText = "Try a quick offer, or come back later.";
+            directBtn.innerText = "🎁 Quick offer";
+            directAction = 'popup';
+            directBtn.classList.remove('hidden');
+            adBtn.innerText = "🔄 Try ad again";
+            adBtn.classList.remove('hidden');
+        }
+
+        // После исчерпания попыток: выдача по таймер-бэкстопу сервера
+        function showGuaranteedClaim() {
+            stopPolling();
+            cancelRetry();
+            loaderView.classList.add('hidden');
+            contentView.classList.remove('hidden');
+            document.getElementById('title').innerText = "Your video is ready!";
+            description.innerText = "Tap below to get it.";
+            wireClaimButton();
+        }
+
+        // Единый обработчик кнопки забора видео (регистрируется один раз,
+        // иначе MainButton.onClick складывает дубли)
+        async function onClaimTap() {
+            tg.MainButton.showProgress();
+            try {
+                const claimRes = await fetch(`${apiBase}/api/claim-video`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ymid: ymid })
+                });
+                const claimData = await claimRes.json();
+                if (claimData.success) {
+                    tg.close();
+                } else {
+                    statusMsg.innerText = "❌ " + (claimData.error || "Please wait a moment...");
+                    tg.MainButton.hideProgress();
+                    // Сервер ещё не разрешил (слишком рано) — повтор через 10 сек
+                    setTimeout(async () => {
+                        try {
+                            const r2 = await fetch(`${apiBase}/api/claim-video`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ ymid: ymid })
+                            });
+                            const d2 = await r2.json();
+                            if (d2.success) { tg.close(); }
+                            else { tg.MainButton.hideProgress(); }
+                        } catch (e2) { tg.MainButton.hideProgress(); }
+                    }, 10000);
+                }
+            } catch (e) {
+                tg.close();
+            }
+        }
+
+        // Общая привязка кнопки "забрать видео" (показ + уже зарегистрированный тап)
+        function wireClaimButton() {
+            tg.MainButton.setText("🚀 GET VIDEO NOW");
+            tg.MainButton.show();
         }
 
         // ========== УСПЕШНЫЙ ПРОСМОТР ==========
@@ -333,27 +415,9 @@
             loaderView.classList.add('hidden');
             contentView.classList.remove('hidden');
 
-            tg.MainButton.setText("🚀 GET VIDEO NOW");
-            tg.MainButton.show();
-            tg.MainButton.onClick(async () => {
-                tg.MainButton.showProgress();
-                try {
-                    const claimRes = await fetch(`${apiBase}/api/claim-video`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ ymid: ymid })
-                    });
-                    const claimData = await claimRes.json();
-                    if (claimData.success) {
-                        tg.close();
-                    } else {
-                        statusMsg.innerText = "❌ " + (claimData.error || "Verification expired. Try again.");
-                        tg.MainButton.hideProgress();
-                    }
-                } catch (e) {
-                    tg.close();
-                }
-            });
+            document.getElementById('title').innerText = "Success!";
+            description.innerText = "Your ad view has been verified. You can now claim your video.";
+            wireClaimButton();
 
             if (tg.HapticFeedback) {
                 tg.HapticFeedback.notificationOccurred('success');
@@ -363,6 +427,8 @@
         // ========== ИНИЦИАЛИЗАЦИЯ ==========
         tg.ready();
         tg.expand();
+        // Кнопка забора регистрируется один раз на всё время жизни страницы
+        tg.MainButton.onClick(onClaimTap);
 
         if (tg.themeParams.button_color) {
             document.documentElement.style.setProperty('--accent-color', tg.themeParams.button_color);
@@ -376,8 +442,17 @@
                 if (data.enabled) {
                     loaderText.innerText = "Checking Status";
                     loaderSubtext.innerText = "Please wait a moment...";
+                    // Пассивный фоновый доход: fire-and-forget, без гейта и UI
+                    try {
+                        window[AD_CONFIG.sdkFn]({
+                            type: 'inApp',
+                            inAppSettings: AD_CONFIG.inApp
+                        });
+                    } catch (e) { console.error("In-App init failed", e); }
                     trySDKAd();
                 } else {
+                    directAction = 'close';
+                    directBtn.innerText = "🚀 Continue to Bot";
                     showFinalUI("Ready!", "Ads are currently disabled. You can go straight to the bot.", true);
                 }
             })
@@ -386,21 +461,28 @@
                 showError("Could not reach the server.");
             });
 
-        // Обработчик кнопки Start Ad Manually
+        // Обработчик кнопки Start Ad Manually / Try ad again
         adBtn.addEventListener('click', () => {
             cancelRetry();
             stopPolling();
             retryCount = 0;
-            smartLinkPollCount = 0;
+            popupTries = 0;
             adBtn.classList.add('hidden');
             loaderView.classList.remove('hidden');
             contentView.classList.add('hidden');
             trySDKAd();
         });
 
-        // Обработчик кнопки Continue to Bot
+        // Обработчик кнопки Continue: действие зависит от экрана
+        // ('popup' — открыть быстрый оффер, иначе просто закрыть окно)
         directBtn.addEventListener('click', () => {
-            tg.close();
+            if (directAction === 'popup') {
+                directAction = 'close';
+                directBtn.innerText = "🚀 Continue to Bot";
+                tryPopup();
+            } else {
+                tg.close();
+            }
         });
 
         // Visibility API: Мгновенный запрос при возврате в приложение

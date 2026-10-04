@@ -143,8 +143,12 @@ pub async fn daily_stats_text_handler(
                 .await
                 .unwrap_or_else(|_| all.clone());
             let user_conv = if s.unique_users > 0 { (s.unique_downloaders as f64 / s.unique_users as f64) * 100.0 } else { 0.0 };
-            let ad_pay_cr = if s.ad_impressions > 0 { (s.payments_count as f64 / s.ad_impressions as f64) * 100.0 } else { 0.0 };
             let inv_pay_cr = if s.invoices_sent > 0 { (s.payments_count as f64 / s.invoices_sent as f64) * 100.0 } else { 0.0 };
+            let (pb_valued, pb_free) = db_pool.get_postback_stats(1).await.unwrap_or((0, 0));
+            let (pb_valued_w, pb_free_w) = db_pool.get_postback_stats(7).await.unwrap_or((0, 0));
+            let pb_total = pb_valued + pb_free;
+            let uncredited_alert =
+                pb_total >= 10 && (pb_free as f64 / pb_total as f64) > 0.8;
 
             // Helper to escape anything
             let e = |s: String| escape_markdown_v2(&s);
@@ -159,12 +163,15 @@ pub async fn daily_stats_text_handler(
                 👁 Ad Impressions:     {}\n\
                 🆕 New Users Today:    {}\n\
                 🔁 Returning Users:    {}\n\n\
-                *Monetization*\n\
+                *Monetization \\(Stars Premium\\)*\n\
                 💰 Payments Today:     {}\n\
                 ⭐ Revenue \\(Stars\\):    {}\n\
-                📈 Ad → Pay CR:        {}%\n\
                 🔄 Invoices Sent:      {}\n\
-                💳 Invoice → Pay CR:   {}%\n\n",
+                💳 Invoice → Pay CR:   {}%\n\n\
+                *📢 Ads \\(Monetag\\)*\n\
+                💰 Засчитано сегодня:  {}\n\
+                🆓 Бесплатных:         {}\n\
+                📊 За 7 дней:          {} / {}\n",
                 e(s.date),
                 e(all.unique_users.to_string()),
                 e(all.unique_downloaders.to_string()),
@@ -180,10 +187,16 @@ pub async fn daily_stats_text_handler(
                 e(s.returning_users.to_string()),
                 e(s.payments_count.to_string()),
                 e(s.revenue_xtr.to_string()),
-                e(format!("{:.1}", ad_pay_cr)),
                 e(s.invoices_sent.to_string()),
-                e(format!("{:.1}", inv_pay_cr))
+                e(format!("{:.1}", inv_pay_cr)),
+                e(pb_valued.to_string()),
+                e(pb_free.to_string()),
+                e(pb_valued_w.to_string()),
+                e(pb_free_w.to_string())
             );
+            if uncredited_alert {
+                response.push_str("⚠️ *Незачтено больше 80% — проверь постбэк\\-URL в SSP, секрет и саппорт Monetag*\n");
+            }
 
             if let Some((hour, count)) = s.peak_hour {
                 response.push_str(&format!(
@@ -258,6 +271,12 @@ pub async fn weekly_stats_text_handler(
                 e(total_dl.to_string()),
                 e(total_blocks.to_string())
             ));
+            let (pb_valued_w, pb_free_w) = db_pool.get_postback_stats(7).await.unwrap_or((0, 0));
+            response.push_str(&format!(
+                "📢 *Ads 7d:* 💰 {} · 🆓 {}\n",
+                e(pb_valued_w.to_string()),
+                e(pb_free_w.to_string())
+            ));
             if let Ok(all_days) = days_all {
                 let (mut au, mut an, mut ad, mut ab) = (0i64, 0i64, 0i64, 0i64);
                 for d in &all_days {
@@ -324,18 +343,20 @@ pub async fn funnel_text_handler(
             let mut response = String::from("🔻 *Conversion Funnel — last 7 days \\(без админа\\)*\n\n");
             for d in &days {
                 response.push_str(&format!(
-                    "*{}*\nS0 start {} → S1 link {} \\({}\\) → S2 ad {} \\({}\\) → S3 claim {} \\({}\\) → S4 got video {} \\({}\\)\n💀 expired {} · failed {}\n\n",
+                    "*{}*\nS0 start {} → S1 link {} \\({}\\) → S2 ad {} \\({}\\) → S3 claim {} \\({}\\) → S4 got video {} \\({}\\) \\(💰 {} · 🆓 {}\\)\n💀 expired {} · failed {}\n\n",
                     e(d.date.clone()),
                     e(d.started.to_string()),
                     e(d.link_sent.to_string()), e(funnel_conv(d.link_sent, d.started)),
                     e(d.ad_watched.to_string()), e(funnel_conv(d.ad_watched, d.link_sent)),
                     e(d.claimed.to_string()), e(funnel_conv(d.claimed, d.ad_watched)),
                     e(d.delivered.to_string()), e(funnel_conv(d.delivered, d.claimed)),
+                    e(d.delivered_paid.to_string()),
+                    e(d.delivered_free.to_string()),
                     e(d.expired.to_string()),
                     e(d.failed.to_string()),
                 ));
             }
-            response.push_str("S0\\=start · S1\\=sent link · S2\\=watched ad · S3\\=claimed · S4\\=delivered\\. Biggest drop \\= fix first\\.\n");
+            response.push_str("S0\\=start · S1\\=sent link · S2\\=watched ad · S3\\=claimed · S4\\=delivered \\(💰\\=valued, 🆓\\=таймер/без зачёта\\)\\. Biggest drop \\= fix first\\.\n");
             bot.send_message(msg.chat.id, response)
                 .parse_mode(teloxide::types::ParseMode::MarkdownV2)
                 .await?;
