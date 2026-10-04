@@ -76,7 +76,6 @@ pub fn init_database() -> Result<()> {
     ensure_column(&conn, "users", "premium_until", "premium_until DATETIME")?;
     ensure_column(&conn, "users", "lang", "lang TEXT DEFAULT NULL")?;
     ensure_column(&conn, "users", "ref_code", "ref_code TEXT DEFAULT NULL")?;
-    ensure_column(&conn, "pending_downloads", "notified_at", "notified_at DATETIME DEFAULT NULL")?;
 
     // Backfill created_at for rows that predate the column (NULL after the
     // ADD COLUMN above) or carry a naive ALTER timestamp (always *after*
@@ -158,6 +157,9 @@ pub fn init_database() -> Result<()> {
         "CREATE TABLE IF NOT EXISTS pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL)",
         (),
     )?;
+    // Column ensure + retirement run after the CREATE above so fresh
+    // databases (where the table does not exist yet) don't error.
+    ensure_column(&conn, "pending_downloads", "notified_at", "notified_at DATETIME DEFAULT NULL")?;
     // Silently retire download requests abandoned before this startup (the
     // user never finished watching the ad). They are marked notified so the
     // expiry sweeper never messages them; only new rows get notified.
