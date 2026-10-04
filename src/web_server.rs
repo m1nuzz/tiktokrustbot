@@ -296,6 +296,17 @@ async fn claim_video(
             Json(json!({ "success": true }))
         },
         Err(e) => {
+            // Idempotent success: a concurrent auto-delivery (valued postback)
+            // may have completed this row first, so the video is on its way.
+            if let Ok(Some(status)) = db.get_pending_download_status(&ymid).await {
+                if status == "completed" {
+                    log::info!(
+                        "Claim for ymid {} already completed, returning success",
+                        ymid
+                    );
+                    return Json(json!({ "success": true }));
+                }
+            }
             log::error!("Claim failed for ymid {}: {}", ymid, e);
             Json(json!({ 
                 "success": false, 
