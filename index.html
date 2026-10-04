@@ -409,10 +409,12 @@
         }
         
         /* One section-heading pattern site-wide: centered, fluid size so long
-           question headings never overflow their cards on narrow screens */
+           question headings never overflow their cards on narrow screens.
+           Every heading gets a brand gradient (white-start keeps it crisp). */
         .features > h2,
         .how-it-works h2,
-        .faq h2 {
+        .faq h2,
+        .github-section h2 {
             grid-column: 1 / -1;
             text-align: center;
             font-size: clamp(1.5rem, 1.1rem + 2vw, 2rem);
@@ -420,6 +422,33 @@
             margin-bottom: 1.5rem;
             overflow-wrap: break-word;
             text-wrap: balance;
+            background: linear-gradient(135deg, #fff, #00d4ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .how-it-works h2 {
+            background: linear-gradient(135deg, #fff, #9333ea);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .faq h2 {
+            background: linear-gradient(135deg, #00d4ff, #ff00ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        /* Card and FAQ sub-headings: same gradient treatment */
+        .feature-card h3,
+        .faq h3 {
+            background: linear-gradient(135deg, #fff, #00d4ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
         }
         
         /* Content links: brand cyan + underline, readable on dark cards (AA) */
@@ -582,7 +611,7 @@
         </section>
         
         <section class="github-section glass">
-            <h2 style="margin-bottom: 1.5rem; font-size: 2rem;">Open Source on GitHub</h2>
+            <h2>Open Source on GitHub</h2>
             <p style="margin-bottom: 2rem; color: #b0b0b0;">This project is open source. Check out the code, contribute, or report issues.</p>
             <a href="https://github.com/m1nuzz/tiktokrustbot" class="github-button" target="_blank" rel="noopener noreferrer">
                 <span>⭐</span>
