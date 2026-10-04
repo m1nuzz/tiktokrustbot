@@ -1,0 +1,17 @@
+# TikYouBot — TikTok Downloader Telegram Bot
+
+> Free Telegram bot that downloads TikTok videos without watermark in seconds.
+> Also supports Instagram, YouTube Shorts, Twitter and Facebook videos, plus
+> TikTok photo posts with sound. No app install, no login required.
+
+## Main page
+- [TikTok Downloader Bot — No Watermark, Free](https://m1nuzz.github.io/tiktokrustbot/): landing page with how-it-works steps, supported platforms and FAQ.
+
+## Bot
+- [TikYouBot on Telegram](https://t.me/tikyoubot?start=site): send any TikTok, Instagram or YouTube Shorts link and receive the clean HD video.
+
+## Source code
+- [m1nuzz/tiktokrustbot on GitHub](https://github.com/m1nuzz/tiktokrustbot): open-source Rust bot (teloxide, yt-dlp, FFmpeg, SQLite).
+
+## Contact
+- Support and ideas: https://t.me/SuggestMeTokBot
