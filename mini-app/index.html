@@ -178,9 +178,12 @@
         let isPolling = false;
         let pollCount = 0;
         let popupTries = 0;
-        let directAction = 'close'; // 'close' | 'popup'
+        let directAction = 'close'; // 'close' | 'popup' | 'claim'
         let currentAdSource = null; // 'sdk' или 'popup'
         let claimFired = false; // auto-claim guard: one claim per attempt
+        let noAdsShown = false; // no-ads screen visible (upgradeable to adblock)
+        let sdkLoadFailed = false; // SDK known missing: skip retry loops, fail fast
+        let adblockDetected = false; // DNS filtering blocks the ad SDK host
 
         const tg = window.Telegram.WebApp;
         const loaderView = document.getElementById('loader-view');
@@ -227,6 +230,7 @@
         }
 
         function showError(message) {
+            noAdsShown = false;
             loaderView.classList.add('hidden');
             contentView.classList.remove('hidden');
             document.getElementById('title').innerText = "Error";
@@ -290,6 +294,13 @@
         // ========== УРОВЕНЬ 1: SDK Ad ==========
         function trySDKAd() {
             claimFired = false; // new attempt: allow one auto-claim
+            if (window._sdkLoadFailed === true || sdkLoadFailed) {
+                // Script tag errored or SDK already proven missing on this
+                // device (DNS adblock): don't spin, go straight to a screen.
+                sdkLoadFailed = true;
+                showNoAdsOrAdblock();
+                return;
+            }
             if (typeof window[AD_CONFIG.sdkFn] === 'function') {
                 loaderText.innerText = "Starting Ad";
                 loaderSubtext.innerText = "Watch to support the bot!";
@@ -321,7 +332,8 @@
                 updateRetryUI(retryCount);
 
                 if (retryCount >= AD_CONFIG.maxRetries) {
-                    showNoAds();
+                    sdkLoadFailed = true; // fail fast on every later tap
+                    showNoAdsOrAdblock();
                     return;
                 }
                 retryTimerId = setTimeout(trySDKAd, AD_CONFIG.retryInterval);
@@ -333,6 +345,12 @@
         // Постбэк impression прилетает как обычно; claim — общий.
         function tryPopup() {
             claimFired = false; // new attempt: allow one auto-claim
+            if (typeof window[AD_CONFIG.sdkFn] !== 'function') {
+                // SDK missing (blocked script): popup can't open, skip loader flash
+                sdkLoadFailed = true;
+                showNoAdsOrAdblock();
+                return;
+            }
             cancelRetry();
             stopPolling();
             if (popupTries >= AD_CONFIG.popupMaxTries) {
@@ -369,24 +387,49 @@
         // Honest screen instead of dead waiting: no ads right now.
         // The user picks the next step (quick offer or ad retry);
         // both paths auto-claim on resolve with zero extra taps.
+        // Route to the honest screen: ad-blocked devices get a claim button
+        // (ads can never load there), everyone else gets retry options.
+        function showNoAdsOrAdblock() {
+            if (adblockDetected) showAdblock();
+            else showNoAds();
+        }
+
         function showNoAds() {
             stopPolling();
             cancelRetry();
+            noAdsShown = true;
             loaderView.classList.add('hidden');
             contentView.classList.remove('hidden');
             document.getElementById('title').innerText = "No ads right now 😕";
-            description.innerText = "Try a quick offer, or come back later.";
-            directBtn.innerText = "🎁 Quick offer";
+            description.innerText = "Try another method, or come back later.";
+            directBtn.innerText = "🔀 Other method";
             directAction = 'popup';
             directBtn.classList.remove('hidden');
             adBtn.innerText = "🔄 Try ad again";
             adBtn.classList.remove('hidden');
         }
 
+        // Ad-blocked device: ads can never load, so offer the video directly.
+        // The claim still passes the server age gate (auto-retry built in).
+        function showAdblock() {
+            stopPolling();
+            cancelRetry();
+            noAdsShown = false;
+            loaderView.classList.add('hidden');
+            contentView.classList.remove('hidden');
+            document.getElementById('title').innerText = "🛡 Ad-block detected";
+            description.innerText = "DNS filtering blocks ads on this device. Turn it off for Telegram, or take the video below.";
+            directBtn.innerText = "🎬 Get my video";
+            directAction = 'claim';
+            directBtn.classList.remove('hidden');
+            adBtn.classList.add('hidden');
+        }
+
         // Popup tries exhausted: deliver via the server timer backstop, no taps.
         function showGuaranteedClaim() {
             stopPolling();
             cancelRetry();
+            noAdsShown = false;
             loaderView.classList.add('hidden');
             contentView.classList.remove('hidden');
             document.getElementById('title').innerText = "Your video is ready!";
@@ -433,6 +476,7 @@
         function onAdSuccess() {
             stopPolling();
             cancelRetry();
+            noAdsShown = false;
 
             loaderView.classList.add('hidden');
             contentView.classList.remove('hidden');
@@ -455,6 +499,17 @@
         if (tg.themeParams.button_color) {
             document.documentElement.style.setProperty('--accent-color', tg.themeParams.button_color);
         }
+
+        // Adblock probe (parallel, non-blocking): DNS filtering blocks the
+        // SDK host, so the script tag errors and every ad tap dead-ends.
+        // A failed probe routes to the adblock screen with a claim button.
+        fetch('https://libtl.com/sdk.js', { method: 'HEAD', mode: 'no-cors', cache: 'no-store' })
+            .catch(() => {
+                adblockDetected = true;
+                // Late detection: upgrade the no-ads screen if already shown
+                // and the SDK is still missing.
+                if (noAdsShown && typeof window[AD_CONFIG.sdkFn] !== 'function') showAdblock();
+            });
 
         // Проверяем статус рекламы (ymid — чтобы сервер решил персонально:
         // админ с Admin Ads ON увидит реальную рекламу даже при глобальном OFF)
@@ -483,6 +538,7 @@
             cancelRetry();
             stopPolling();
             retryCount = 0;
+            sdkLoadFailed = false; // explicit retry: one fresh attempt
             popupTries = 0;
             claimFired = false; // new attempt: allow one auto-claim
             adBtn.classList.add('hidden');
@@ -491,13 +547,16 @@
             trySDKAd();
         });
 
-        // Обработчик кнопки Continue: действие зависит от экрана
-        // ('popup' — открыть быстрый оффер, иначе просто закрыть окно)
+        // Continue button: action depends on the screen
+        // ('popup' opens the quick offer, 'claim' claims the video, else close)
         directBtn.addEventListener('click', () => {
             if (directAction === 'popup') {
                 directAction = 'close';
                 directBtn.innerText = "🚀 Continue to Bot";
                 tryPopup();
+            } else if (directAction === 'claim') {
+                directBtn.innerText = "⏳ Getting video...";
+                autoClaim();
             } else {
                 tg.close();
             }
