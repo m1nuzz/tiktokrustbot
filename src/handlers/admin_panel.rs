@@ -246,6 +246,19 @@ pub async fn weekly_stats_text_handler(
                 e(total_dl.to_string()),
                 e(total_blocks.to_string())
             ));
+            match db_pool.get_ref_stats(7).await {
+                Ok(refs) if !refs.is_empty() => {
+                    response.push_str("\n🔗 *Top refs \\(new users, 7d\\):*\n");
+                    for (ref_code, count) in &refs {
+                        response.push_str(&format!(
+                            "{} — {}\n",
+                            e(ref_code.clone().unwrap_or_else(|| "(direct)".to_string())),
+                            e(count.to_string())
+                        ));
+                    }
+                }
+                _ => {}
+            }
             bot.send_message(msg.chat.id, response)
                 .parse_mode(teloxide::types::ParseMode::MarkdownV2)
                 .await?;

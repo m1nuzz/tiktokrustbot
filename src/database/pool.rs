@@ -365,6 +365,22 @@ impl DatabasePool {
         Ok(out)
     }
 
+    /// Top /start ref_codes by registrations in the last `days` days.
+    /// `None` means a bare t.me link with no payload.
+    pub async fn get_ref_stats(&self, days: i64) -> Result<Vec<(Option<String>, i64)>, anyhow::Error> {
+        self.execute_with_timeout(move |conn| {
+            let since = format!("date('now', '-{} days')", days - 1);
+            let mut stmt = conn.prepare(&format!(
+                "SELECT ref_code, COUNT(*) FROM users WHERE date(created_at) >= {since} GROUP BY ref_code ORDER BY COUNT(*) DESC LIMIT 10"
+            ))?;
+            let rows: Vec<(Option<String>, i64)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        }).await.map_err(|e| anyhow::anyhow!("Failed to get ref stats: {}", e))
+    }
+
     /// Expire abandoned download requests older than `older_than_secs` and
     /// return the ones that still need a user notification, marking them
     /// notified atomically so a second run never double-notifies.
@@ -659,6 +675,24 @@ mod tests {
         assert_eq!(status, Some("expired".to_string()));
         let status = pool.get_pending_download_status("fresh").await.unwrap();
         assert_eq!(status, Some("pending".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_ref_stats_breakdown() {
+        let (pool, _file) = setup_test_db().await;
+        pool.execute_with_timeout(|conn| {
+            conn.execute("INSERT INTO users (telegram_id, ref_code) VALUES (1, 'site')", ())?;
+            conn.execute("INSERT INTO users (telegram_id, ref_code) VALUES (2, 'site')", ())?;
+            conn.execute("INSERT INTO users (telegram_id) VALUES (3)", ())?;
+            // Old user outside the window: must not count.
+            conn.execute("INSERT INTO users (telegram_id, ref_code, created_at) VALUES (4, 'old', datetime('now', '-30 days'))", ())?;
+            Ok(())
+        }).await.unwrap();
+
+        let refs = pool.get_ref_stats(7).await.unwrap();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0], (Some("site".to_string()), 2));
+        assert_eq!(refs[1], (None, 1));
     }
 
     #[tokio::test]
