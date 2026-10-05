@@ -150,13 +150,42 @@ pub async fn start_web_server(state: AppState, port: u16) {
     axum::serve(listener, app).await.expect("Failed to start axum server");
 }
 
-async fn serve_mini_app() -> impl axum::response::IntoResponse {
+async fn serve_mini_app(
+    State(state): State<AppState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> impl axum::response::IntoResponse {
     // Get SmartLink from environment variable with fallback
     let smartlink = std::env::var("MONETAG_SMARTLINK")
         .unwrap_or_else(|_| "https://omg10.com/4/11148490".to_string());
-    
+
     // Inject SmartLink URL into HTML
     let html = MINI_APP_HTML.replace("// SMARTLINK_INJECT", &format!("const AD_CONFIG_SMARTLINK = \"{}\";", smartlink));
+    // Localise the mini-app the same way the bot localises replies: an
+    // explicit ?lang= (appended by the bot button) wins, else the stored
+    // /language override for the ymid's owner, else English. The resolved
+    // dict is injected below; the client never guesses the language itself.
+    let lang = match query.get("lang").map(|s| s.as_str()) {
+        Some(code) if !code.is_empty() => crate::i18n::resolve_lang(Some(code)).to_string(),
+        _ => match query.get("ymid") {
+            Some(ymid) if !ymid.is_empty() => match state.db.get_user_id_by_ymid(ymid).await {
+                Ok(user_id) => state.db.get_effective_lang(user_id, None).await,
+                Err(_) => "en".to_string(),
+            },
+            _ => "en".to_string(),
+        },
+    };
+    let mut dict = serde_json::Map::new();
+    for (name, key) in crate::i18n::MINI_APP_STRINGS {
+        dict.insert(
+            name.to_string(),
+            serde_json::Value::String(crate::i18n::t(*key, Some(&lang)).to_string()),
+        );
+    }
+    let html = html.replace(
+        "/*STRINGS_INJECT*/",
+        &format!("const STRINGS = {};\n        const PAGE_LANG = {};", serde_json::Value::Object(dict), serde_json::Value::String(lang.clone())),
+    );
+    let html = html.replace("<html lang=\"en\">", &format!("<html lang=\"{}\">", crate::i18n::resolve_lang(Some(&lang))));
     // Never cache the document: Telegram WebViews keep serving a stale copy
     // otherwise, and users get stuck on old funnel screens (e.g. a blue,
     // always-visible Continue from a build before btn-success/watch-gate).

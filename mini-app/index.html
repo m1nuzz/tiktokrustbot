@@ -262,6 +262,17 @@
         const ymid = urlParams.get('ymid') || 'unknown_request';
         const apiBase = window.location.origin;
 
+        // Localised UI strings, injected per request by the server
+        // (serve_mini_app + i18n::MINI_APP_STRINGS, resolved like the bot:
+        // ?lang= wins, else the stored /language override, else English).
+        // Falls back to the key name when opened without injection.
+        const STRINGS = /*STRINGS_INJECT*/null;
+        function t(key) {
+            if (typeof STRINGS === 'object' && STRINGS !== null
+                && typeof STRINGS[key] === 'string' && STRINGS[key]) return STRINGS[key];
+            return key;
+        }
+
         // ========== УТИЛИТЫ ==========
         function cancelRetry() {
             if (retryTimerId) {
@@ -292,7 +303,7 @@
             noAdsShown = false;
             loaderView.classList.add('hidden');
             contentView.classList.remove('hidden');
-            document.getElementById('title').innerText = "Error";
+            document.getElementById('title').innerText = t('MiniErrTitle');
             description.innerText = message;
             claimBtn.classList.add('hidden');
             directAction = 'close';
@@ -325,7 +336,7 @@
 
                 if (data.status === 'expired' || data.status === 'not_found') {
                     isPolling = false;
-                    showError("Session expired. Please try again.");
+                    showError(t('MiniErrExpired'));
                     return;
                 }
 
@@ -333,7 +344,7 @@
                 pollCount++;
                 if (pollCount >= AD_CONFIG.maxPolls) {
                     isPolling = false;
-                    showError("Taking too long. Please try again.");
+                    showError(t('MiniErrTooLong'));
                     return;
                 }
 
@@ -349,8 +360,8 @@
             if (isPolling) return;
             isPolling = true;
             pollCount = 0;
-            loaderText.innerText = "Waiting for verification...";
-            loaderSubtext.innerText = "Please keep the app open";
+            loaderText.innerText = t('MiniWaitVerifyTitle');
+            loaderSubtext.innerText = t('MiniWaitVerifySub');
             doPoll();
         }
 
@@ -374,8 +385,8 @@
                 showAdblock();
                 return;
             }
-            loaderText.innerText = "Starting Ad";
-            loaderSubtext.innerText = "Watch to support the bot!";
+            loaderText.innerText = t('MiniStartingAdTitle');
+            loaderSubtext.innerText = t('MiniStartingAdSub');
             currentAdSource = 'sdk';
 
             const token = ++adAttemptToken;
@@ -473,8 +484,8 @@
         // blockers answer with a stub page instead of failing — so the only
         // reliable test is loading the SDK script itself.
         async function startAdFlow() {
-            loaderText.innerText = "Checking for ad network";
-            loaderSubtext.innerText = "Please wait a moment...";
+            loaderText.innerText = t('MiniCheckingNetTitle');
+            loaderSubtext.innerText = t('MiniCheckingNetSub');
             trackEvent('probe_start');
             for (let attempt = 1; attempt <= AD_CONFIG.sdkProbeAttempts; attempt++) {
                 if (typeof window[AD_CONFIG.sdkFn] === 'function') { break; }
@@ -571,8 +582,8 @@
                 return;
             }
             popupTries++;
-            loaderText.innerText = "Opening quick offer...";
-            loaderSubtext.innerText = "Look at the offer, then return here";
+            loaderText.innerText = t('MiniOpeningOfferTitle');
+            loaderSubtext.innerText = t('MiniOpeningOfferSub');
             const token = ++adAttemptToken;
             try {
                 const popupPromise = window[AD_CONFIG.sdkFn]({
@@ -610,16 +621,16 @@
             noAdsShown = true;
             loaderView.classList.add('hidden');
             contentView.classList.remove('hidden');
-            document.getElementById('title').innerText = "No ads right now 😕";
-            description.innerText = "No ad is available at the moment. Take the video, try the quick offer, or retry the ad.";
+            document.getElementById('title').innerText = t('MiniNoAdsTitle');
+            description.innerText = t('MiniNoAdsDesc');
             // Every visible button must do something: claim / offer / retry.
             trackEvent('no_fill_screen');
-            claimBtn.innerText = "🎬 Get my video";
+            claimBtn.innerText = t('MiniBtnGetVideo');
             claimBtn.classList.remove('hidden');
-            directBtn.innerText = "🎁 Quick offer";
+            directBtn.innerText = t('MiniBtnQuickOffer');
             directAction = 'popup';
             directBtn.classList.remove('hidden');
-            adBtn.innerText = "🔄 Try ad again";
+            adBtn.innerText = t('MiniBtnRetryAd');
             adBtn.classList.remove('hidden');
         }
 
@@ -637,20 +648,20 @@
             adblockDetected = true;
             loaderView.classList.add('hidden');
             contentView.classList.remove('hidden');
-            document.getElementById('title').innerText = "🛡 Ad-block detected";
-            description.innerText = "Ads cannot load while ad-blocking is on, so there is nothing to watch. Turn off ad-blocking for Telegram (your ad-blocker app, or the DNS / Private DNS setting) and come back — the ad will start on its own. If it does not, close this window and press the bot's button again.";
+            document.getElementById('title').innerText = t('MiniAdblockTitle');
+            description.innerText = t('MiniAdblockDesc');
             // A reload carrying ?pop=fail|timeout means the last offer tap
             // found no ad to open: say so instead of repeating the base text.
             const popOutcome = urlParams.get('pop');
             if (popOutcome === 'fail' || popOutcome === 'timeout') {
-                description.innerText += " All attempts to load an ad have failed — please turn off ad-blocking and try again.";
+                description.innerText += t('MiniAdblockMiss');
             }
             claimBtn.classList.add('hidden');
             adBtn.classList.add('hidden');
             // One manual recovery path: reload the document (fresh SDK load
             // attempt) and fire a popup inside the tap gesture. Its
             // impression/valued postbacks correlate to this same ymid.
-            directBtn.innerText = "🔄 Reload & open offer";
+            directBtn.innerText = t('MiniBtnReloadOffer');
             directAction = 'reload_popup';
             directBtn.classList.remove('hidden');
             trackEvent('adblock_popup_shown');
@@ -784,9 +795,9 @@
         // one honest line, then restore the screen text.
         function showTransientOfferMiss() {
             const prev = description.innerText;
-            description.innerText = "All attempts to load an ad have failed — please turn off ad-blocking and try again.";
+            description.innerText = t('MiniAdblockMiss').trim();
             setTimeout(() => {
-                if (document.getElementById('title').innerText.includes('Ad-block')) {
+                if (document.getElementById('title').innerText.includes(t('MiniAdblockTitle'))) {
                     description.innerText = prev;
                 }
             }, 4000);
@@ -944,8 +955,8 @@
             noAdsShown = false;
             loaderView.classList.add('hidden');
             contentView.classList.remove('hidden');
-            document.getElementById('title').innerText = "Your video is ready!";
-            description.innerText = "Taking it for you now.";
+            document.getElementById('title').innerText = t('MiniVideoReadyTitle');
+            description.innerText = t('MiniVideoReadyDesc');
             claimBtn.classList.add('hidden');
             adBtn.classList.add('hidden');
             autoClaim();
@@ -978,12 +989,12 @@
                 }
 
                 if (attempt === AD_CONFIG.claimMaxAttempts) {
-                    showError("Couldn't confirm the download yet. Please open the bot and send the link again.");
+                    showError(t('MiniErrClaim'));
                     return;
                 }
 
                 // Visible progress so the wait never looks like a dead button.
-                claimBtn.innerText = `⏳ Preparing video... (${attempt}/${AD_CONFIG.claimMaxAttempts})`;
+                claimBtn.innerText = t('MiniClaimProgress').replace('{n}', attempt).replace('{m}', AD_CONFIG.claimMaxAttempts);
                 claimBtn.classList.remove('hidden');
                 await new Promise(r => setTimeout(r, AD_CONFIG.claimRetryInterval));
             }
@@ -998,8 +1009,8 @@
             loaderView.classList.add('hidden');
             contentView.classList.remove('hidden');
 
-            document.getElementById('title').innerText = "Success!";
-            description.innerText = "Your ad view has been verified. We are sending your video now.";
+            document.getElementById('title').innerText = t('MiniSuccessTitle');
+            description.innerText = t('MiniSuccessDesc');
             claimBtn.classList.add('hidden');
             adBtn.classList.add('hidden');
             directBtn.classList.add('hidden');
@@ -1016,12 +1027,12 @@
             const revealContinue = () => {
                 if (revealToken !== adAttemptToken) return;
                 if (contentView.classList.contains('hidden')) return;
-                if (document.getElementById('title').innerText !== "Success!") return;
+                if (document.getElementById('title').innerText !== t('MiniSuccessTitle')) return;
                 if (bonusPopupDone) {
-                    directBtn.innerText = "🚀 Continue to Bot";
+                    directBtn.innerText = t('MiniBtnContinueBot');
                     directAction = 'close';
                 } else {
-                    directBtn.innerText = "🎁 Continue";
+                    directBtn.innerText = t('MiniBtnContinue');
                     directAction = 'bonus_popup';
                     trackEvent('bonus_popup_shown');
                 }
@@ -1029,7 +1040,7 @@
             };
             const waitMs = AD_CONFIG.requiredWatchMs - (Date.now() - (adShownAt || 0));
             if (waitMs > 0) {
-                description.innerText = "Thanks for watching! Your video is on its way.";
+                description.innerText = t('MiniThanksWatching');
                 setTimeout(revealContinue, waitMs);
             } else {
                 revealContinue();
@@ -1042,6 +1053,8 @@
         }
 
         // ========== ИНИЦИАЛИЗАЦИЯ ==========
+        loaderText.innerText = t('MiniLoadingTitle');
+        loaderSubtext.innerText = t('MiniLoadingSub');
         tg.ready();
         tg.expand();
         // No claim buttons anywhere: keep the main button hidden defensively.
@@ -1063,13 +1076,13 @@ if (data.enabled) {
         startAdFlow();
     } else {
                     directAction = 'close';
-                    directBtn.innerText = "🚀 Continue to Bot";
-                    showFinalUI("Ready!", "Ads are currently disabled. You can go straight to the bot.", true);
+                    directBtn.innerText = t('MiniBtnContinueBot');
+                    showFinalUI(t('MiniReadyTitle'), t('MiniReadyDesc'), true);
                 }
             })
             .catch(e => {
                 console.error(e);
-                showError("Could not reach the server.");
+                showError(t('MiniErrNoServer'));
             });
 
         // Обработчик кнопки Start Ad Manually / Try ad again
@@ -1094,7 +1107,7 @@ if (data.enabled) {
             cancelRetry();
             stopPolling();
             claimFired = false;
-            claimBtn.innerText = "⏳ Preparing video...";
+            claimBtn.innerText = t('MiniClaimBusy');
             autoClaim();
         });
 
@@ -1105,11 +1118,11 @@ if (data.enabled) {
         directBtn.addEventListener('click', () => {
             if (directAction === 'popup') {
                 directAction = 'close';
-                directBtn.innerText = "🚀 Continue to Bot";
+                directBtn.innerText = t('MiniBtnContinueBot');
                 tryPopup();
             } else if (directAction === 'bonus_popup') {
                 directAction = 'close';
-                directBtn.innerText = "🚀 Continue to Bot";
+                directBtn.innerText = t('MiniBtnContinueBot');
                 bonusPopupDone = true;
                 trackEvent('bonus_popup_tapped');
                 tryPopup('valued_bonus_popup');

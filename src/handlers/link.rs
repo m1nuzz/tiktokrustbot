@@ -238,6 +238,9 @@ pub async fn link_handler(
 
                 let mut final_url = url_obj;
                 final_url.query_pairs_mut().append_pair("ymid", &ymid);
+                // The mini-app localises itself server-side from this tag
+                // (stored override wins, else the tag already resolved here).
+                final_url.query_pairs_mut().append_pair("lang", &lang);
 
                 let ad_btn_text = i18n::t(MsgKey::AdButton, Some(lang.as_str()));
                 let prem_btn_text = i18n::t(MsgKey::PremiumButton, Some(lang.as_str()));
