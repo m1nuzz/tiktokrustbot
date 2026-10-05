@@ -639,6 +639,12 @@
             contentView.classList.remove('hidden');
             document.getElementById('title').innerText = "🛡 Ad-block detected";
             description.innerText = "Ads cannot load while ad-blocking is on, so there is nothing to watch. Turn off ad-blocking for Telegram (your ad-blocker app, or the DNS / Private DNS setting) and come back — the ad will start on its own. If it does not, close this window and press the bot's button again.";
+            // A reload carrying ?pop=fail|timeout means the last offer tap
+            // found no ad to open: say so instead of repeating the base text.
+            const popOutcome = urlParams.get('pop');
+            if (popOutcome === 'fail' || popOutcome === 'timeout') {
+                description.innerText += " All attempts to load an ad have failed — please turn off ad-blocking and try again.";
+            }
             claimBtn.classList.add('hidden');
             adBtn.classList.add('hidden');
             // One manual recovery path: reload the document (fresh SDK load
@@ -726,7 +732,9 @@
         function reloadAndPopup() {
             trackEvent('adblock_popup_tapped');
             let popupPromise = null;
+            let sdkPresent = false;
             if (typeof window[AD_CONFIG.sdkFn] === 'function') {
+                sdkPresent = true;
                 try {
                     popupPromise = window[AD_CONFIG.sdkFn]({
                         ymid: ymid,
@@ -743,28 +751,45 @@
                 }
             }
             if (!claimPageReload()) {
-                // Marker already spent: the popup retry above already fired.
-                // Stay on the screen, the watchdog keeps retrying in the
-                // background. No second navigation, ever.
+                // Marker already spent: no navigation. If the popup failed
+                // (or there was no SDK to fire it), say so transiently —
+                // otherwise the tap visibly does nothing at all.
+                if (popupPromise && typeof popupPromise.then === 'function') {
+                    popupPromise.then(() => {}, () => showTransientOfferMiss());
+                } else {
+                    showTransientOfferMiss();
+                }
                 return;
             }
             trackEvent('page_reload');
-            const target = location.pathname
+            const base = location.pathname
                 + '?ymid=' + encodeURIComponent(ymid)
                 + '&r=' + Date.now();
             if (!popupPromise || typeof popupPromise.then !== 'function') {
-                navigateTo(target);
+                navigateTo(base + '&pop=' + (sdkPresent ? 'fail' : 'none'));
                 return;
             }
             let navigated = false;
-            const go = () => {
+            const go = (outcome) => {
                 if (navigated) return;
                 navigated = true;
                 clearTimeout(timer);
-                navigateTo(target);
+                navigateTo(base + '&pop=' + outcome);
             };
-            const timer = setTimeout(go, AD_CONFIG.adblockPopupSettleMs);
-            popupPromise.then(go, go);
+            const timer = setTimeout(() => go('timeout'), AD_CONFIG.adblockPopupSettleMs);
+            popupPromise.then(() => go('ok'), () => go('fail'));
+        }
+
+        // The offer didn't open and the page is staying: replace silence with
+        // one honest line, then restore the screen text.
+        function showTransientOfferMiss() {
+            const prev = description.innerText;
+            description.innerText = "All attempts to load an ad have failed — please turn off ad-blocking and try again.";
+            setTimeout(() => {
+                if (document.getElementById('title').innerText.includes('Ad-block')) {
+                    description.innerText = prev;
+                }
+            }, 4000);
         }
 
         // ========== TELEMETRY ==========
