@@ -329,6 +329,26 @@ impl DatabasePool {
         .map_err(|e| anyhow::anyhow!("Failed to log postback: {}", e))
     }
 
+    /// Whether Monetag ever recorded an ad view for this ymid.
+    /// The mini-app cannot tell "zone out of inventory" from "ad blocked on
+    /// this device" — one SDK rejection covers both. An absent impression is
+    /// the server-side proof that nothing was ever presented for this ymid.
+    /// `event_type IS NULL` counts too: SSP configs that omit the macro still
+    /// journal the row, and it can only exist after a real ad view.
+    pub async fn has_ad_impression(&self, ymid: &str) -> Result<bool, anyhow::Error> {
+        let ymid_owned = ymid.to_string();
+        self.execute_with_timeout(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM monetag_postbacks WHERE ymid = ?1 AND (event_type = 'impression' OR event_type IS NULL)",
+                params![ymid_owned],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to check impressions for {}: {}", ymid, e))
+    }
+
     /// Claim a download when unlocked: verified first, else the timer backstop
     /// (pending older than ~20s). Atomic per attempt: concurrent claimants
     /// (user tap vs valued auto-delivery) can't both succeed.

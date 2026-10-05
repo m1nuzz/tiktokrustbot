@@ -62,11 +62,23 @@ pub struct CheckStatusResponse {
     pub status: String,
 }
 
+#[derive(Deserialize)]
+pub struct AdImpressionQuery {
+    pub ymid: String,
+}
+
+#[derive(Serialize)]
+pub struct AdImpressionResponse {
+    /// True when Monetag journaled at least one ad view for this ymid.
+    pub impression: bool,
+}
+
 pub async fn start_web_server(state: AppState, port: u16) {
     let app = Router::new()
         .route("/api/ads-status", get(get_ads_status))
         .route("/api/monetag-postback", get(monetag_postback))
         .route("/api/check-status", get(check_ad_status))
+        .route("/api/ad-impression", get(get_ad_impression))
         .route("/api/claim-video", post(claim_video))
         .fallback(serve_mini_app)
         .layer(CorsLayer::permissive())
@@ -247,6 +259,29 @@ async fn check_ad_status(
         Err(e) => {
             log::error!("Error checking status for ymid {}: {}", ymid, e);
             Json(CheckStatusResponse { status: "error".to_string() })
+        }
+    }
+}
+
+/// Server-side oracle for the ad-block funnel. The SDK registers on blocked
+/// iOS devices too, so a client-side probe cannot separate "no fill" from
+/// "ad never presented": both look like a rejected/never-settling show() call.
+/// What separates them is whether Monetag ever recorded a view for this ymid.
+/// An unreachable/errored DB reports `false` so the client stays conservative
+/// (adblock screen, no free video) instead of handing out the download.
+async fn get_ad_impression(
+    State(state): State<AppState>,
+    Query(query): Query<AdImpressionQuery>,
+) -> Json<AdImpressionResponse> {
+    let db = state.db.clone();
+    let ymid = query.ymid.clone();
+
+    match db.has_ad_impression(&ymid).await {
+        Ok(true) => Json(AdImpressionResponse { impression: true }),
+        Ok(false) => Json(AdImpressionResponse { impression: false }),
+        Err(e) => {
+            log::warn!("ad-impression check failed for ymid {}: {}", ymid, e);
+            Json(AdImpressionResponse { impression: false })
         }
     }
 }

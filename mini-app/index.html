@@ -179,7 +179,15 @@
             // Startup probe: how many times to (re)load the SDK and how long to
             // wait for it before declaring the device ad-blocked.
             sdkProbeAttempts: 2,
-            sdkProbeTimeout: 4000
+            sdkProbeTimeout: 4000,
+            // How long we wait for a show() call before treating the silence as
+            // "never presented" (blocked) instead of "no fill".
+            adTimeout: 25000,
+            // Server oracle: whether Monetag ever journaled an ad view for this
+            // ymid. Only the server knows; the client cannot infer it.
+            impressionUrl: '/api/ad-impression',
+            impressionRetries: 2,
+            impressionRetryDelay: 1200
         };
 
         // ========== СОСТОЯНИЕ ==========
@@ -197,6 +205,7 @@
         let adblockDetected = false; // DNS filtering blocks the ad SDK host
         let sdkCheckRunning = false; // one SDK re-check at a time
         let adblockWatchdogId = null; // background SDK reload while blocked
+        let adAttemptToken = 0; // guards async ad verdicts against stale attempts
 
         const tg = window.Telegram.WebApp;
         const loaderView = document.getElementById('loader-view');
@@ -317,18 +326,24 @@
             loaderSubtext.innerText = "Watch to support the bot!";
             currentAdSource = 'sdk';
 
-            // catchIfNoFeed: a silent resolve with no actual ad must surface
-            // as an error, not a phantom success
+            const token = ++adAttemptToken;
+            // NOTE: the shipped SDK build does not implement `catchIfNoFeed`
+            // (the token is absent from its bundle), and its no-ad branch
+            // rejects with a reason-free "Empty feed" for both an empty zone
+            // and a blocked render. So the flag is kept only for forward
+            // compatibility, and every failure is classified through
+            // handleAdFailure() + the server impression oracle instead.
             let adPromise;
             try {
                 adPromise = window[AD_CONFIG.sdkFn]({ ymid: ymid, catchIfNoFeed: true, requestVar: 'sdk_interstitial' });
             } catch (e) {
                 console.error("Ad threw", e);
-                showNoAds();
+                handleAdFailure('throw', token);
                 return;
             }
-            sdkWithTimeout(adPromise, 25000, 'sdk')
+            sdkWithTimeout(adPromise, AD_CONFIG.adTimeout, 'sdk')
                 .then(() => {
+                    if (token !== adAttemptToken) return;
                     // Auto-claim first, then keep polling: whichever wins
                     // (claim gate or valued postback auto-delivery) delivers once.
                     autoClaim();
@@ -336,8 +351,53 @@
                 })
                 .catch((e) => {
                     console.error("Ad failed", e);
-                    showNoAds();
+                    // A timeout means nothing was ever presented (the ad call
+                    // hung), so it is treated as blocking, not as no-fill.
+                    const kind = (e && typeof e.message === 'string' && e.message.indexOf('timeout') !== -1)
+                        ? 'timeout'
+                        : 'reject';
+                    handleAdFailure(kind, token);
                 });
+        }
+
+        // Single funnel for every failed ad/popup call. The SDK registers even
+        // on ad-blocked devices, so a throw/reject/timeout alone cannot tell
+        // "out of inventory" from "ad never shown here". Ask the server whether
+        // Monetag ever recorded a view for this ymid:
+        //   no view  -> nothing was presented -> ad-blocked, text-only screen
+        //   a view   -> ads do work here, this is inventory -> no-fill screen
+        // A timeout is treated as blocking regardless: rendering never finished.
+        async function handleAdFailure(kind, token) {
+            if (token !== adAttemptToken) return;
+            const hadView = kind === 'timeout' ? false : await hasAdImpression();
+            if (token !== adAttemptToken) return;
+            if (hadView) {
+                showNoAds();
+            } else {
+                showAdblock();
+            }
+        }
+
+        // Server oracle: has any ad view ever been journaled for this ymid?
+        // Retry once — the postback can land slightly after the ad call fails.
+        // Any error is treated as "no impression" (conservative: ad-blocked).
+        async function hasAdImpression() {
+            for (let attempt = 1; attempt <= AD_CONFIG.impressionRetries; attempt++) {
+                try {
+                    const res = await fetch(`${apiBase}${AD_CONFIG.impressionUrl}?ymid=${encodeURIComponent(ymid)}`);
+                    const data = await res.json();
+                    if (data && data.impression === true) return true;
+                    if (data && data.impression === false) {
+                        // Only trust a definitive "no" on the last try: the
+                        // postback may still be in flight.
+                        if (attempt === AD_CONFIG.impressionRetries) return false;
+                    }
+                } catch (e) {
+                    // network error: retry, then fall through to "no impression"
+                }
+                await new Promise(r => setTimeout(r, AD_CONFIG.impressionRetryDelay));
+            }
+            return false;
         }
 
         // Entry point: prove the ad SDK can actually load before showing
@@ -360,79 +420,19 @@
         }
 
         // Injects the SDK script tag. Repeatable: used by the startup probe
-        // and by the ad-block watchdog.
-        function injectSdkScript() {
+        // and by the ad-block watchdog. onError lets the watchdog settle its
+        // wait immediately instead of polling until the timeout.
+        function injectSdkScript(onError) {
             const script = document.createElement('script');
             script.src = 'https://libtl.com/sdk.js';
             script.async = true;
             script.setAttribute('data-zone', AD_CONFIG.zone);
             script.setAttribute('data-sdk', AD_CONFIG.sdkFn);
-            script.onerror = () => { window._sdkLoadFailed = true; };
+            script.onerror = () => {
+                window._sdkLoadFailed = true;
+                if (onError) onError();
+            };
             document.head.appendChild(script);
-        }
-
-        // Polls for the SDK global: a script may register it before onload
-        // fires, so the wait must not depend on the event.
-        function waitForSdk(ms) {
-            return new Promise((resolve) => {
-                const t0 = Date.now();
-                const iv = setInterval(() => {
-                    if (typeof window[AD_CONFIG.sdkFn] === 'function') {
-                        clearInterval(iv);
-                        resolve(true);
-                    } else if (Date.now() - t0 > ms) {
-                        clearInterval(iv);
-                        resolve(false);
-                    }
-                }, 200);
-            });
-        }
-
-        function armAdblockWatchdog() {
-            if (adblockWatchdogId) return;
-            adblockWatchdogId = setInterval(retrySdkSilently, AD_CONFIG.adblockWatchdogInterval);
-        }
-
-        function disarmAdblockWatchdog() {
-            if (adblockWatchdogId) {
-                clearInterval(adblockWatchdogId);
-                adblockWatchdogId = null;
-            }
-            sdkCheckRunning = false;
-        }
-
-        // Reload the SDK in the background and start the ad the moment it
-        // registers. No user interaction required.
-        function retrySdkSilently() {
-            if (sdkCheckRunning) return;
-            if (typeof window[AD_CONFIG.sdkFn] === 'function') {
-                startAdAttempt();
-                return;
-            }
-            sdkCheckRunning = true;
-            sdkLoadFailed = false;
-            injectSdkScript();
-            waitForSdk(AD_CONFIG.sdkCheckTimeout).then((ok) => {
-                sdkCheckRunning = false;
-                if (ok) startAdAttempt();
-            });
-        }
-
-        function startAdAttempt() {
-            disarmAdblockWatchdog();
-            adblockDetected = false;
-            sdkLoadFailed = false;
-            // Stale flag from the first blocked load would otherwise bounce us
-            // straight back to the adblock screen.
-            window._sdkLoadFailed = false;
-            retryCount = 0;
-            popupTries = 0;
-            claimFired = false;
-            directAction = 'close';
-            claimBtn.classList.add('hidden');
-            loaderView.classList.remove('hidden');
-            contentView.classList.add('hidden');
-            trySDKAd();
         }
 
 // ========== УРОВЕНЬ 2: Popup (быстрый оффер вместо SmartLink) ==========
@@ -457,6 +457,7 @@
             popupTries++;
             loaderText.innerText = "Opening quick offer...";
             loaderSubtext.innerText = "Look at the offer, then return here";
+            const token = ++adAttemptToken;
             try {
                 const popupPromise = window[AD_CONFIG.sdkFn]({
                     ymid: ymid,
@@ -464,8 +465,9 @@
                     requestVar: 'popup_retry_' + popupTries,
                     catchIfNoFeed: true
                 });
-                sdkWithTimeout(popupPromise, 25000, 'popup')
+                sdkWithTimeout(popupPromise, AD_CONFIG.adTimeout, 'popup')
                     .then(() => {
+                        if (token !== adAttemptToken) return;
                         // Auto-claim first, then keep polling: whichever wins
                         // (claim gate or valued postback auto-delivery) delivers once.
                         autoClaim();
@@ -473,11 +475,14 @@
                     })
                     .catch((e) => {
                         console.error("Popup failed", e);
-                        showNoAds();
+                        const kind = (e && typeof e.message === 'string' && e.message.indexOf('timeout') !== -1)
+                            ? 'timeout'
+                            : 'reject';
+                        handleAdFailure(kind, token);
                     });
             } catch (e) {
                 console.error("Popup threw", e);
-                showNoAds();
+                handleAdFailure('throw', token);
             }
         }
 
@@ -503,12 +508,16 @@
 
 // Ad-blocked device: no ad view and no offer are possible. Text-only screen:
 // we do not hand out the video for free and we do not offer dead buttons —
-// just tell the user what to fix. A background watchdog reloads the SDK, so
-// returning to the app after disabling the blocker resumes the ad by itself.
+// just tell the user what to fix. Recovery is automatic: a background watchdog
+// re-runs the ad attempt, so returning to the app after disabling the blocker
+// (or on the next watchdog tick) starts the ad without any tap.
         function showAdblock() {
             stopPolling();
             cancelRetry();
             noAdsShown = false;
+            // Marks "the ad cannot run here" for the visibility handler: the
+            // user most likely just turned their blocker off.
+            adblockDetected = true;
             loaderView.classList.add('hidden');
             contentView.classList.remove('hidden');
             document.getElementById('title').innerText = "🛡 Ad-block detected";
@@ -538,6 +547,12 @@
 
         function armAdblockWatchdog() {
             if (adblockWatchdogId) return;
+            // Only poll while the SDK script itself is unreachable — that is the
+            // one blocked state a background reload can fix on its own. When the
+            // script loads but the ad never presents, re-calling show() on a
+            // timer would just hammer the ad network, so recovery waits for the
+            // visibility handler instead.
+            if (typeof window[AD_CONFIG.sdkFn] === 'function') return;
             adblockWatchdogId = setInterval(retrySdkSilently, AD_CONFIG.adblockWatchdogInterval);
         }
 
@@ -568,14 +583,7 @@
                 if (ok) startAdAttempt();
             };
 
-            const script = document.createElement('script');
-            script.src = 'https://libtl.com/sdk.js';
-            script.async = true;
-            script.setAttribute('data-zone', AD_CONFIG.zone);
-            script.setAttribute('data-sdk', AD_CONFIG.sdkFn);
-            script.onerror = () => finish(false);
-            document.head.appendChild(script);
-
+            injectSdkScript(() => finish(false));
             waitForSdk(AD_CONFIG.sdkCheckTimeout).then(finish);
         }
 
