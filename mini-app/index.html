@@ -200,22 +200,12 @@
             // How long we wait for a show() call before treating the silence as
             // "never presented" (blocked) instead of "no fill".
             adTimeout: 25000,
-            // How long the failure funnel keeps asking the server whether an
-            // impression landed before declaring the device blocked. iOS ads
-            // can render tens of seconds after the page opened.
-            impressionWindow: 75000,
-            impressionPoll: 5000,
             // Server oracle: whether Monetag ever journaled an ad view for this
             // ymid. Only the server knows; the client cannot infer it.
             impressionUrl: '/api/ad-impression',
+            impressionRetries: 2,
+            impressionRetryDelay: 1200
         };
-
-        // Test hook: `?w=<ms>` shortens the oracle window so automated tests
-        // do not wait out the production 75s. Production links never set it.
-        try {
-            const wOverride = parseInt(new URLSearchParams(window.location.search).get('w'), 10);
-            if (Number.isFinite(wOverride) && wOverride > 0) AD_CONFIG.impressionWindow = wOverride;
-        } catch (e) {}
 
         // ========== СОСТОЯНИЕ ==========
         let retryCount = 0;
@@ -405,44 +395,35 @@
         //   no view   -> nothing was ever presented -> ad-blocked, text-only
         async function handleAdFailure(kind, token) {
             if (token !== adAttemptToken) return;
-            const t0 = Date.now();
-            for (;;) {
-                if (token !== adAttemptToken) return;
-                if (await hasAdImpressionOnce()) {
-                    if (token !== adAttemptToken) return;
-                    trackEvent('oracle_impression');
-                    // The ad was presented on this device, so the network
-                    // works — this is inventory, not blocking. Offer the
-                    // video, a quick offer, or one ad retry: all functional.
-                    showNoAds();
-                    return;
-                }
-                if (Date.now() - t0 > AD_CONFIG.impressionWindow) {
-                    if (token !== adAttemptToken) return;
-                    trackEvent('oracle_none');
-                    showAdblock();
-                    return;
-                }
-                // Visible progress: this wait is long, it must never look dead.
-                loaderView.classList.remove('hidden');
-                contentView.classList.add('hidden');
-                const elapsed = Math.round((Date.now() - t0) / 1000);
-                loaderText.innerText = "Waiting for the ad to appear...";
-                loaderSubtext.innerText = `Slow connections can take a while (${elapsed}s)`;
-                await new Promise(r => setTimeout(r, AD_CONFIG.impressionPoll));
+            const hadView = kind === 'timeout' ? false : await hasAdImpression();
+            if (token !== adAttemptToken) return;
+            trackEvent(hadView ? 'oracle_impression' : 'oracle_none');
+            if (hadView) {
+                showNoAds();
+            } else {
+                showAdblock();
             }
         }
 
         // Server oracle: has any ad view ever been journaled for this ymid?
         // One probe per call; the caller loops. Any error counts as "no view".
-        async function hasAdImpressionOnce() {
-            try {
-                const res = await fetch(`${apiBase}${AD_CONFIG.impressionUrl}?ymid=${encodeURIComponent(ymid)}`);
-                const data = await res.json();
-                return !!(data && data.impression === true);
-            } catch (e) {
-                return false;
+        async function hasAdImpression() {
+            for (let attempt = 1; attempt <= AD_CONFIG.impressionRetries; attempt++) {
+                try {
+                    const res = await fetch(`${apiBase}${AD_CONFIG.impressionUrl}?ymid=${encodeURIComponent(ymid)}`);
+                    const data = await res.json();
+                    if (data && data.impression === true) return true;
+                    if (data && data.impression === false) {
+                        // Only trust a definitive "no" on the last try: the
+                        // postback may still be in flight.
+                        if (attempt === AD_CONFIG.impressionRetries) return false;
+                    }
+                } catch (e) {
+                    // network error: retry, then fall through to "no impression"
+                }
+                await new Promise(r => setTimeout(r, AD_CONFIG.impressionRetryDelay));
             }
+            return false;
         }
 
         // Entry point: prove the ad SDK can actually load before showing
