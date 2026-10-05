@@ -4,6 +4,7 @@ use axum::{
     Json, Router,
     response::Html,
 };
+use axum::http::{header, HeaderMap, HeaderValue};
 use tower_http::cors::CorsLayer;
 use std::sync::Arc;
 use crate::database::{ClaimVia, DatabasePool};
@@ -156,7 +157,15 @@ async fn serve_mini_app() -> impl axum::response::IntoResponse {
     
     // Inject SmartLink URL into HTML
     let html = MINI_APP_HTML.replace("// SMARTLINK_INJECT", &format!("const AD_CONFIG_SMARTLINK = \"{}\";", smartlink));
-    Html(html)
+    // Never cache the document: Telegram WebViews keep serving a stale copy
+    // otherwise, and users get stuck on old funnel screens (e.g. a blue,
+    // always-visible Continue from a build before btn-success/watch-gate).
+    // Every open already carries a unique ?ymid=, this only stops the client
+    // from reusing a previous document for it.
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store, no-cache, must-revalidate, max-age=0"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    (headers, Html(html))
 }
 
 async fn get_ads_status(
