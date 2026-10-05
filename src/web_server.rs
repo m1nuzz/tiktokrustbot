@@ -37,6 +37,14 @@ pub struct PostbackQuery {
     pub event_type: Option<String>,
     #[serde(default)]
     pub estimated_price: Option<f64>,
+    // Placement attribution: which SDK call produced this event
+    // ('sdk_interstitial', 'popup_retry_N', 'valued_bonus_popup', ...).
+    // Optional so zones whose SSP template lacks the macros keep working.
+    // Aliases cover the SSP template naming variants.
+    #[serde(default, alias = "requestVar", alias = "source")]
+    pub request_var: Option<String>,
+    #[serde(default, alias = "subZoneId", alias = "sub")]
+    pub sub_zone_id: Option<String>,
     // Optional shared secret (MONETAG_POSTBACK_SECRET env must match when set)
     #[serde(default)]
     pub secret: Option<String>,
@@ -253,6 +261,8 @@ async fn monetag_postback(
             query.event_type.as_deref(),
             &reward,
             query.estimated_price,
+            query.request_var.as_deref(),
+            query.sub_zone_id.as_deref(),
         )
         .await
     {

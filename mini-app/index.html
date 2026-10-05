@@ -153,7 +153,7 @@
             
             <button id="ad-btn" class="btn hidden">🎬 Start Ad Manually</button>
             <button id="claim-btn" class="btn hidden">🎬 Get my video</button>
-            <button id="direct-btn" class="btn hidden">🚀 Continue to Bot</button>
+            <button id="direct-btn" class="btn btn-success hidden">🚀 Continue to Bot</button>
             
             <div id="status-message" style="margin-top: 20px; font-size: 14px;"></div>
         </div>
@@ -214,7 +214,7 @@
         let isPolling = false;
         let pollCount = 0;
         let popupTries = 0;
-        let directAction = 'close'; // 'close' | 'popup' | 'claim'
+        let directAction = 'close'; // 'close' | 'popup' | 'bonus_popup'
         let currentAdSource = null; // 'sdk' или 'popup'
         let claimFired = false; // auto-claim guard: one claim per attempt
         let noAdsShown = false; // no-ads screen visible (upgradeable to adblock)
@@ -224,6 +224,7 @@
         let adblockWatchdogId = null; // background SDK reload while blocked
         let adAttemptToken = 0; // guards async ad verdicts against stale attempts
         let sdkInjectCount = 0; // cache-buster for repeated SDK injections
+        let bonusPopupDone = false; // bonus offer already taken: no second round
         let sdkHostIndex = 0; // rotates the first SDK host tried per injection
         let lastSdkHost = null; // host that actually registered the SDK global
         let adblockReloadId = null; // one-shot page reload while ad-blocked
@@ -489,7 +490,7 @@
 // ========== УРОВЕНЬ 2: Popup (быстрый оффер вместо SmartLink) ==========
         // Вызывается ТОЛЬКО из клика (требование popup-blocker'ов).
         // Постбэк impression прилетает как обычно; claim — общий.
-        function tryPopup() {
+        function tryPopup(requestVar) {
             claimFired = false; // new attempt: allow one auto-claim
             if (typeof window[AD_CONFIG.sdkFn] !== 'function') {
                 // SDK missing (blocked script): the offer cannot open either,
@@ -513,7 +514,7 @@
                 const popupPromise = window[AD_CONFIG.sdkFn]({
                     ymid: ymid,
                     type: 'pop',
-                    requestVar: 'popup_retry_' + popupTries,
+                    requestVar: requestVar || ('popup_retry_' + popupTries),
                     catchIfNoFeed: true
                 });
                 sdkWithTimeout(popupPromise, AD_CONFIG.adTimeout, 'popup')
@@ -630,7 +631,7 @@
             'probe_start', 'sdk_host_ok', 'sdk_probe_fail', 'adblock_screen',
             'ad_resolve', 'ad_reject', 'ad_timeout', 'ad_throw',
             'oracle_impression', 'oracle_none', 'no_fill_screen', 'page_reload',
-            'watchdog_recover'
+            'watchdog_recover', 'bonus_popup_shown', 'bonus_popup_tapped'
         ]);
         const trackedSent = new Set();
 
@@ -823,6 +824,20 @@
             description.innerText = "Your ad view has been verified. We are sending your video now.";
             claimBtn.classList.add('hidden');
             adBtn.classList.add('hidden');
+            // Green Continue: the video is already on its way (server
+            // auto-delivers on valued), so this tap is a pure bonus — a
+            // popup offer that can only add revenue, never lose the video.
+            // After the bonus was taken once, the button is a plain close
+            // so returning from the offer cannot loop back into another one.
+            if (bonusPopupDone) {
+                directBtn.innerText = "🚀 Continue to Bot";
+                directAction = 'close';
+            } else {
+                directBtn.innerText = "🎁 Continue";
+                directAction = 'bonus_popup';
+                trackEvent('bonus_popup_shown');
+            }
+            directBtn.classList.remove('hidden');
             autoClaim();
 
             if (tg.HapticFeedback) {
@@ -887,12 +902,21 @@ if (data.enabled) {
             autoClaim();
         });
 
-        // Continue button: 'popup' opens the quick offer, otherwise close.
+        // Continue button: 'popup' opens the quick offer, 'bonus_popup'
+        // opens the post-reward bonus offer (the video is already delivered
+        // by the server on valued, so this tap cannot lose anything),
+        // otherwise just close.
         directBtn.addEventListener('click', () => {
             if (directAction === 'popup') {
                 directAction = 'close';
                 directBtn.innerText = "🚀 Continue to Bot";
                 tryPopup();
+            } else if (directAction === 'bonus_popup') {
+                directAction = 'close';
+                directBtn.innerText = "🚀 Continue to Bot";
+                bonusPopupDone = true;
+                trackEvent('bonus_popup_tapped');
+                tryPopup('valued_bonus_popup');
             } else {
                 tg.close();
             }

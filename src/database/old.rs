@@ -183,6 +183,10 @@ pub fn init_database() -> Result<()> {
         "CREATE TABLE IF NOT EXISTS monetag_postbacks (id INTEGER PRIMARY KEY, ymid TEXT NOT NULL, event_type TEXT DEFAULT NULL, reward_event_type TEXT NOT NULL, estimated_price REAL DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
     )?;
+    // Placement attribution for postback revenue (which SDK call earned it).
+    // Runs after the CREATE above so fresh databases don't error.
+    ensure_column(&conn, "monetag_postbacks", "request_var", "request_var TEXT DEFAULT NULL")?;
+    ensure_column(&conn, "monetag_postbacks", "sub_zone_id", "sub_zone_id TEXT DEFAULT NULL")?;
     // Client-side ad-funnel telemetry. The mini-app cannot tell "no fill" from
     // "ad blocked on this device", so every stage transition is reported here
     // and correlated with monetag_postbacks by ymid.

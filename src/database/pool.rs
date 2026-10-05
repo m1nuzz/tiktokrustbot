@@ -314,14 +314,18 @@ impl DatabasePool {
         event_type: Option<&str>,
         reward_event_type: &str,
         estimated_price: Option<f64>,
+        request_var: Option<&str>,
+        sub_zone_id: Option<&str>,
     ) -> Result<(), anyhow::Error> {
         let ymid_owned = ymid.to_string();
         let event_owned = event_type.map(|s| s.to_string());
         let reward_owned = reward_event_type.to_string();
+        let request_owned = request_var.map(|s| s.chars().take(64).collect::<String>());
+        let sub_owned = sub_zone_id.map(|s| s.chars().take(64).collect::<String>());
         self.execute_with_timeout(move |conn| {
             conn.execute(
-                "INSERT INTO monetag_postbacks (ymid, event_type, reward_event_type, estimated_price) VALUES (?1, ?2, ?3, ?4)",
-                params![ymid_owned, event_owned, reward_owned, estimated_price],
+                "INSERT INTO monetag_postbacks (ymid, event_type, reward_event_type, estimated_price, request_var, sub_zone_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![ymid_owned, event_owned, reward_owned, estimated_price, request_owned, sub_owned],
             )?;
             Ok(())
         })
