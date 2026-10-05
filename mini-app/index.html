@@ -152,6 +152,7 @@
             <p id="description">Your ad view has been verified. You can now claim your video.</p>
             
             <button id="ad-btn" class="btn hidden">🎬 Start Ad Manually</button>
+            <button id="claim-btn" class="btn hidden">🎬 Get my video</button>
             <button id="direct-btn" class="btn hidden">🚀 Continue to Bot</button>
             
             <div id="status-message" style="margin-top: 20px; font-size: 14px;"></div>
@@ -168,7 +169,11 @@
             retryInterval: 1200,
             pollInterval: 3000,
             maxPolls: 60, // ~3 min safety cap, then error screen
-            popupMaxTries: 2
+            popupMaxTries: 2,
+            // The server unlocks a pending row only after ~20s (ad window) or
+            // a valued postback, so a claim must be retried patiently.
+            claimMaxAttempts: 8,
+            claimRetryInterval: 8000
         };
 
         // ========== СОСТОЯНИЕ ==========
@@ -191,6 +196,7 @@
         const loaderSubtext = document.getElementById('loader-subtext');
         const contentView = document.getElementById('content-view');
         const adBtn = document.getElementById('ad-btn');
+        const claimBtn = document.getElementById('claim-btn');
         const directBtn = document.getElementById('direct-btn');
         const statusMsg = document.getElementById('status-message');
         const description = document.getElementById('description');
@@ -235,6 +241,7 @@
             contentView.classList.remove('hidden');
             document.getElementById('title').innerText = "Error";
             description.innerText = message;
+            claimBtn.classList.add('hidden');
             directBtn.classList.remove('hidden');
         }
 
@@ -244,6 +251,7 @@
             document.getElementById('title').innerText = titleText;
             description.innerText = descText;
             if (showDirect) directBtn.classList.remove('hidden');
+            claimBtn.classList.add('hidden');
         }
 
         // ========== POLLING МЕХАНИЗМ ==========
@@ -346,9 +354,11 @@
         function tryPopup() {
             claimFired = false; // new attempt: allow one auto-claim
             if (typeof window[AD_CONFIG.sdkFn] !== 'function') {
-                // SDK missing (blocked script): popup can't open, skip loader flash
+                // SDK missing (blocked script): the offer cannot open either,
+                // so don't bounce back to the same screen — go to the video.
                 sdkLoadFailed = true;
-                showNoAdsOrAdblock();
+                adblockDetected = true;
+                showAdblock();
                 return;
             }
             cancelRetry();
@@ -401,16 +411,19 @@
             loaderView.classList.add('hidden');
             contentView.classList.remove('hidden');
             document.getElementById('title').innerText = "No ads right now 😕";
-            description.innerText = "Try another method, or come back later.";
-            directBtn.innerText = "🔀 Other method";
+            description.innerText = "No ad is available at the moment. Take the video, try the quick offer, or retry the ad.";
+            // Every visible button must do something: claim / offer / retry.
+            claimBtn.innerText = "🎬 Get my video";
+            claimBtn.classList.remove('hidden');
+            directBtn.innerText = "🎁 Quick offer";
             directAction = 'popup';
             directBtn.classList.remove('hidden');
             adBtn.innerText = "🔄 Try ad again";
             adBtn.classList.remove('hidden');
         }
 
-        // Ad-blocked device: ads can never load, so offer the video directly.
-        // The claim still passes the server age gate (auto-retry built in).
+        // Ad-blocked device: no ad SDK and no offer can ever load, so the
+        // only honest path left is the video itself.
         function showAdblock() {
             stopPolling();
             cancelRetry();
@@ -418,11 +431,13 @@
             loaderView.classList.add('hidden');
             contentView.classList.remove('hidden');
             document.getElementById('title').innerText = "🛡 Ad-block detected";
-            description.innerText = "DNS filtering blocks ads on this device. Turn it off for Telegram, or take the video below.";
-            directBtn.innerText = "🎬 Get my video";
-            directAction = 'claim';
-            directBtn.classList.remove('hidden');
+            description.innerText = "Ads are blocked on this device, so no ad can be shown. Take the video below.";
+            claimBtn.innerText = "🎬 Get my video";
+            claimBtn.classList.remove('hidden');
             adBtn.classList.add('hidden');
+            directBtn.innerText = "🚀 Continue to Bot";
+            directAction = 'close';
+            directBtn.classList.remove('hidden');
         }
 
         // Popup tries exhausted: deliver via the server timer backstop, no taps.
@@ -433,42 +448,47 @@
             loaderView.classList.add('hidden');
             contentView.classList.remove('hidden');
             document.getElementById('title').innerText = "Your video is ready!";
-            description.innerText = "Tap below to get it.";
+            description.innerText = "Taking it for you now.";
+            claimBtn.classList.add('hidden');
+            adBtn.classList.add('hidden');
             autoClaim();
         }
 
-        // Single auto-claim: fired after any ad/popup resolves, guarded so
-        // concurrent callers (resolve path + polling success) can't double-fire.
+        // Single auto-claim: fired after any ad/popup resolves or when the user
+        // takes the video, guarded so concurrent callers can't double-fire.
+        // The server unlocks a pending row only after the ad window passes, so
+        // this retries patiently instead of giving up and looking broken.
         async function autoClaim() {
             if (claimFired) return;
             claimFired = true;
-            try {
-                const claimRes = await fetch(`${apiBase}/api/claim-video`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ ymid: ymid })
-                });
-                const claimData = await claimRes.json();
-                if (claimData.success) {
-                    tg.close();
-                } else {
-                    // Server says too early: one automatic retry after 10s,
-                    // then fall back to the error screen.
-                    setTimeout(async () => {
-                        try {
-                            const r2 = await fetch(`${apiBase}/api/claim-video`, {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ ymid: ymid })
-                            });
-                            const d2 = await r2.json();
-                            if (d2.success) { tg.close(); }
-                            else { showError("Ad verification not received yet. Please try again."); }
-                        } catch (e2) { tg.close(); }
-                    }, 10000);
+            for (let attempt = 1; attempt <= AD_CONFIG.claimMaxAttempts; attempt++) {
+                let ok = false;
+                try {
+                    const claimRes = await fetch(`${apiBase}/api/claim-video`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ymid: ymid })
+                    });
+                    const claimData = await claimRes.json();
+                    ok = !!claimData.success;
+                } catch (e) {
+                    ok = false; // network hiccup: retry
                 }
-            } catch (e) {
-                tg.close();
+
+                if (ok) {
+                    tg.close();
+                    return;
+                }
+
+                if (attempt === AD_CONFIG.claimMaxAttempts) {
+                    showError("Couldn't confirm the download yet. Please open the bot and send the link again.");
+                    return;
+                }
+
+                // Visible progress so the wait never looks like a dead button.
+                claimBtn.innerText = `⏳ Preparing video... (${attempt}/${AD_CONFIG.claimMaxAttempts})`;
+                claimBtn.classList.remove('hidden');
+                await new Promise(r => setTimeout(r, AD_CONFIG.claimRetryInterval));
             }
         }
 
@@ -482,7 +502,9 @@
             contentView.classList.remove('hidden');
 
             document.getElementById('title').innerText = "Success!";
-            description.innerText = "Your ad view has been verified. You can now claim your video.";
+            description.innerText = "Your ad view has been verified. We are sending your video now.";
+            claimBtn.classList.add('hidden');
+            adBtn.classList.add('hidden');
             autoClaim();
 
             if (tg.HapticFeedback) {
@@ -542,21 +564,29 @@
             popupTries = 0;
             claimFired = false; // new attempt: allow one auto-claim
             adBtn.classList.add('hidden');
+            claimBtn.classList.add('hidden');
             loaderView.classList.remove('hidden');
             contentView.classList.add('hidden');
             trySDKAd();
         });
 
-        // Continue button: action depends on the screen
-        // ('popup' opens the quick offer, 'claim' claims the video, else close)
+// Claim button: the video itself. Re-arms the guard so a retry after an
+        // error works, and gives instant feedback while the server waits out
+        // the ad window.
+        claimBtn.addEventListener('click', () => {
+            cancelRetry();
+            stopPolling();
+            claimFired = false;
+            claimBtn.innerText = "⏳ Preparing video...";
+            autoClaim();
+        });
+
+        // Continue button: 'popup' opens the quick offer, otherwise just close.
         directBtn.addEventListener('click', () => {
             if (directAction === 'popup') {
                 directAction = 'close';
                 directBtn.innerText = "🚀 Continue to Bot";
                 tryPopup();
-            } else if (directAction === 'claim') {
-                directBtn.innerText = "⏳ Getting video...";
-                autoClaim();
             } else {
                 tg.close();
             }
