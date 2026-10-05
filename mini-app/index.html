@@ -206,6 +206,7 @@
         let sdkCheckRunning = false; // one SDK re-check at a time
         let adblockWatchdogId = null; // background SDK reload while blocked
         let adAttemptToken = 0; // guards async ad verdicts against stale attempts
+        let sdkInjectCount = 0; // cache-buster for repeated SDK injections
 
         const tg = window.Telegram.WebApp;
         const loaderView = document.getElementById('loader-view');
@@ -424,7 +425,12 @@
         // wait immediately instead of polling until the timeout.
         function injectSdkScript(onError) {
             const script = document.createElement('script');
-            script.src = 'https://libtl.com/sdk.js';
+            sdkInjectCount++;
+            // Cache-bust every injection. The iOS WebView caches connection /
+            // DNS failures per process, so after the user disables their
+            // blocker the plain URL keeps failing until the webapp is closed
+            // and reopened — a unique query forces a real refetch.
+            script.src = 'https://libtl.com/sdk.js?_=' + Date.now() + '_' + sdkInjectCount;
             script.async = true;
             script.setAttribute('data-zone', AD_CONFIG.zone);
             script.setAttribute('data-sdk', AD_CONFIG.sdkFn);
