@@ -17,6 +17,13 @@ use teloxide::prelude::*;
 /// Mini-app HTML embedded at compile time — no need to deploy the folder separately
 const MINI_APP_HTML: &str = include_str!("../mini-app/index.html");
 
+/// Watch-gate for valued deliveries. Monetag marks the impression valued at
+/// ad start, but the product deal is "watch the ad": the valued sequence
+/// (verify + claim + spawn) waits this long so neither the video nor an
+/// early client claim can jump the gate. Server-side wait, so closing the
+/// app loses nothing — the job still runs.
+const VERIFIED_DELIVERY_DELAY_SECS: u64 = 15;
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<DatabasePool>,
@@ -277,6 +284,12 @@ async fn monetag_postback(
 
     let db = state.db.clone();
     let ymid = query.ymid.clone();
+    // Watch-gate (see VERIFIED_DELIVERY_DELAY_SECS): hold the whole valued
+    // sequence so the video cannot be delivered before the ad was watched.
+    tokio::time::sleep(std::time::Duration::from_secs(
+        VERIFIED_DELIVERY_DELAY_SECS,
+    ))
+    .await;
     if let Err(e) = db.mark_as_verified(&ymid).await {
         log::error!("Failed to mark download as verified for ymid {}: {}", ymid, e);
         return axum::http::StatusCode::OK;

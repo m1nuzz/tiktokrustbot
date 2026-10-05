@@ -204,8 +204,20 @@
             // ymid. Only the server knows; the client cannot infer it.
             impressionUrl: '/api/ad-impression',
             impressionRetries: 2,
-            impressionRetryDelay: 1200
+            impressionRetryDelay: 1200,
+            // Watch-gate: the Continue button (and the video, server-side via
+            // VERIFIED_DELIVERY_DELAY_SECS) only unlocks after the ad was
+            // displayed this long. Monetag marks the impression valued at ad
+            // start, so without this gate both would jump ahead of watching.
+            requiredWatchMs: 15000,
         };
+
+        // Test hook: `?g=<ms>` overrides the watch gate so automated tests do
+        // not wait out production timings. Production links never set it.
+        try {
+            const gOverride = parseInt(new URLSearchParams(window.location.search).get('g'), 10);
+            if (Number.isFinite(gOverride) && gOverride >= 0) AD_CONFIG.requiredWatchMs = gOverride;
+        } catch (e) {}
 
         // ========== СОСТОЯНИЕ ==========
         let retryCount = 0;
@@ -223,6 +235,7 @@
         let sdkCheckRunning = false; // one SDK re-check at a time
         let adblockWatchdogId = null; // background SDK reload while blocked
         let adAttemptToken = 0; // guards async ad verdicts against stale attempts
+        let adShownAt = 0; // timestamp of the last show() call (watch-gate)
         let sdkInjectCount = 0; // cache-buster for repeated SDK injections
         let bonusPopupDone = false; // bonus offer already taken: no second round
         let sdkHostIndex = 0; // rotates the first SDK host tried per injection
@@ -357,6 +370,7 @@
             // handleAdFailure() + the server impression oracle instead.
             let adPromise;
             try {
+                adShownAt = Date.now();
                 adPromise = window[AD_CONFIG.sdkFn]({ ymid: ymid, catchIfNoFeed: true, requestVar: 'sdk_interstitial' });
             } catch (e) {
                 console.error("Ad threw", e);
@@ -396,7 +410,11 @@
         //   no view   -> nothing was ever presented -> ad-blocked, text-only
         async function handleAdFailure(kind, token) {
             if (token !== adAttemptToken) return;
-            const hadView = kind === 'timeout' ? false : await hasAdImpression();
+            // Even a timeout consults the oracle: on iOS the user may have
+            // tapped the creative and left for the offer page while show()
+            // stayed pending. Declaring "blocked" without asking strands them
+            // on the adblock screen when they come back.
+            const hadView = await hasAdImpression();
             if (token !== adAttemptToken) return;
             trackEvent(hadView ? 'oracle_impression' : 'oracle_none');
             if (hadView) {
@@ -824,20 +842,38 @@
             description.innerText = "Your ad view has been verified. We are sending your video now.";
             claimBtn.classList.add('hidden');
             adBtn.classList.add('hidden');
+            directBtn.classList.add('hidden');
+            // Watch-gate: the Continue appears only after the ad was actually
+            // displayed for requiredWatchMs. The server holds delivery by the
+            // same amount (VERIFIED_DELIVERY_DELAY_SECS), so neither the
+            // button nor the video can jump ahead of watching.
             // Green Continue: the video is already on its way (server
             // auto-delivers on valued), so this tap is a pure bonus — a
             // popup offer that can only add revenue, never lose the video.
             // After the bonus was taken once, the button is a plain close
             // so returning from the offer cannot loop back into another one.
-            if (bonusPopupDone) {
-                directBtn.innerText = "🚀 Continue to Bot";
-                directAction = 'close';
+            const revealToken = adAttemptToken;
+            const revealContinue = () => {
+                if (revealToken !== adAttemptToken) return;
+                if (contentView.classList.contains('hidden')) return;
+                if (document.getElementById('title').innerText !== "Success!") return;
+                if (bonusPopupDone) {
+                    directBtn.innerText = "🚀 Continue to Bot";
+                    directAction = 'close';
+                } else {
+                    directBtn.innerText = "🎁 Continue";
+                    directAction = 'bonus_popup';
+                    trackEvent('bonus_popup_shown');
+                }
+                directBtn.classList.remove('hidden');
+            };
+            const waitMs = AD_CONFIG.requiredWatchMs - (Date.now() - (adShownAt || 0));
+            if (waitMs > 0) {
+                description.innerText = "Thanks for watching! Your video is on its way.";
+                setTimeout(revealContinue, waitMs);
             } else {
-                directBtn.innerText = "🎁 Continue";
-                directAction = 'bonus_popup';
-                trackEvent('bonus_popup_shown');
+                revealContinue();
             }
-            directBtn.classList.remove('hidden');
             autoClaim();
 
             if (tg.HapticFeedback) {
@@ -922,6 +958,22 @@ if (data.enabled) {
             }
         });
 
+        // The user may have tapped the creative and left for the offer page
+        // while show() stayed pending; the timeout then strands them on the
+        // adblock text. On return, ask the oracle once: an impression that
+        // landed while they were away upgrades the screen to the working
+        // no-fill screen instead of leaving them stuck.
+        async function recheckOracleOnReturn() {
+            if (isPolling || !adblockDetected) return false;
+            if (contentView.classList.contains('hidden')) return false;
+            if (await hasAdImpression()) {
+                trackEvent('oracle_impression');
+                showNoAds();
+                return true;
+            }
+            return false;
+        }
+
         // Visibility API: Мгновенный запрос при возврате в приложение
         document.addEventListener('visibilitychange', () => {
             if (document.visibilityState !== 'visible') return;
@@ -931,7 +983,9 @@ if (data.enabled) {
             } else if (adblockDetected) {
                 // User most likely just switched off their ad-blocker: retry
                 // the SDK right away instead of waiting for the watchdog tick.
-                retrySdkSilently();
+                recheckOracleOnReturn().then((upgraded) => {
+                    if (!upgraded) retrySdkSilently();
+                });
             }
         });
     </script>
