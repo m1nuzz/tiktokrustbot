@@ -67,6 +67,41 @@ pub struct AdImpressionQuery {
     pub ymid: String,
 }
 
+/// Client-side funnel beacon. Fire-and-forget: the mini-app must never wait
+/// for telemetry, so the response is empty and failures are logged only.
+#[derive(Deserialize)]
+pub struct MiniAppEventRequest {
+    pub ymid: String,
+    pub event: String,
+    #[serde(default)]
+    pub platform: Option<String>,
+    #[serde(default)]
+    pub sdk_host: Option<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+}
+
+async fn log_mini_app_event(
+    State(state): State<AppState>,
+    Json(payload): Json<MiniAppEventRequest>,
+) -> axum::http::StatusCode {
+    if let Err(e) = state
+        .db
+        .log_mini_app_event(
+            &payload.ymid,
+            &payload.event,
+            payload.platform.as_deref(),
+            payload.sdk_host.as_deref(),
+            payload.user_agent.as_deref(),
+        )
+        .await
+    {
+        log::error!("Failed to journal mini-app event {}: {}", payload.event, e);
+        return axum::http::StatusCode::INTERNAL_SERVER_ERROR;
+    }
+    axum::http::StatusCode::OK
+}
+
 #[derive(Serialize)]
 pub struct AdImpressionResponse {
     /// True when Monetag journaled at least one ad view for this ymid.
@@ -79,6 +114,7 @@ pub async fn start_web_server(state: AppState, port: u16) {
         .route("/api/monetag-postback", get(monetag_postback))
         .route("/api/check-status", get(check_ad_status))
         .route("/api/ad-impression", get(get_ad_impression))
+        .route("/api/mini-app-event", post(log_mini_app_event))
         .route("/api/claim-video", post(claim_video))
         .fallback(serve_mini_app)
         .layer(CorsLayer::permissive())

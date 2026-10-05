@@ -225,6 +225,7 @@
         let adAttemptToken = 0; // guards async ad verdicts against stale attempts
         let sdkInjectCount = 0; // cache-buster for repeated SDK injections
         let sdkHostIndex = 0; // rotates the first SDK host tried per injection
+        let lastSdkHost = null; // host that actually registered the SDK global
         let adblockReloadId = null; // one-shot page reload while ad-blocked
 
         const tg = window.Telegram.WebApp;
@@ -358,12 +359,14 @@
                 adPromise = window[AD_CONFIG.sdkFn]({ ymid: ymid, catchIfNoFeed: true, requestVar: 'sdk_interstitial' });
             } catch (e) {
                 console.error("Ad threw", e);
+                trackEvent('ad_throw');
                 handleAdFailure('throw', token);
                 return;
             }
             sdkWithTimeout(adPromise, AD_CONFIG.adTimeout, 'sdk')
                 .then(() => {
                     if (token !== adAttemptToken) return;
+                    trackEvent('ad_resolve');
                     // Auto-claim first, then keep polling: whichever wins
                     // (claim gate or valued postback auto-delivery) delivers once.
                     autoClaim();
@@ -376,6 +379,7 @@
                     const kind = (e && typeof e.message === 'string' && e.message.indexOf('timeout') !== -1)
                         ? 'timeout'
                         : 'reject';
+                    trackEvent(kind === 'timeout' ? 'ad_timeout' : 'ad_reject');
                     handleAdFailure(kind, token);
                 });
         }
@@ -391,6 +395,7 @@
             if (token !== adAttemptToken) return;
             const hadView = kind === 'timeout' ? false : await hasAdImpression();
             if (token !== adAttemptToken) return;
+            trackEvent(hadView ? 'oracle_impression' : 'oracle_none');
             if (hadView) {
                 showNoAds();
             } else {
@@ -427,6 +432,7 @@
         async function startAdFlow() {
             loaderText.innerText = "Checking for ad network";
             loaderSubtext.innerText = "Please wait a moment...";
+            trackEvent('probe_start');
             for (let attempt = 1; attempt <= AD_CONFIG.sdkProbeAttempts; attempt++) {
                 if (typeof window[AD_CONFIG.sdkFn] === 'function') { trySDKAd(); return; }
                 injectSdkScript();
@@ -436,6 +442,7 @@
             // The SDK host never answered: ad-blocking (app or DNS filtering)
             // is the realistic cause, so say it plainly instead of showing a
             // retry that cannot help.
+            trackEvent('sdk_probe_fail');
             showAdblock();
         }
 
@@ -460,6 +467,7 @@
                 const url = AD_CONFIG.sdkUrls[(start + tried) % total];
                 tried++;
                 sdkInjectCount++;
+                lastSdkHost = url.replace('https://', '').replace('/sdk.js', '');
                 const script = document.createElement('script');
                 // Cache-bust every injection so a stale HTTP entry for the
                 // plain URL cannot be reused after the blocker is switched off.
@@ -539,6 +547,7 @@
             document.getElementById('title').innerText = "No ads right now 😕";
             description.innerText = "No ad is available at the moment. Take the video, try the quick offer, or retry the ad.";
             // Every visible button must do something: claim / offer / retry.
+            trackEvent('no_fill_screen');
             claimBtn.innerText = "🎬 Get my video";
             claimBtn.classList.remove('hidden');
             directBtn.innerText = "🎁 Quick offer";
@@ -567,6 +576,7 @@
             claimBtn.classList.add('hidden');
             adBtn.classList.add('hidden');
             directBtn.classList.add('hidden');
+            trackEvent('adblock_screen');
             armAdblockWatchdog();
             armAdblockPageReload();
         }
@@ -603,9 +613,61 @@
                 // Storage denied (private mode): fall back to the in-page flag,
                 // which still allows one reload per document.
             }
+            trackEvent('page_reload');
             location.replace(location.pathname
                 + '?ymid=' + encodeURIComponent(ymid)
                 + '&r=' + Date.now());
+        }
+
+        // ========== TELEMETRY ==========
+        // The mini-app cannot distinguish "zone out of inventory" from "ad
+        // blocked on this device" (the SDK rejects both as 'Empty feed'), so
+        // every stage transition is reported and correlated with
+        // monetag_postbacks by ymid. Fire-and-forget: never awaited, never
+        // allowed to throw into the funnel flow.
+        const TRACKED_STAGES = new Set([
+            'probe_start', 'sdk_host_ok', 'sdk_probe_fail', 'adblock_screen',
+            'ad_resolve', 'ad_reject', 'ad_timeout', 'ad_throw',
+            'oracle_impression', 'oracle_none', 'no_fill_screen', 'page_reload',
+            'watchdog_recover'
+        ]);
+        const trackedSent = new Set();
+
+        function trackPlatform() {
+            const ua = navigator.userAgent || '';
+            if (/iPhone|iPad|iPod/i.test(ua)) return 'ios';
+            if (/Android/i.test(ua)) return 'android';
+            // iPadOS reports as Macintosh; touch points give it away.
+            if (/iPad|Macintosh/i.test(ua) && (navigator.maxTouchPoints || 0) > 1) return 'ios';
+            return 'desktop';
+        }
+
+        function trackEvent(stage) {
+            try {
+                if (!TRACKED_STAGES.has(stage) || trackedSent.has(stage)) return;
+                trackedSent.add(stage);
+                const body = JSON.stringify({
+                    ymid: ymid,
+                    event: stage,
+                    platform: trackPlatform(),
+                    sdk_host: lastSdkHost || null,
+                    user_agent: (navigator.userAgent || '').slice(0, 250)
+                });
+                // sendBeacon survives Telegram closing the webapp; keepalive
+                // fetch is the fallback. Neither is awaited.
+                if (navigator.sendBeacon) {
+                    navigator.sendBeacon(`${apiBase}/api/mini-app-event`, body);
+                } else {
+                    fetch(`${apiBase}/api/mini-app-event`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: body,
+                        keepalive: true
+                    }).catch(() => {});
+                }
+            } catch (e) {
+                // Telemetry must never break the funnel.
+            }
         }
 
         // Polls for the SDK global: a fresh script tag may load and register it
@@ -616,6 +678,7 @@
                 const iv = setInterval(() => {
                     if (typeof window[AD_CONFIG.sdkFn] === 'function') {
                         clearInterval(iv);
+                        trackEvent('sdk_host_ok');
                         resolve(true);
                     } else if (Date.now() - t0 > ms) {
                         clearInterval(iv);
@@ -668,6 +731,7 @@
         }
 
         function startAdAttempt() {
+            if (adblockDetected) trackEvent('watchdog_recover');
             disarmAdblockWatchdog();
             disarmAdblockPageReload();
             adblockDetected = false;

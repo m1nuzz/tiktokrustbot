@@ -329,6 +329,34 @@ impl DatabasePool {
         .map_err(|e| anyhow::anyhow!("Failed to log postback: {}", e))
     }
 
+    /// Client-side ad-funnel telemetry from the mini-app. Correlated with
+    /// `monetag_postbacks` by `ymid` to tell "no fill" from "ad blocked here".
+    /// Long strings are truncated in SQL so a hostile client cannot bloat the
+    /// database through this endpoint.
+    pub async fn log_mini_app_event(
+        &self,
+        ymid: &str,
+        event: &str,
+        platform: Option<&str>,
+        sdk_host: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        let ymid_owned = ymid.chars().take(64).collect::<String>();
+        let event_owned = event.chars().take(64).collect::<String>();
+        let platform_owned = platform.map(|s| s.chars().take(16).collect::<String>());
+        let host_owned = sdk_host.map(|s| s.chars().take(64).collect::<String>());
+        let ua_owned = user_agent.map(|s| s.chars().take(256).collect::<String>());
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "INSERT INTO mini_app_events (ymid, event, platform, sdk_host, user_agent) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![ymid_owned, event_owned, platform_owned, host_owned, ua_owned],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to log mini-app event: {}", e))
+    }
+
     /// Whether Monetag ever recorded an ad view for this ymid.
     /// The mini-app cannot tell "zone out of inventory" from "ad blocked on
     /// this device" — one SDK rejection covers both. An absent impression is
