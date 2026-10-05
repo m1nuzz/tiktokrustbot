@@ -176,6 +176,23 @@
             // the SDK in the background so unblocking resumes the ad itself.
             adblockWatchdogInterval: 5000,
             sdkCheckTimeout: 6000,
+            // The SDK bundle is served byte-identically from several first-party
+            // hosts. A blocker that has poisoned one hostname keeps failing it
+            // for the lifetime of the WebView network session, and a query
+            // string cannot bypass a hostname-keyed failure, so injections
+            // rotate through this list instead of hammering one dead host.
+            sdkUrls: [
+                'https://libtl.com/sdk.js',
+                'https://ill3.com/sdk.js'
+            ],
+            // Escalation when in-page re-injection cannot revive the SDK: reload
+            // the document once with a fresh cache key. sessionStorage survives
+            // the reload, so the marker below makes this at most once per
+            // WebView and therefore impossible to loop. The delay is long
+            // enough that the visibility retry and at least one watchdog tick
+            // (cheaper, no navigation) get their chance first.
+            adblockReloadDelay: 12000,
+            adblockReloadMarker: 'adblock_reload_done',
             // Startup probe: how many times to (re)load the SDK and how long to
             // wait for it before declaring the device ad-blocked.
             sdkProbeAttempts: 2,
@@ -207,6 +224,8 @@
         let adblockWatchdogId = null; // background SDK reload while blocked
         let adAttemptToken = 0; // guards async ad verdicts against stale attempts
         let sdkInjectCount = 0; // cache-buster for repeated SDK injections
+        let sdkHostIndex = 0; // rotates the first SDK host tried per injection
+        let adblockReloadId = null; // one-shot page reload while ad-blocked
 
         const tg = window.Telegram.WebApp;
         const loaderView = document.getElementById('loader-view');
@@ -423,22 +442,39 @@
         // Injects the SDK script tag. Repeatable: used by the startup probe
         // and by the ad-block watchdog. onError lets the watchdog settle its
         // wait immediately instead of polling until the timeout.
+        //
+        // Every injection walks the whole sdkUrls list before reporting a
+        // failure, and the starting host rotates between injections so a dead
+        // hostname is not retried first every time.
         function injectSdkScript(onError) {
-            const script = document.createElement('script');
-            sdkInjectCount++;
-            // Cache-bust every injection. The iOS WebView caches connection /
-            // DNS failures per process, so after the user disables their
-            // blocker the plain URL keeps failing until the webapp is closed
-            // and reopened — a unique query forces a real refetch.
-            script.src = 'https://libtl.com/sdk.js?_=' + Date.now() + '_' + sdkInjectCount;
-            script.async = true;
-            script.setAttribute('data-zone', AD_CONFIG.zone);
-            script.setAttribute('data-sdk', AD_CONFIG.sdkFn);
-            script.onerror = () => {
-                window._sdkLoadFailed = true;
-                if (onError) onError();
+            const total = AD_CONFIG.sdkUrls.length;
+            const start = sdkHostIndex % total;
+            sdkHostIndex++;
+            let tried = 0;
+
+            const tryHost = () => {
+                if (tried >= total) {
+                    if (onError) onError();
+                    return;
+                }
+                const url = AD_CONFIG.sdkUrls[(start + tried) % total];
+                tried++;
+                sdkInjectCount++;
+                const script = document.createElement('script');
+                // Cache-bust every injection so a stale HTTP entry for the
+                // plain URL cannot be reused after the blocker is switched off.
+                script.src = url + '?_=' + Date.now() + '_' + sdkInjectCount;
+                script.async = true;
+                script.setAttribute('data-zone', AD_CONFIG.zone);
+                script.setAttribute('data-sdk', AD_CONFIG.sdkFn);
+                script.onerror = () => {
+                    window._sdkLoadFailed = true;
+                    tryHost();
+                };
+                document.head.appendChild(script);
             };
-            document.head.appendChild(script);
+
+            tryHost();
         }
 
 // ========== УРОВЕНЬ 2: Popup (быстрый оффер вместо SmartLink) ==========
@@ -527,11 +563,49 @@
             loaderView.classList.add('hidden');
             contentView.classList.remove('hidden');
             document.getElementById('title').innerText = "🛡 Ad-block detected";
-            description.innerText = "Ads cannot load while ad-blocking is on, so there is nothing to watch. Turn off ad-blocking for Telegram (your ad-blocker app, or the DNS / Private DNS setting) and come back — the ad will start automatically.";
+            description.innerText = "Ads cannot load while ad-blocking is on, so there is nothing to watch. Turn off ad-blocking for Telegram (your ad-blocker app, or the DNS / Private DNS setting) and come back — the ad will start on its own. If it does not, close this window and press the bot's button again.";
             claimBtn.classList.add('hidden');
             adBtn.classList.add('hidden');
             directBtn.classList.add('hidden');
             armAdblockWatchdog();
+            armAdblockPageReload();
+        }
+
+        // Last-resort recovery for the ad-block screen: reload the document once
+        // with a fresh cache key. This buys a new document and a new HTTP cache
+        // entry, but it keeps the same WebView, so it cannot clear a failure the
+        // network stack remembers per hostname - that is why the SDK host
+        // rotation in injectSdkScript() is tried first and on every tick.
+        function armAdblockPageReload() {
+            if (adblockReloadId) return;
+            adblockReloadId = setTimeout(reloadPageOnce, AD_CONFIG.adblockReloadDelay);
+        }
+
+        function disarmAdblockPageReload() {
+            if (adblockReloadId) {
+                clearTimeout(adblockReloadId);
+                adblockReloadId = null;
+            }
+        }
+
+        function reloadPageOnce() {
+            adblockReloadId = null;
+            // Never disturb a working SDK, a running ad, or a claim in flight.
+            if (typeof window[AD_CONFIG.sdkFn] === 'function') return;
+            if (isPolling || claimFired || adAttemptToken > 0) return;
+            // sessionStorage outlives the reload inside one WebView, so this
+            // marker caps the escalation at one reload per WebView: no loop,
+            // no reload storm while the blocker stays on.
+            try {
+                if (window.sessionStorage.getItem(AD_CONFIG.adblockReloadMarker) === '1') return;
+                window.sessionStorage.setItem(AD_CONFIG.adblockReloadMarker, '1');
+            } catch (e) {
+                // Storage denied (private mode): fall back to the in-page flag,
+                // which still allows one reload per document.
+            }
+            location.replace(location.pathname
+                + '?ymid=' + encodeURIComponent(ymid)
+                + '&r=' + Date.now());
         }
 
         // Polls for the SDK global: a fresh script tag may load and register it
@@ -595,6 +669,7 @@
 
         function startAdAttempt() {
             disarmAdblockWatchdog();
+            disarmAdblockPageReload();
             adblockDetected = false;
             sdkLoadFailed = false;
             // Stale flag from the first blocked load would otherwise bounce us
