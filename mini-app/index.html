@@ -193,6 +193,11 @@
             // (cheaper, no navigation) get their chance first.
             adblockReloadDelay: 12000,
             adblockReloadMarker: 'adblock_reload_done',
+            // Popup-before-reload: the SDK opens the tab synchronously but
+            // iOS creates the native tab asynchronously, so the manual
+            // recovery waits for the popup promise to settle before the
+            // reload navigation. Hard cap: a hanging show() still reloads.
+            adblockPopupSettleMs: 1500,
             // Startup probe: how many times to (re)load the SDK and how long to
             // wait for it before declaring the device ad-blocked.
             sdkProbeAttempts: 2,
@@ -707,27 +712,59 @@
         // to this row. The new tab survives our navigation. Without an SDK
         // there is nothing to fire — the reload alone still gives a clean
         // document that retries the SDK load with host rotation.
+        //
+        // The SDK opens the tab synchronously, but the host WebView creates
+        // the native tab asynchronously: navigating away in the same task
+        // tears down the document before iOS finishes the open, so no tab
+        // appears. The call below stays synchronous to keep the user
+        // gesture; only the navigation waits — for the popup to settle or
+        // for the cap below, whichever comes first, so a hanging show()
+        // can never trap the user. The offer URL is never exposed by the
+        // SDK (show() resolves with no value), so a placeholder tab or
+        // Telegram.WebApp.openLink cannot be used here — waiting is the
+        // only available fix.
         function reloadAndPopup() {
             trackEvent('adblock_popup_tapped');
+            let popupPromise = null;
             if (typeof window[AD_CONFIG.sdkFn] === 'function') {
                 try {
-                    const p = window[AD_CONFIG.sdkFn]({
+                    popupPromise = window[AD_CONFIG.sdkFn]({
                         ymid: ymid,
                         type: 'pop',
                         requestVar: 'adblock_popup',
                         catchIfNoFeed: true
                     });
-                    if (p && typeof p.catch === 'function') p.catch(() => {});
-                } catch (e) {}
+                    // Attach a no-op rejection handler immediately so a fast
+                    // reject never surfaces as an unhandled rejection; the
+                    // settle handler below still runs the navigation.
+                    if (popupPromise && typeof popupPromise.catch === 'function') popupPromise.catch(() => {});
+                } catch (e) {
+                    popupPromise = null;
+                }
             }
-            if (claimPageReload()) {
-                trackEvent('page_reload');
-                navigateTo(location.pathname
-                    + '?ymid=' + encodeURIComponent(ymid)
-                    + '&r=' + Date.now());
+            if (!claimPageReload()) {
+                // Marker already spent: the popup retry above already fired.
+                // Stay on the screen, the watchdog keeps retrying in the
+                // background. No second navigation, ever.
+                return;
             }
-            // Marker already spent: stay on the screen, the watchdog keeps
-            // retrying in the background. No second navigation, ever.
+            trackEvent('page_reload');
+            const target = location.pathname
+                + '?ymid=' + encodeURIComponent(ymid)
+                + '&r=' + Date.now();
+            if (!popupPromise || typeof popupPromise.then !== 'function') {
+                navigateTo(target);
+                return;
+            }
+            let navigated = false;
+            const go = () => {
+                if (navigated) return;
+                navigated = true;
+                clearTimeout(timer);
+                navigateTo(target);
+            };
+            const timer = setTimeout(go, AD_CONFIG.adblockPopupSettleMs);
+            popupPromise.then(go, go);
         }
 
         // ========== TELEMETRY ==========
