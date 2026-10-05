@@ -410,8 +410,7 @@ impl DatabasePool {
                     params![id_owned],
                     |row| row.get(0),
                 )
-                .optional()
-                .flatten()
+                .optional()?
                 .flatten();
             Ok(ts)
         })
@@ -1183,10 +1182,14 @@ mod tests {
         })
         .await
         .unwrap();
-        for (event, reward, age) in postbacks {
+        // Own every value before the loop: the async DB closure below must
+        // capture owned data, never borrows into the caller's slice.
+        let rows: Vec<(String, String, i64)> = postbacks
+            .iter()
+            .map(|(e, r, a)| (e.to_string(), r.to_string(), *a))
+            .collect();
+        for (event_owned, reward_owned, age) in rows {
             let id_owned = id.to_string();
-            let event_owned = event.to_string();
-            let reward_owned = reward.to_string();
             pool.execute_with_timeout(move |conn| {
                 conn.execute(
                     "INSERT INTO monetag_postbacks (ymid, event_type, reward_event_type, created_at) VALUES (?1, ?2, ?3, datetime('now', ?4))",
