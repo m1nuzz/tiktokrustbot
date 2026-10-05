@@ -139,8 +139,11 @@
     <div class="blob blob-2"></div>
 
     <div class="container">
-        <!-- Persistent Loader -->
-        <div id="loader-view" class="spinner-container">
+        <!-- Permanent: `hidden` stays forever, nothing may ever remove it. The
+             spinner card was rejected twice as a screen (it flashed after the
+             user pressed Continue in the ad), so no part of the flow may show
+             it — before the first content view, or while one is already up. -->
+        <div id="loader-view" class="spinner-container hidden">
             <div class="spinner"></div>
             <h2 id="loader-text" style="font-size: 18px; color: var(--text-primary); margin: 0;">Loading...</h2>
             <span id="loader-subtext" style="font-size: 14px; color: var(--text-secondary);">Connecting to servers</span>
@@ -252,8 +255,6 @@
 
         const tg = window.Telegram.WebApp;
         const loaderView = document.getElementById('loader-view');
-        const loaderText = document.getElementById('loader-text');
-        const loaderSubtext = document.getElementById('loader-subtext');
         const contentView = document.getElementById('content-view');
         const adBtn = document.getElementById('ad-btn');
         const claimBtn = document.getElementById('claim-btn');
@@ -397,8 +398,6 @@
                 showAdblock();
                 return;
             }
-            loaderText.innerText = t('MiniStartingAdTitle');
-            loaderSubtext.innerText = t('MiniStartingAdSub');
             currentAdSource = 'sdk';
 
             const token = ++adAttemptToken;
@@ -553,8 +552,6 @@
         // blockers answer with a stub page instead of failing — so the only
         // reliable test is loading the SDK script itself.
         async function startAdFlow() {
-            loaderText.innerText = t('MiniCheckingNetTitle');
-            loaderSubtext.innerText = t('MiniCheckingNetSub');
             trackEvent('probe_start');
             for (let attempt = 1; attempt <= AD_CONFIG.sdkProbeAttempts; attempt++) {
                 if (typeof window[AD_CONFIG.sdkFn] === 'function') { break; }
@@ -651,8 +648,6 @@
                 return;
             }
             popupTries++;
-            loaderText.innerText = t('MiniOpeningOfferTitle');
-            loaderSubtext.innerText = t('MiniOpeningOfferSub');
             const token = ++adAttemptToken;
             try {
                 adShownAt = Date.now();
@@ -1018,8 +1013,9 @@
             popupTries = 0;
             claimFired = false;
             directAction = 'close';
-            loaderView.classList.remove('hidden');
-            contentView.classList.add('hidden');
+            // Background recovery (watchdog tick / return from the offer page):
+            // it must be invisible and must not touch the current screen. The
+            // ad overlay is its own visual; the loader view is never shown.
             trySDKAd();
         }
 
@@ -1128,8 +1124,6 @@
         }
 
         // ========== ИНИЦИАЛИЗАЦИЯ ==========
-        loaderText.innerText = t('MiniLoadingTitle');
-        loaderSubtext.innerText = t('MiniLoadingSub');
         tg.ready();
         tg.expand();
         // No claim buttons anywhere: keep the main button hidden defensively.
@@ -1170,8 +1164,8 @@ if (data.enabled) {
             claimFired = false; // new attempt: allow one auto-claim
             adBtn.classList.add('hidden');
             claimBtn.classList.add('hidden');
-            loaderView.classList.remove('hidden');
-            contentView.classList.add('hidden');
+            // The attempt itself is the ad overlay; the card underneath is
+            // left exactly as it is instead of switching to the loader view.
             trySDKAd();
         });
 
