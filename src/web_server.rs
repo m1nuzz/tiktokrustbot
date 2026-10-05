@@ -83,8 +83,15 @@ pub struct MiniAppEventRequest {
 
 async fn log_mini_app_event(
     State(state): State<AppState>,
-    Json(payload): Json<MiniAppEventRequest>,
+    // Raw body, not axum's `Json`: `navigator.sendBeacon` posts `text/plain`
+    // by default and `Json` rejects anything but `application/json` (415) —
+    // that is how every beacon got silently eaten.
+    body: String,
 ) -> axum::http::StatusCode {
+    let payload: MiniAppEventRequest = match serde_json::from_str(&body) {
+        Ok(p) => p,
+        Err(_) => return axum::http::StatusCode::BAD_REQUEST,
+    };
     if let Err(e) = state
         .db
         .log_mini_app_event(
