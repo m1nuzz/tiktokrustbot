@@ -226,7 +226,7 @@
         let isPolling = false;
         let pollCount = 0;
         let popupTries = 0;
-        let directAction = 'close'; // 'close' | 'popup' | 'bonus_popup'
+        let directAction = 'close'; // 'close' | 'popup' | 'bonus_popup' | 'reload_popup'
         let currentAdSource = null; // 'sdk' или 'popup'
         let claimFired = false; // auto-claim guard: one claim per attempt
         let noAdsShown = false; // no-ads screen visible (upgradeable to adblock)
@@ -289,6 +289,7 @@
             document.getElementById('title').innerText = "Error";
             description.innerText = message;
             claimBtn.classList.add('hidden');
+            directAction = 'close';
             directBtn.classList.remove('hidden');
         }
 
@@ -297,6 +298,7 @@
             contentView.classList.remove('hidden');
             document.getElementById('title').innerText = titleText;
             description.innerText = descText;
+            directAction = 'close';
             if (showDirect) directBtn.classList.remove('hidden');
             claimBtn.classList.add('hidden');
         }
@@ -595,7 +597,13 @@
             description.innerText = "Ads cannot load while ad-blocking is on, so there is nothing to watch. Turn off ad-blocking for Telegram (your ad-blocker app, or the DNS / Private DNS setting) and come back — the ad will start on its own. If it does not, close this window and press the bot's button again.";
             claimBtn.classList.add('hidden');
             adBtn.classList.add('hidden');
-            directBtn.classList.add('hidden');
+            // One manual recovery path: reload the document (fresh SDK load
+            // attempt) and fire a popup inside the tap gesture. Its
+            // impression/valued postbacks correlate to this same ymid.
+            directBtn.innerText = "🔄 Reload & open offer";
+            directAction = 'reload_popup';
+            directBtn.classList.remove('hidden');
+            trackEvent('adblock_popup_shown');
             trackEvent('adblock_screen');
             armAdblockWatchdog();
             armAdblockPageReload();
@@ -623,20 +631,64 @@
             // Never disturb a working SDK, a running ad, or a claim in flight.
             if (typeof window[AD_CONFIG.sdkFn] === 'function') return;
             if (isPolling || claimFired || adAttemptToken > 0) return;
-            // sessionStorage outlives the reload inside one WebView, so this
-            // marker caps the escalation at one reload per WebView: no loop,
-            // no reload storm while the blocker stays on.
-            try {
-                if (window.sessionStorage.getItem(AD_CONFIG.adblockReloadMarker) === '1') return;
-                window.sessionStorage.setItem(AD_CONFIG.adblockReloadMarker, '1');
-            } catch (e) {
-                // Storage denied (private mode): fall back to the in-page flag,
-                // which still allows one reload per document.
-            }
+            if (!claimPageReload()) return;
             trackEvent('page_reload');
-            location.replace(location.pathname
+            navigateTo(location.pathname
                 + '?ymid=' + encodeURIComponent(ymid)
                 + '&r=' + Date.now());
+        }
+
+        // One reload per WebView, shared by the automatic escalation above
+        // and the manual button below. Returns true when this call consumed
+        // the single reload.
+        function claimPageReload() {
+            try {
+                // sessionStorage outlives the reload inside one WebView, so
+                // this marker caps the escalation: no loop, no reload storm
+                // while the blocker stays on.
+                if (window.sessionStorage.getItem(AD_CONFIG.adblockReloadMarker) === '1') return false;
+                window.sessionStorage.setItem(AD_CONFIG.adblockReloadMarker, '1');
+                return true;
+            } catch (e) {
+                // Storage denied (private mode): allow the single in-page
+                // attempt, the page is going away anyway.
+                return true;
+            }
+        }
+
+        // Navigates to a fresh document. Separate function so tests can
+        // observe the navigation target (jsdom cannot perform navigation).
+        function navigateTo(url) {
+            location.replace(url);
+        }
+
+        // Manual recovery on the adblock screen: fire a popup inside the user
+        // gesture (popup-blockers allow it), then reload the document with
+        // the SAME ymid so the popup's impression/valued postbacks correlate
+        // to this row. The new tab survives our navigation. Without an SDK
+        // there is nothing to fire — the reload alone still gives a clean
+        // document that retries the SDK load with host rotation.
+        function reloadAndPopup() {
+            trackEvent('adblock_popup_tapped');
+            if (typeof window[AD_CONFIG.sdkFn] === 'function') {
+                try {
+                    const p = window[AD_CONFIG.sdkFn]({
+                        ymid: ymid,
+                        type: 'pop',
+                        requestVar: 'adblock_popup',
+                        catchIfNoFeed: true
+                    });
+                    if (p && typeof p.catch === 'function') p.catch(() => {});
+                } catch (e) {}
+            }
+            if (claimPageReload()) {
+                trackEvent('page_reload');
+                navigateTo(location.pathname
+                    + '?ymid=' + encodeURIComponent(ymid)
+                    + '&r=' + Date.now());
+            }
+            // Marker already spent: stay on the screen, the watchdog keeps
+            // retrying in the background. No second navigation, ever.
         }
 
         // ========== TELEMETRY ==========
@@ -649,7 +701,8 @@
             'probe_start', 'sdk_host_ok', 'sdk_probe_fail', 'adblock_screen',
             'ad_resolve', 'ad_reject', 'ad_timeout', 'ad_throw',
             'oracle_impression', 'oracle_none', 'no_fill_screen', 'page_reload',
-            'watchdog_recover', 'bonus_popup_shown', 'bonus_popup_tapped'
+            'watchdog_recover', 'bonus_popup_shown', 'bonus_popup_tapped',
+            'adblock_popup_shown', 'adblock_popup_tapped'
         ]);
         const trackedSent = new Set();
 
@@ -953,6 +1006,8 @@ if (data.enabled) {
                 bonusPopupDone = true;
                 trackEvent('bonus_popup_tapped');
                 tryPopup('valued_bonus_popup');
+            } else if (directAction === 'reload_popup') {
+                reloadAndPopup();
             } else {
                 tg.close();
             }
