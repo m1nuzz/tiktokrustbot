@@ -54,6 +54,13 @@ pub struct PostbackQuery {
 #[derive(Deserialize)]
 pub struct ClaimRequest {
     pub ymid: String,
+    /// Client attestation that the ad was displayed for the full watch gate
+    /// (X-press after a full watch). Old clients omit it; serde defaults it
+    /// to false, which keeps the click/90s branches as the only engagement
+    /// proof. The gate still requires the valued impression and the 15s
+    /// floor server-side, so an attestation alone unlocks nothing early.
+    #[serde(default)]
+    pub watched_full: bool,
 }
 
 #[derive(Deserialize)]
@@ -427,35 +434,19 @@ async fn claim_video(
     let db = state.db.clone();
     let ymid = payload.ymid.clone();
 
-    // 1. Get user_id for this ymid
-    let user_id = match db.get_user_id_by_ymid(&ymid).await {
-        Ok(id) => id,
-        Err(e) => {
-            log::error!("Claim failed: Ymid {} not found: {}", ymid, e);
-            return Json(json!({ "success": false, "error": "Invalid request ID" }));
-        }
-    };
+    // 1. Reject unknown ymids early (the shared gate below would fail
+    // them anyway, but with a less specific error).
+    if let Err(e) = db.get_user_id_by_ymid(&ymid).await {
+        log::error!("Claim failed: Ymid {} not found: {}", ymid, e);
+        return Json(json!({ "success": false, "error": "Invalid request ID" }));
+    }
 
-    // 2. Check if user is admin
-    let admins: Vec<i64> = std::env::var("ADMIN_IDS")
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
-    
-    let is_admin = admins.contains(&user_id);
-
-    // 3. Attempt to claim: admin bypass, else the strict gate (valued
-    // impression plus 15s watch plus click-or-90s). No timer backstop:
-    // without a valued postback the download stays locked.
-    let claim_result = if is_admin {
-        log::info!("Admin detected (user {}), using bypass claim for ymid {}", user_id, ymid);
-        db.claim_any_download(&ymid)
-            .await
-            .map(|(u, url)| (u, url, ClaimVia::Admin))
-    } else {
-        db.claim_if_ready(&ymid).await
-    };
+    // 2. Single shared gate for everyone, admins included: valued
+    // impression plus 15s watch plus click-or-90s-or-attested-full-watch.
+    // No admin bypass (admin testing must reproduce the user experience)
+    // and no timer backstop: without a valued postback the download stays
+    // locked. Completed rows below still return idempotent success.
+    let claim_result = db.claim_if_ready_watched(&ymid, payload.watched_full).await;
 
     match claim_result {
         Ok((user_id, url, via)) => {

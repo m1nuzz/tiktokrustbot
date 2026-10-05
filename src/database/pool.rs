@@ -19,9 +19,10 @@ pub struct UserInfo {
 }
 
 /// How a download request was unlocked (for delivery-reason stats).
-/// Verified = strict gate (valued impression plus watch plus click/90s);
-/// Timer = legacy 20s age-rule backstop (removed, kept for historic rows);
-/// Admin = admin bypass (no ad needed).
+/// Verified = strict gate (valued impression plus watch plus click/90s or an
+/// attested full watch); Timer = legacy 20s age-rule backstop (removed, kept
+/// for historic rows); Admin = historic admin bypass rows (no longer issued:
+/// admins go through the same strict gate as everyone else).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimVia {
     Verified,
@@ -443,6 +444,19 @@ impl DatabasePool {
     /// No timer backstop: without any valued event the download stays locked.
     /// Atomic per attempt via claim_verified_download.
     pub async fn claim_if_ready(&self, id: &str) -> Result<(i64, String, ClaimVia), anyhow::Error> {
+        self.claim_if_ready_watched(id, false).await
+    }
+
+    /// Watched-full variant of the strict gate. A client-attested full watch
+    /// counts as engagement proof equivalent to a click: it unlocks iff the
+    /// valued impression AND the watch floor already hold, i.e. an
+    /// attestation alone never unlocks anything early. The click/90s
+    /// branches are kept as-is for callers without an attestation.
+    pub async fn claim_if_ready_watched(
+        &self,
+        id: &str,
+        watched_full: bool,
+    ) -> Result<(i64, String, ClaimVia), anyhow::Error> {
         const WATCH_SECS: i64 = 15;
         const CLICK_WAIT_SECS: i64 = 90;
         if !self.has_valued_impression(id).await.unwrap_or(false) {
@@ -460,7 +474,10 @@ impl DatabasePool {
         if age < WATCH_SECS {
             return Err(anyhow::anyhow!("watch window not elapsed for {}", id));
         }
-        if age < CLICK_WAIT_SECS && !self.has_click_for_ymid(id).await.unwrap_or(false) {
+        if !watched_full
+            && age < CLICK_WAIT_SECS
+            && !self.has_click_for_ymid(id).await.unwrap_or(false)
+        {
             return Err(anyhow::anyhow!("no click yet for {}", id));
         }
         self.claim_verified_download(id)
@@ -510,25 +527,6 @@ impl DatabasePool {
             
             Ok((user_id, url))
         }).await.map_err(|e| anyhow::anyhow!("Failed to claim verified download {}: {}", id, e))
-    }
-
-    /// Claim a download regardless of status (for admins or bypassing)
-    pub async fn claim_any_download(&self, id: &str) -> Result<(i64, String), anyhow::Error> {
-        let id_owned = id.to_string();
-        self.execute_with_timeout(move |conn| {
-            let (user_id, url): (i64, String) = conn.query_row(
-                "SELECT user_id, video_url FROM pending_downloads WHERE id = ?1 AND (status = 'verified' OR status = 'pending')",
-                params![id_owned],
-                |row| Ok((row.get(0)?, row.get(1)?))
-            )?;
-            
-            conn.execute(
-                "UPDATE pending_downloads SET status = 'completed' WHERE id = ?1",
-                params![id_owned],
-            )?;
-            
-            Ok((user_id, url))
-        }).await.map_err(|e| anyhow::anyhow!("Failed to bypass-claim download {}: {}", id, e))
     }
 
     /// Get user_id for a specific ymid
@@ -1291,6 +1289,82 @@ mod tests {
                 .await
                 .unwrap(),
             Some("pending".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_if_ready_watched_full_ok_without_click() {
+        let (pool, _file) = setup_test_db().await;
+        // Valued impression 20s old (watch floor passed), no click: the
+        // attested full watch stands in for the click.
+        setup_gate_row(
+            &pool,
+            "gate-watched",
+            "verified",
+            30,
+            &[("impression", "valued", 20)],
+        )
+        .await;
+        // Without the attestation the same row stays locked (no click, <90s).
+        assert!(pool.claim_if_ready("gate-watched").await.is_err());
+        let (user_id, url, via) = pool
+            .claim_if_ready_watched("gate-watched", true)
+            .await
+            .unwrap();
+        assert_eq!(user_id, 7);
+        assert_eq!(url, "http://v");
+        assert_eq!(via, ClaimVia::Verified);
+        assert_eq!(
+            pool.get_pending_download_status("gate-watched")
+                .await
+                .unwrap(),
+            Some("completed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_if_ready_watched_full_young_err() {
+        let (pool, _file) = setup_test_db().await;
+        // Valued impression just landed: the attestation alone unlocks
+        // nothing before the 15s watch floor.
+        setup_gate_row(
+            &pool,
+            "gate-watched-young",
+            "verified",
+            5,
+            &[("impression", "valued", 0)],
+        )
+        .await;
+        assert!(
+            pool.claim_if_ready_watched("gate-watched-young", true)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            pool.get_pending_download_status("gate-watched-young")
+                .await
+                .unwrap(),
+            Some("verified".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_if_ready_watched_full_no_valued_err() {
+        let (pool, _file) = setup_test_db().await;
+        // Only a non-valued impression: no payment proof, the attestation
+        // cannot substitute for it.
+        setup_gate_row(
+            &pool,
+            "gate-watched-free",
+            "verified",
+            100,
+            &[("impression", "non_valued", 95)],
+        )
+        .await;
+        assert!(
+            pool.claim_if_ready_watched("gate-watched-free", true)
+                .await
+                .is_err()
         );
     }
 }

@@ -243,6 +243,7 @@
         let adAttemptToken = 0; // guards async ad verdicts against stale attempts
         let impressionSeen = false; // this ymid already presented an ad: no new show()
         let adShownAt = 0; // timestamp of the last show() call (watch-gate)
+        let watchedFastDelivered = false; // per ymid: one fast-path delivery, no doubles
         let sdkInjectCount = 0; // cache-buster for repeated SDK injections
         let bonusPopupDone = false; // bonus offer already taken: no second round
         let sdkHostIndex = 0; // rotates the first SDK host tried per injection
@@ -418,10 +419,15 @@
                 return;
             }
             sdkWithTimeout(adPromise, AD_CONFIG.adTimeout, 'sdk')
-                .then(() => {
+                .then(async () => {
                     if (token !== adAttemptToken) return;
                     trackEvent('ad_resolve');
                     impressionSeen = true; // a resolved show presented an ad
+                    // Fast path first: an X-press after a full watch ends
+                    // the call as a resolve too, and must deliver + close
+                    // without an intermediate screen.
+                    if (await tryWatchedFastDeliver(token)) return;
+                    if (token !== adAttemptToken) return;
                     // Auto-claim first, then keep polling: whichever wins
                     // (claim gate or valued postback auto-delivery) delivers once.
                     autoClaim();
@@ -448,7 +454,59 @@
         // call looked dead):
         //   a view    -> the ad was presented -> no-fill screen (working claim)
         //   no view   -> nothing was ever presented -> ad-blocked, text-only
+        // Fast path for an X-press after a full watch: the show() call
+        // settled (resolve or reject/timeout — closing the ad ends the call
+        // either way) after the ad was displayed for the full watch gate,
+        // and the server oracle confirms an impression for this ymid. One
+        // attested claim-video POST (watched_full:true); success closes the
+        // webapp at once with no intermediate screen. Anything else returns
+        // false so the caller falls through to the existing flow unchanged.
+        // Token-guarded throughout: a stale attempt never closes the app or
+        // disturbs a newer attempt (the token check and the claimFired set
+        // run with no await between them, so no newer attempt can slip in
+        // between). Single delivery per ymid: a second settle for the same
+        // ymid never claims twice.
+        async function tryWatchedFastDeliver(token) {
+            if (token !== adAttemptToken) return false;
+            if (watchedFastDelivered || claimFired) return false;
+            if (!adShownAt) return false;
+            if (Date.now() - adShownAt < AD_CONFIG.requiredWatchMs) return false;
+            let hadView = false;
+            try {
+                hadView = await hasAdImpression();
+            } catch (e) {
+                hadView = false;
+            }
+            if (token !== adAttemptToken) return false;
+            if (!hadView) return false;
+            trackEvent('oracle_impression');
+            claimFired = true; // single attested claim for this attempt
+            try {
+                const res = await fetch(`${apiBase}/api/claim-video`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ymid: ymid, watched_full: true })
+                });
+                const data = await res.json();
+                if (token !== adAttemptToken) return false;
+                if (data && data.success) {
+                    watchedFastDelivered = true;
+                    trackEvent('watched_deliver');
+                    tg.close();
+                    return true;
+                }
+            } catch (e) {
+                // Network hiccup: fall through to the existing flow below.
+            }
+            claimFired = false; // release: the normal claim/poll flow may run
+            return false;
+        }
+
         async function handleAdFailure(kind, token) {
+            if (token !== adAttemptToken) return;
+            // X-press after a full watch delivers + closes without any
+            // intermediate screen; anything else falls through unchanged.
+            if (await tryWatchedFastDeliver(token)) return;
             if (token !== adAttemptToken) return;
             // Even a timeout consults the oracle: on iOS the user may have
             // tapped the creative and left for the offer page while show()
@@ -597,6 +655,7 @@
             loaderSubtext.innerText = t('MiniOpeningOfferSub');
             const token = ++adAttemptToken;
             try {
+                adShownAt = Date.now();
                 const popupPromise = window[AD_CONFIG.sdkFn]({
                     ymid: ymid,
                     type: 'pop',
@@ -604,7 +663,11 @@
                     catchIfNoFeed: true
                 });
                 sdkWithTimeout(popupPromise, AD_CONFIG.adTimeout, 'popup')
-                    .then(() => {
+                    .then(async () => {
+                        if (token !== adAttemptToken) return;
+                        // Same fast path as the interstitial resolve: a full
+                        // watch ended by the X delivers + closes at once.
+                        if (await tryWatchedFastDeliver(token)) return;
                         if (token !== adAttemptToken) return;
                         // Auto-claim first, then keep polling: whichever wins
                         // (claim gate or valued postback auto-delivery) delivers once.
@@ -826,7 +889,7 @@
             'oracle_impression', 'oracle_none', 'no_fill_screen', 'page_reload',
             'watchdog_recover', 'bonus_popup_shown', 'bonus_popup_tapped',
             'adblock_popup_shown', 'adblock_popup_tapped', 'retry_suppressed',
-            'claim_tapped', 'already_delivered'
+            'claim_tapped', 'already_delivered', 'watched_deliver'
         ]);
         const trackedSent = new Set();
 
