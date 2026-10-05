@@ -143,6 +143,23 @@ pub async fn start_web_server(state: AppState, port: u16) {
     axum::serve(listener, app).await.expect("Failed to start axum server");
 }
 
+/// Substitutes the per-locale STRINGS dict into the mini-app template.
+/// The template already declares `const STRINGS = /*STRINGS_INJECT*/null`,
+/// so ONLY the JSON dict is substituted here. Substituting anything else
+/// (e.g. a second `const STRINGS = ...`) is a syntax error that kills the
+/// entire inline script — this exact bug shipped once (served page failed
+/// to parse, mini-app dead on arrival). The unit test below guards it.
+fn inject_mini_app_strings(html: &str, lang: &str, dict: &serde_json::Value) -> String {
+    let html = html.replace("/*STRINGS_INJECT*/", &dict.to_string());
+    html.replace(
+        "<html lang=\"en\">",
+        &format!(
+            "<html lang=\"{}\">",
+            crate::i18n::resolve_lang(Some(lang))
+        ),
+    )
+}
+
 async fn serve_mini_app(
     State(state): State<AppState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
@@ -174,11 +191,7 @@ async fn serve_mini_app(
             serde_json::Value::String(crate::i18n::t(*key, Some(&lang)).to_string()),
         );
     }
-    let html = html.replace(
-        "/*STRINGS_INJECT*/",
-        &format!("const STRINGS = {};\n        const PAGE_LANG = {};", serde_json::Value::Object(dict), serde_json::Value::String(lang.clone())),
-    );
-    let html = html.replace("<html lang=\"en\">", &format!("<html lang=\"{}\">", crate::i18n::resolve_lang(Some(&lang))));
+    let html = inject_mini_app_strings(&html, &lang, &serde_json::Value::Object(dict));
     // Never cache the document: Telegram WebViews keep serving a stale copy
     // otherwise, and users get stuck on old funnel screens (e.g. a blue,
     // always-visible Continue from a build before btn-success/watch-gate).
@@ -468,5 +481,32 @@ async fn claim_video(
                 "error": "Ad verification not received yet. Please finish watching the ad or wait a few seconds." 
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: the STRINGS substitution must never emit a second
+    /// `const STRINGS` declaration — that exact bug shipped once and killed
+    /// the whole inline script (served page failed to parse, mini-app dead).
+    #[test]
+    fn strings_injection_emits_single_declaration() {
+        let template = "<html lang=\"en\"><script>const STRINGS = /*STRINGS_INJECT*/null;</script>";
+        let mut dict = serde_json::Map::new();
+        dict.insert(
+            "MiniNoAdsTitle".to_string(),
+            serde_json::Value::String("x".to_string()),
+        );
+        let out = inject_mini_app_strings(
+            template,
+            "ru",
+            &serde_json::Value::Object(dict),
+        );
+        assert_eq!(out.matches("const STRINGS").count(), 1);
+        assert!(!out.contains("STRINGS_INJECT"));
+        assert!(out.contains("<html lang=\"ru\">"));
+        assert!(out.contains("\"MiniNoAdsTitle\":\"x\""));
     }
 }
