@@ -144,13 +144,13 @@ pub async fn start_web_server(state: AppState, port: u16) {
 }
 
 /// Substitutes the per-locale STRINGS dict into the mini-app template.
-/// The template already declares `const STRINGS = /*STRINGS_INJECT*/null`,
-/// so ONLY the JSON dict is substituted here. Substituting anything else
-/// (e.g. a second `const STRINGS = ...`) is a syntax error that kills the
-/// entire inline script — this exact bug shipped once (served page failed
-/// to parse, mini-app dead on arrival). The unit test below guards it.
+/// The template line reads `const STRINGS = /*STRINGS_INJECT*/null`, so the
+/// marker INCLUSIVE of the trailing `null` is replaced by the bare dict —
+/// anything else (a second `const`, a leftover `null`) is a syntax error
+/// that kills the entire inline script. Shipped broken once; the unit test
+/// below guards the exact template shape.
 fn inject_mini_app_strings(html: &str, lang: &str, dict: &serde_json::Value) -> String {
-    let html = html.replace("/*STRINGS_INJECT*/", &dict.to_string());
+    let html = html.replace("/*STRINGS_INJECT*/null", &dict.to_string());
     html.replace(
         "<html lang=\"en\">",
         &format!(
@@ -506,6 +506,7 @@ mod tests {
         );
         assert_eq!(out.matches("const STRINGS").count(), 1);
         assert!(!out.contains("STRINGS_INJECT"));
+        assert!(!out.contains("}null"), "leftover null after the dict");
         assert!(out.contains("<html lang=\"ru\">"));
         assert!(out.contains("\"MiniNoAdsTitle\":\"x\""));
     }
