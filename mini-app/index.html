@@ -173,7 +173,11 @@
             // The server unlocks a pending row only after ~20s (ad window) or
             // a valued postback, so a claim must be retried patiently.
             claimMaxAttempts: 8,
-            claimRetryInterval: 8000
+            claimRetryInterval: 8000,
+            // Ad-blocked devices get a text-only screen; the watchdog reloads
+            // the SDK in the background so unblocking resumes the ad itself.
+            adblockWatchdogInterval: 5000,
+            sdkCheckTimeout: 6000
         };
 
         // ========== СОСТОЯНИЕ ==========
@@ -189,6 +193,8 @@
         let noAdsShown = false; // no-ads screen visible (upgradeable to adblock)
         let sdkLoadFailed = false; // SDK known missing: skip retry loops, fail fast
         let adblockDetected = false; // DNS filtering blocks the ad SDK host
+        let sdkCheckRunning = false; // one SDK re-check at a time
+        let adblockWatchdogId = null; // background SDK reload while blocked
 
         const tg = window.Telegram.WebApp;
         const loaderView = document.getElementById('loader-view');
@@ -422,8 +428,10 @@
             adBtn.classList.remove('hidden');
         }
 
-        // Ad-blocked device: no ad SDK and no offer can ever load, so the
-        // only honest path left is the video itself.
+// Ad-blocked device: no ad view and no offer are possible. Text-only screen:
+// we do not hand out the video for free and we do not offer dead buttons —
+// just tell the user what to fix. A background watchdog reloads the SDK, so
+// returning to the app after disabling the blocker resumes the ad by itself.
         function showAdblock() {
             stopPolling();
             cancelRetry();
@@ -431,13 +439,87 @@
             loaderView.classList.add('hidden');
             contentView.classList.remove('hidden');
             document.getElementById('title').innerText = "🛡 Ad-block detected";
-            description.innerText = "Ads are blocked on this device, so no ad can be shown. Take the video below.";
-            claimBtn.innerText = "🎬 Get my video";
-            claimBtn.classList.remove('hidden');
+            description.innerText = "Ads cannot load while ad-blocking is on, so there is nothing to watch. Turn off ad-blocking for Telegram (your ad-blocker app, or the DNS / Private DNS setting) and come back — the ad will start automatically.";
+            claimBtn.classList.add('hidden');
             adBtn.classList.add('hidden');
-            directBtn.innerText = "🚀 Continue to Bot";
+            directBtn.classList.add('hidden');
+            armAdblockWatchdog();
+        }
+
+        // Polls for the SDK global: a fresh script tag may load and register it
+        // before onload fires, so the wait must not depend on the event.
+        function waitForSdk(ms) {
+            return new Promise((resolve) => {
+                const t0 = Date.now();
+                const iv = setInterval(() => {
+                    if (typeof window[AD_CONFIG.sdkFn] === 'function') {
+                        clearInterval(iv);
+                        resolve(true);
+                    } else if (Date.now() - t0 > ms) {
+                        clearInterval(iv);
+                        resolve(false);
+                    }
+                }, 200);
+            });
+        }
+
+        function armAdblockWatchdog() {
+            if (adblockWatchdogId) return;
+            adblockWatchdogId = setInterval(retrySdkSilently, AD_CONFIG.adblockWatchdogInterval);
+        }
+
+        function disarmAdblockWatchdog() {
+            if (adblockWatchdogId) {
+                clearInterval(adblockWatchdogId);
+                adblockWatchdogId = null;
+            }
+            sdkCheckRunning = false;
+        }
+
+        // Reload the SDK in the background and start the ad the moment it
+        // registers. No user interaction required.
+        function retrySdkSilently() {
+            if (sdkCheckRunning) return;
+            if (typeof window[AD_CONFIG.sdkFn] === 'function') {
+                startAdAttempt();
+                return;
+            }
+            sdkCheckRunning = true;
+            sdkLoadFailed = false;
+
+            let settled = false;
+            const finish = (ok) => {
+                if (settled) return;
+                settled = true;
+                sdkCheckRunning = false;
+                if (ok) startAdAttempt();
+            };
+
+            const script = document.createElement('script');
+            script.src = 'https://libtl.com/sdk.js';
+            script.async = true;
+            script.setAttribute('data-zone', AD_CONFIG.zone);
+            script.setAttribute('data-sdk', AD_CONFIG.sdkFn);
+            script.onerror = () => finish(false);
+            document.head.appendChild(script);
+
+            waitForSdk(AD_CONFIG.sdkCheckTimeout).then(finish);
+        }
+
+        function startAdAttempt() {
+            disarmAdblockWatchdog();
+            adblockDetected = false;
+            sdkLoadFailed = false;
+            // Stale flag from the first blocked load would otherwise bounce us
+            // straight back to the adblock screen.
+            window._sdkLoadFailed = false;
+            retryCount = 0;
+            popupTries = 0;
+            claimFired = false;
             directAction = 'close';
-            directBtn.classList.remove('hidden');
+            loaderView.classList.remove('hidden');
+            contentView.classList.add('hidden');
+            trySDKAd();
         }
 
         // Popup tries exhausted: deliver via the server timer backstop, no taps.
@@ -581,7 +663,7 @@
             autoClaim();
         });
 
-        // Continue button: 'popup' opens the quick offer, otherwise just close.
+        // Continue button: 'popup' opens the quick offer, otherwise close.
         directBtn.addEventListener('click', () => {
             if (directAction === 'popup') {
                 directAction = 'close';
@@ -594,9 +676,14 @@
 
         // Visibility API: Мгновенный запрос при возврате в приложение
         document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'visible' && isPolling) {
+            if (document.visibilityState !== 'visible') return;
+            if (isPolling) {
                 clearTimeout(pollTimeoutId); // Отменяем ожидание
                 doPoll(); // Делаем запрос ПРЯМО СЕЙЧАС
+            } else if (adblockDetected) {
+                // User most likely just switched off their ad-blocker: retry
+                // the SDK right away instead of waiting for the watchdog tick.
+                retrySdkSilently();
             }
         });
     </script>
