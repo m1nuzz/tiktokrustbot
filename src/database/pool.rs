@@ -19,7 +19,8 @@ pub struct UserInfo {
 }
 
 /// How a download request was unlocked (for delivery-reason stats).
-/// Verified = valued postback arrived; Timer = 20s age rule backstop;
+/// Verified = strict gate (valued impression plus watch plus click/90s);
+/// Timer = legacy 20s age-rule backstop (removed, kept for historic rows);
 /// Admin = admin bypass (no ad needed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimVia {
@@ -381,30 +382,92 @@ impl DatabasePool {
         .map_err(|e| anyhow::anyhow!("Failed to check impressions for {}: {}", ymid, e))
     }
 
-    /// Claim a download when unlocked: verified first, else the timer backstop
-    /// (pending older than ~20s). Atomic per attempt: concurrent claimants
-    /// (user tap vs valued auto-delivery) can't both succeed.
-    pub async fn claim_if_unlocked(&self, id: &str) -> Result<(i64, String, ClaimVia), anyhow::Error> {
-        // Strict path: a valued postback marked this row verified.
-        if let Ok((user_id, url)) = self.claim_verified_download(id).await {
-            return Ok((user_id, url, ClaimVia::Verified));
-        }
-        // Timer backstop: the user waited out the ad window.
+    /// Whether any click postback was journaled for this ymid (any reward:
+    /// a click proves the user engaged the creative, even an unpaid one).
+    pub async fn has_click_for_ymid(&self, id: &str) -> Result<bool, anyhow::Error> {
         let id_owned = id.to_string();
         self.execute_with_timeout(move |conn| {
-            let (user_id, url): (i64, String) = conn.query_row(
-                "SELECT user_id, video_url FROM pending_downloads WHERE id = ?1 AND status = 'pending' AND created_at < datetime('now', '-20 seconds')",
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM monetag_postbacks WHERE ymid = ?1 AND event_type = 'click'",
                 params![id_owned],
-                |row| Ok((row.get(0)?, row.get(1)?))
+                |row| row.get(0),
             )?;
-            conn.execute(
-                "UPDATE pending_downloads SET status = 'completed' WHERE id = ?1",
-                params![id_owned],
-            )?;
-            Ok((user_id, url, ClaimVia::Timer))
+            Ok(count > 0)
         })
         .await
-        .map_err(|e| anyhow::anyhow!("Download not unlocked yet for {}: {}", id, e))
+        .map_err(|e| anyhow::anyhow!("Failed to check clicks for {}: {}", id, e))
+    }
+
+    /// Unix time of the first valued postback for this ymid, if any.
+    /// CAST is required: strftime('%s', ...) yields TEXT in SQLite and
+    /// rusqlite cannot decode TEXT into i64.
+    pub async fn first_valued_at(&self, id: &str) -> Result<Option<i64>, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let ts: Option<i64> = conn
+                .query_row(
+                    "SELECT MIN(CAST(strftime('%s', created_at) AS INTEGER)) FROM monetag_postbacks WHERE ymid = ?1 AND reward_event_type = 'valued'",
+                    params![id_owned],
+                    |row| row.get(0),
+                )
+                .optional()
+                .flatten()
+                .flatten();
+            Ok(ts)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read first valued for {}: {}", id, e))
+    }
+
+    /// Whether a valued impression was journaled for this ymid (payment
+    /// proof). Stricter than has_ad_impression: the reward must be valued,
+    /// so a non-valued impression alone never unlocks a download.
+    pub async fn has_valued_impression(&self, id: &str) -> Result<bool, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM monetag_postbacks WHERE ymid = ?1 AND reward_event_type = 'valued' AND (event_type = 'impression' OR event_type IS NULL)",
+                params![id_owned],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to check valued impressions for {}: {}", id, e))
+    }
+
+    /// Strict delivery gate. A download unlocks iff ALL hold:
+    /// 1. a valued impression exists (payment proof),
+    /// 2. at least WATCH_SECS passed since the first valued (watch the ad),
+    /// 3. a click exists OR CLICK_WAIT_SECS passed since the first valued
+    ///    (click-less formats like popup can never send one).
+    /// No timer backstop: without any valued event the download stays locked.
+    /// Atomic per attempt via claim_verified_download.
+    pub async fn claim_if_ready(&self, id: &str) -> Result<(i64, String, ClaimVia), anyhow::Error> {
+        const WATCH_SECS: i64 = 15;
+        const CLICK_WAIT_SECS: i64 = 90;
+        if !self.has_valued_impression(id).await.unwrap_or(false) {
+            return Err(anyhow::anyhow!("not valued yet for {}", id));
+        }
+        let first = self
+            .first_valued_at(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no valued timestamp for {}", id))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let age = now.saturating_sub(first);
+        if age < WATCH_SECS {
+            return Err(anyhow::anyhow!("watch window not elapsed for {}", id));
+        }
+        if age < CLICK_WAIT_SECS && !self.has_click_for_ymid(id).await.unwrap_or(false) {
+            return Err(anyhow::anyhow!("no click yet for {}", id));
+        }
+        self.claim_verified_download(id)
+            .await
+            .map(|(u, url)| (u, url, ClaimVia::Verified))
+            .map_err(|e| anyhow::anyhow!("claim failed for {}: {}", id, e))
     }
 
     /// (valued, non_valued) postback counts for the last `days` days.
@@ -839,6 +902,10 @@ mod tests {
                 (),
             )?;
             conn.execute(
+                "CREATE TABLE monetag_postbacks (id INTEGER PRIMARY KEY, ymid TEXT NOT NULL, event_type TEXT DEFAULT NULL, reward_event_type TEXT NOT NULL, estimated_price REAL DEFAULT NULL, request_var TEXT DEFAULT NULL, sub_zone_id TEXT DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+                (),
+            )?;
+            conn.execute(
                 "CREATE TABLE blocks (id INTEGER PRIMARY KEY, telegram_id BIGINT NOT NULL, blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
                 (),
             )?;
@@ -1094,5 +1161,133 @@ mod tests {
         let premium_users = pool.get_premium_users().await.unwrap();
         assert_eq!(premium_users.len(), 1);
         assert_eq!(premium_users[0].0, 1);
+    }
+
+    /// Seed one pending row plus postback journals for claim_if_ready tests.
+    /// `postbacks` holds (event_type, reward, age_secs): age 0 means now.
+    async fn setup_gate_row(
+        pool: &DatabasePool,
+        id: &str,
+        status: &str,
+        pending_age_secs: i64,
+        postbacks: &[(&str, &str, i64)],
+    ) {
+        let id_owned = id.to_string();
+        let status_owned = status.to_string();
+        pool.execute_with_timeout(move |conn| {
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status, created_at) VALUES (?1, 7, 'http://v', ?2, datetime('now', ?3))",
+                params![id_owned, status_owned, format!("-{} seconds", pending_age_secs)],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        for (event, reward, age) in postbacks {
+            let id_owned = id.to_string();
+            let event_owned = event.to_string();
+            let reward_owned = reward.to_string();
+            pool.execute_with_timeout(move |conn| {
+                conn.execute(
+                    "INSERT INTO monetag_postbacks (ymid, event_type, reward_event_type, created_at) VALUES (?1, ?2, ?3, datetime('now', ?4))",
+                    params![id_owned, event_owned, reward_owned, format!("-{} seconds", age)],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_claim_if_ready_valued_click_ok() {
+        let (pool, _file) = setup_test_db().await;
+        // Valued impression 20s old (watch floor passed) plus an unpaid click.
+        setup_gate_row(
+            &pool,
+            "gate-click",
+            "verified",
+            30,
+            &[("impression", "valued", 20), ("click", "non_valued", 5)],
+        )
+        .await;
+        let (user_id, url, via) = pool.claim_if_ready("gate-click").await.unwrap();
+        assert_eq!(user_id, 7);
+        assert_eq!(url, "http://v");
+        assert_eq!(via, ClaimVia::Verified);
+        assert_eq!(
+            pool.get_pending_download_status("gate-click")
+                .await
+                .unwrap(),
+            Some("completed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_if_ready_valued_young_no_click_err() {
+        let (pool, _file) = setup_test_db().await;
+        // Valued impression just landed: the 15s watch floor still holds.
+        setup_gate_row(
+            &pool,
+            "gate-young",
+            "verified",
+            5,
+            &[("impression", "valued", 0)],
+        )
+        .await;
+        assert!(pool.claim_if_ready("gate-young").await.is_err());
+        assert_eq!(
+            pool.get_pending_download_status("gate-young")
+                .await
+                .unwrap(),
+            Some("verified".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_if_ready_valued_old_no_click_ok() {
+        let (pool, _file) = setup_test_db().await;
+        // Valued impression 95s old: the 90s click wait elapsed, so click-less
+        // formats (popup) deliver without any click postback.
+        setup_gate_row(
+            &pool,
+            "gate-old",
+            "verified",
+            100,
+            &[("impression", "valued", 95)],
+        )
+        .await;
+        let (_, _, via) = pool.claim_if_ready("gate-old").await.unwrap();
+        assert_eq!(via, ClaimVia::Verified);
+    }
+
+    #[tokio::test]
+    async fn test_claim_if_ready_no_valued_err() {
+        let (pool, _file) = setup_test_db().await;
+        // Only a non-valued impression: no payment proof, stays locked.
+        setup_gate_row(
+            &pool,
+            "gate-free",
+            "verified",
+            100,
+            &[("impression", "non_valued", 95)],
+        )
+        .await;
+        assert!(pool.claim_if_ready("gate-free").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_claim_if_ready_backstop_gone() {
+        let (pool, _file) = setup_test_db().await;
+        // 20s-old pending row with zero postbacks: the deleted timer backstop
+        // would have delivered this, the strict gate must not.
+        setup_gate_row(&pool, "gate-stale", "pending", 20, &[]).await;
+        assert!(pool.claim_if_ready("gate-stale").await.is_err());
+        assert_eq!(
+            pool.get_pending_download_status("gate-stale")
+                .await
+                .unwrap(),
+            Some("pending".to_string())
+        );
     }
 }

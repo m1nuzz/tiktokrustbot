@@ -18,13 +18,6 @@ use teloxide::prelude::*;
 /// Mini-app HTML embedded at compile time — no need to deploy the folder separately
 const MINI_APP_HTML: &str = include_str!("../mini-app/index.html");
 
-/// Watch-gate for valued deliveries. Monetag marks the impression valued at
-/// ad start, but the product deal is "watch the ad": the valued sequence
-/// (verify + claim + spawn) waits this long so neither the video nor an
-/// early client claim can jump the gate. Server-side wait, so closing the
-/// app loses nothing — the job still runs.
-const VERIFIED_DELIVERY_DELAY_SECS: u64 = 15;
-
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<DatabasePool>,
@@ -320,32 +313,54 @@ async fn monetag_postback(
         return axum::http::StatusCode::OK;
     }
 
-    let db = state.db.clone();
-    let ymid = query.ymid.clone();
-    // Watch-gate (see VERIFIED_DELIVERY_DELAY_SECS): hold the whole valued
-    // sequence so the video cannot be delivered before the ad was watched.
-    tokio::time::sleep(std::time::Duration::from_secs(
-        VERIFIED_DELIVERY_DELAY_SECS,
-    ))
-    .await;
-    if let Err(e) = db.mark_as_verified(&ymid).await {
-        log::error!("Failed to mark download as verified for ymid {}: {}", ymid, e);
-        return axum::http::StatusCode::OK;
-    }
-    log::info!("Download {} marked as VERIFIED (valued)", ymid);
+    let task_state = state.clone();
+    let task_ymid = query.ymid.clone();
+    // Detached valued sequence: Monetag times out slow postback responses,
+    // so the HTTP handler must answer 200 OK immediately. The whole valued
+    // sequence (verify, readiness wait, claim, spawn) runs in this task, and
+    // every outcome is logged — a silent task is as bad as the dropped
+    // handler future this replaces.
+    tokio::spawn(async move {
+        match task_state.db.mark_as_verified(&task_ymid).await {
+            Ok(()) => log::info!("Download {} marked as VERIFIED (valued)", task_ymid),
+            Err(e) => log::error!(
+                "Failed to mark download as verified for ymid {}: {}",
+                task_ymid,
+                e
+            ),
+        }
 
-    // Instant auto-delivery: the user may already browse another app/site.
-    // claim_verified_download is atomic single-use: if the user already
-    // claimed via mini-app, this returns Err and we skip (no doubles).
-    match db.claim_verified_download(&ymid).await {
-        Ok((user_id, url)) => {
-            log::info!("Auto-delivering download for user {} (valued postback)", user_id);
-            spawn_download_job(state, user_id, url, ymid, ClaimVia::Verified).await;
+        // Readiness wait loop: the strict gate (valued impression, 15s watch,
+        // click or 90s) may still be ahead of this postback, and duplicate
+        // postbacks are Monetag retries, so poll until the gate passes.
+        const POLL_SECS: u64 = 5;
+        const DEADLINE_SECS: u64 = 150;
+        let tries = DEADLINE_SECS / POLL_SECS;
+        for _ in 0..tries {
+            match task_state.db.claim_if_ready(&task_ymid).await {
+                Ok((user_id, url, via)) => {
+                    // Instant auto-delivery: the user may already browse
+                    // another app/site. claim_if_ready is atomic single-use:
+                    // if the user already claimed via mini-app, this returns
+                    // Err and we skip (no doubles).
+                    log::info!(
+                        "Auto-delivering download for user {} (valued postback)",
+                        user_id
+                    );
+                    spawn_download_job(task_state, user_id, url, task_ymid, via).await;
+                    return;
+                }
+                Err(e) => {
+                    log::info!("Auto-delivery not ready for ymid {}: {}", task_ymid, e);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
         }
-        Err(e) => {
-            log::info!("Auto-delivery skipped for ymid {} (likely already claimed): {}", ymid, e);
-        }
-    }
+        log::warn!(
+            "Valued delivery window elapsed for ymid {} without gate pass",
+            task_ymid
+        );
+    });
 
     axum::http::StatusCode::OK
 }
@@ -417,15 +432,16 @@ async fn claim_video(
     
     let is_admin = admins.contains(&user_id);
 
-    // 3. Attempt to claim: admin bypass, else verified-first then timer backstop
-    // (pending older than ~20s: the user waited out the ad window).
+    // 3. Attempt to claim: admin bypass, else the strict gate (valued
+    // impression plus 15s watch plus click-or-90s). No timer backstop:
+    // without a valued postback the download stays locked.
     let claim_result = if is_admin {
         log::info!("Admin detected (user {}), using bypass claim for ymid {}", user_id, ymid);
         db.claim_any_download(&ymid)
             .await
             .map(|(u, url)| (u, url, ClaimVia::Admin))
     } else {
-        db.claim_if_unlocked(&ymid).await
+        db.claim_if_ready(&ymid).await
     };
 
     match claim_result {

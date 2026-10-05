@@ -168,8 +168,9 @@
             pollInterval: 3000,
             maxPolls: 60, // ~3 min safety cap, then error screen
             popupMaxTries: 2,
-            // The server unlocks a pending row only after ~20s (ad window) or
-            // a valued postback, so a claim must be retried patiently.
+            // The server unlocks a pending row only via the strict gate
+            // (valued impression plus watch plus click-or-90s), so a claim
+            // must be retried patiently: early attempts answer "not yet".
             claimMaxAttempts: 8,
             claimRetryInterval: 8000,
             // Ad-blocked devices get a text-only screen; the watchdog reloads
@@ -201,7 +202,7 @@
             // Startup probe: how many times to (re)load the SDK and how long to
             // wait for it before declaring the device ad-blocked.
             sdkProbeAttempts: 2,
-            sdkProbeTimeout: 4000,
+            sdkProbeTimeout: 2000,
             // How long we wait for a show() call before treating the silence as
             // "never presented" (blocked) instead of "no fill".
             adTimeout: 25000,
@@ -211,7 +212,7 @@
             impressionRetries: 2,
             impressionRetryDelay: 1200,
             // Watch-gate: the Continue button (and the video, server-side via
-            // VERIFIED_DELIVERY_DELAY_SECS) only unlocks after the ad was
+            // the strict delivery gate) only unlocks after the ad was
             // displayed this long. Monetag marks the impression valued at ad
             // start, so without this gate both would jump ahead of watching.
             requiredWatchMs: 15000,
@@ -334,6 +335,16 @@
                     return;
                 }
 
+                // Already delivered (server auto-delivery won the race): the
+                // video is in the chat, so close instead of polling into a
+                // "taking too long" error for a delivered video.
+                if (data.status === 'completed') {
+                    isPolling = false;
+                    trackEvent('already_delivered');
+                    tg.close();
+                    return;
+                }
+
                 if (data.status === 'expired' || data.status === 'not_found') {
                     isPolling = false;
                     showError(t('MiniErrExpired'));
@@ -360,8 +371,8 @@
             if (isPolling) return;
             isPolling = true;
             pollCount = 0;
-            loaderText.innerText = t('MiniWaitVerifyTitle');
-            loaderSubtext.innerText = t('MiniWaitVerifySub');
+            // Poll silently: keep the current screen, never swap the loader
+            // to a "waiting for verification" text.
             doPoll();
         }
 
@@ -814,7 +825,8 @@
             'ad_resolve', 'ad_reject', 'ad_timeout', 'ad_throw',
             'oracle_impression', 'oracle_none', 'no_fill_screen', 'page_reload',
             'watchdog_recover', 'bonus_popup_shown', 'bonus_popup_tapped',
-            'adblock_popup_shown', 'adblock_popup_tapped', 'retry_suppressed'
+            'adblock_popup_shown', 'adblock_popup_tapped', 'retry_suppressed',
+            'claim_tapped', 'already_delivered'
         ]);
         const trackedSent = new Set();
 
@@ -948,7 +960,7 @@
             trySDKAd();
         }
 
-        // Popup tries exhausted: deliver via the server timer backstop, no taps.
+        // Popup tries exhausted: claim via the strict gate, no taps.
         function showGuaranteedClaim() {
             stopPolling();
             cancelRetry();
@@ -964,7 +976,7 @@
 
         // Single auto-claim: fired after any ad/popup resolves or when the user
         // takes the video, guarded so concurrent callers can't double-fire.
-        // The server unlocks a pending row only after the ad window passes, so
+        // The server answers "not yet" until the strict gate passes, so
         // this retries patiently instead of giving up and looking broken.
         async function autoClaim() {
             if (claimFired) return;
@@ -1016,7 +1028,7 @@
             directBtn.classList.add('hidden');
             // Watch-gate: the Continue appears only after the ad was actually
             // displayed for requiredWatchMs. The server holds delivery by the
-            // same amount (VERIFIED_DELIVERY_DELAY_SECS), so neither the
+            // same watch floor (strict gate), so neither the
             // button nor the video can jump ahead of watching.
             // Green Continue: the video is already on its way (server
             // auto-delivers on valued), so this tap is a pure bonus — a
@@ -1101,9 +1113,10 @@ if (data.enabled) {
         });
 
 // Claim button: the video itself. Re-arms the guard so a retry after an
-        // error works, and gives instant feedback while the server waits out
-        // the ad window.
+        // error works, and gives instant feedback while the server gate
+        // is still closed.
         claimBtn.addEventListener('click', () => {
+            trackEvent('claim_tapped');
             cancelRetry();
             stopPolling();
             claimFired = false;
