@@ -1879,6 +1879,106 @@ mod tests {
         );
     }
 
+    /// The two reads the mini-app's heartbeat and status probe depend on have a
+    /// fixed shape, and both "no deadline" cases must stay distinguishable from a
+    /// live one: the client treats an absent deadline as "keep waiting quietly"
+    /// and only ever compares a deadline the server handed it.
+    #[tokio::test]
+    async fn session_state_reports_status_and_deadline_in_one_read() {
+        let (pool, _file) = setup_test_db().await;
+        let live = pool.create_pending_download(11, "http://v").await.unwrap();
+        pool.execute_with_timeout(|conn| {
+            // A row from before the lease column existed: the status is real,
+            // the deadline simply does not exist yet.
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('pre-lease-row', 12, 'http://v', 'pending')",
+                (),
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let (status, deadline) = pool.get_session_state(&live).await.unwrap().unwrap();
+        assert_eq!(status, "pending");
+        assert!(
+            deadline.is_some(),
+            "a row created by the current build must carry a deadline"
+        );
+
+        let (legacy_status, legacy_deadline) =
+            pool.get_session_state("pre-lease-row").await.unwrap().unwrap();
+        assert_eq!(legacy_status, "pending");
+        assert!(
+            legacy_deadline.is_none(),
+            "a row without a lease reports none - never a computed guess"
+        );
+
+        // An unknown ymid reports no row at all, which is what the status
+        // endpoint turns into `not_found`.
+        assert!(
+            pool.get_session_state("never-existed")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Positive control: the heartbeat is what fills that gap in.
+        assert!(pool
+            .refresh_session_lease("pre-lease-row", SESSION_LEASE_SECS)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(pool
+            .get_session_state("pre-lease-row")
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .is_some());
+    }
+
+    /// The failure message hangs off this one column, so it is written once and
+    /// never moved: a repeated mark (the job's own error path after the sweeper
+    /// already looked) keeps the original start time, and an unknown ymid moves
+    /// nothing at all.
+    #[tokio::test]
+    async fn job_start_marker_is_written_once_and_is_row_scoped() {
+        let (pool, _file) = setup_test_db().await;
+        let ymid = pool.create_pending_download(21, "http://v").await.unwrap();
+
+        assert_eq!(pool.mark_job_started("no-such-ymid").await.unwrap(), 0);
+        assert_eq!(
+            row_count(&pool, "no-such-ymid").await,
+            0,
+            "an unknown ymid must not be invented"
+        );
+
+        assert_eq!(pool.mark_job_started(&ymid).await.unwrap(), 1);
+        let first = job_started_at(&pool, &ymid).await;
+        assert!(first.is_some(), "the first mark stamps the column");
+
+        assert_eq!(pool.mark_job_started(&ymid).await.unwrap(), 1);
+        assert_eq!(
+            job_started_at(&pool, &ymid).await,
+            first,
+            "a repeated mark must not move the original start time"
+        );
+    }
+
+    async fn job_started_at(pool: &DatabasePool, ymid: &str) -> Option<String> {
+        let ymid_owned = ymid.to_string();
+        pool.execute_with_timeout(move |conn| {
+            conn.query_row(
+                "SELECT job_started_at FROM pending_downloads WHERE id = ?1",
+                params![ymid_owned],
+                |row| row.get::<_, Option<String>>(0),
+            )
+        })
+        .await
+        .unwrap()
+    }
+
     async fn row_count(pool: &DatabasePool, ymid: &str) -> i64 {
         let ymid_owned = ymid.to_string();
         pool.execute_with_timeout(move |conn| {

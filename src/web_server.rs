@@ -1165,6 +1165,63 @@ mod tests {
         );
     }
 
+    /// Postback ordering: Monetag can journal a valued CLICK before the valued
+    /// IMPRESSION for the same event. The row becomes verified, but the gate -
+    /// a valued impression and nothing else - refuses, so nothing is delivered
+    /// and the row stays claimable for the impression that is still in flight.
+    /// This is the IS-3 guarantee on the server side: an unrewarded ad must not
+    /// look finished, and must not spawn a download job.
+    #[tokio::test]
+    async fn valued_click_before_the_impression_delivers_nothing() {
+        let (pool, _file) = crate::database::setup_test_db().await;
+        let db = Arc::new(pool);
+        crate::database::setup_gate_row(
+            &db,
+            "click-first",
+            "pending",
+            5,
+            &[("click", "valued", 1), ("impression", "non_valued", 2)],
+        )
+        .await;
+        assert!(
+            !db.has_valued_impression("click-first").await.unwrap(),
+            "a valued click and a non-valued impression are both outside the gate"
+        );
+
+        db.log_postback("click-first", Some("click"), "valued", None, None, None)
+            .await
+            .unwrap();
+        let outcome = run_valued_delivery(&db, "click-first").await;
+
+        assert_eq!(outcome, ValuedPostbackResult::NotValuedYet);
+        assert_eq!(
+            db.get_pending_download_status("click-first").await.unwrap(),
+            Some("verified".to_string()),
+            "the row stays claimable, it is not completed"
+        );
+        // The late valued impression is what delivers, on the next postback.
+        db.log_postback(
+            "click-first",
+            Some("impression"),
+            "valued",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            run_valued_delivery(&db, "click-first").await,
+            ValuedPostbackResult::Delivered { .. }
+        ));
+        assert_eq!(
+            db.get_pending_download_status("click-first")
+                .await
+                .unwrap(),
+            Some("completed".to_string())
+        );
+    }
+
     /// Stale-state probe: a valued postback for a row that can no longer be
     /// delivered must never spawn a job, whatever the postback claims.
     #[tokio::test]
