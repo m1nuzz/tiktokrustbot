@@ -73,6 +73,36 @@ pub struct AdsStatusQuery {
 #[derive(Serialize)]
 pub struct CheckStatusResponse {
     pub status: String,
+    /// Server-side lease deadline for this session, so the client learns the
+    /// deadline from the server instead of running a timer of its own.
+    /// NULL for rows created before the lease column existed.
+    pub lease_expires_at: Option<String>,
+}
+
+/// Lease heartbeat. The mini-app calls this while the webapp is open to push
+/// the row's lease forward; it is the only thing that keeps a session
+/// claimable beyond the initial window.
+///
+/// CLIENT HOOK (the client-side task must wire exactly this, in
+/// `mini-app/index.html`): POST `{"ymid": "<ymid>"}` to `/api/session-ping`
+/// every 60 seconds from load until the webapp is closed or the response says
+/// `live:false`. Start it as soon as the page loads, and stop it from the
+/// `visibilitychange`/`pagehide` handlers. Do NOT release or shrink the lease
+/// on close - just stop pinging: the server keeps the row alive for whatever
+/// remained of its lease (up to the ceiling), which is what lets a valued
+/// postback that Monetag sends while the user is on the advertiser's page
+/// still deliver.
+#[derive(Deserialize)]
+pub struct SessionPingRequest {
+    pub ymid: String,
+}
+
+#[derive(Serialize)]
+pub struct SessionPingResponse {
+    pub status: String,
+    pub lease_expires_at: Option<String>,
+    /// False for an unknown or terminal row: the client must stop pinging.
+    pub live: bool,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +166,7 @@ pub async fn start_web_server(state: AppState, port: u16) {
         .route("/api/ad-impression", get(get_ad_impression))
         .route("/api/mini-app-event", post(log_mini_app_event))
         .route("/api/claim-video", post(claim_video))
+        .route("/api/session-ping", post(session_ping))
         .fallback(serve_mini_app)
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -499,6 +530,62 @@ async fn monetag_postback(
     axum::http::StatusCode::OK
 }
 
+/// Built as a pure function so both the extended and the dead-end branch are
+/// testable without a Bot or an HTTP server.
+fn ping_response(status: &str, lease_expires_at: Option<String>, live: bool) -> SessionPingResponse {
+    SessionPingResponse {
+        status: status.to_string(),
+        lease_expires_at,
+        live,
+    }
+}
+
+async fn session_ping(
+    State(state): State<AppState>,
+    Json(payload): Json<SessionPingRequest>,
+) -> Json<SessionPingResponse> {
+    let db = state.db.clone();
+    let ymid = payload.ymid;
+
+    match db
+        .refresh_session_lease(&ymid, crate::database::SESSION_LEASE_SECS)
+        .await
+    {
+        Ok(Some((status, lease_expires_at))) => {
+            Json(ping_response(&status, Some(lease_expires_at), true))
+        }
+        // Unknown ymid, or a row that is already terminal: a heartbeat must
+        // never reanimate it, so tell the client to stop pinging.
+        Ok(None) => match db.get_pending_download_status(&ymid).await {
+            Ok(Some(status)) => Json(ping_response(&status, None, false)),
+            Ok(None) => Json(ping_response("not_found", None, false)),
+            Err(e) => {
+                log::error!("session-ping status read failed for {}: {}", ymid, e);
+                Json(ping_response("error", None, false))
+            }
+        },
+        Err(e) => {
+            log::error!("session-ping lease refresh failed for {}: {}", ymid, e);
+            Json(ping_response("error", None, false))
+        }
+    }
+}
+
+fn check_status_response(
+    state: Option<(String, Option<String>)>,
+) -> CheckStatusResponse {
+    match state {
+        Some((status, lease_expires_at)) => CheckStatusResponse {
+            status,
+            lease_expires_at,
+        },
+        None => CheckStatusResponse {
+            status: "not_found".to_string(),
+            lease_expires_at: None,
+        },
+    }
+}
+
 async fn check_ad_status(
     State(state): State<AppState>,
     Query(query): Query<CheckStatusQuery>,
@@ -506,12 +593,14 @@ async fn check_ad_status(
     let db = state.db.clone();
     let ymid = query.ymid.clone();
 
-    match db.get_pending_download_status(&ymid).await {
-        Ok(Some(status)) => Json(CheckStatusResponse { status }),
-        Ok(None) => Json(CheckStatusResponse { status: "not_found".to_string() }),
+    match db.get_session_state(&ymid).await {
+        Ok(snapshot) => Json(check_status_response(snapshot)),
         Err(e) => {
             log::error!("Error checking status for ymid {}: {}", ymid, e);
-            Json(CheckStatusResponse { status: "error".to_string() })
+            Json(check_status_response(Some((
+                "error".to_string(),
+                None,
+            ))))
         }
     }
 }
@@ -616,6 +705,41 @@ async fn claim_video(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The client must learn its deadline from the server: both the heartbeat
+    /// answer and the status check carry `lease_expires_at`, so no client timer
+    /// invents its own.
+    #[test]
+    fn ping_and_check_status_payloads_carry_the_server_lease() {
+        let deadline = "2026-10-07 12:00:00".to_string();
+
+        let live =
+            serde_json::to_string(&ping_response("verified", Some(deadline.clone()), true)).unwrap();
+        assert!(live.contains("\"lease_expires_at\":\"2026-10-07 12:00:00\""));
+        assert!(live.contains("\"live\":true"));
+
+        let status_payload = serde_json::to_string(&check_status_response(Some((
+            "pending".to_string(),
+            Some(deadline.clone()),
+        ))))
+        .unwrap();
+        assert!(status_payload.contains("\"lease_expires_at\":\"2026-10-07 12:00:00\""));
+        assert!(status_payload.contains("\"status\":\"pending\""));
+    }
+
+    /// A heartbeat for a delivered row must be told the session is over: no
+    /// lease is handed back (so the client stops its timer) and `live` is false.
+    #[test]
+    fn ping_response_for_a_terminal_row_carries_no_lease() {
+        let payload = serde_json::to_string(&ping_response("completed", None, false)).unwrap();
+        assert!(payload.contains("\"status\":\"completed\""));
+        assert!(payload.contains("\"live\":false"));
+        assert!(payload.contains("\"lease_expires_at\":null"));
+
+        let unknown = serde_json::to_string(&check_status_response(None)).unwrap();
+        assert!(unknown.contains("\"status\":\"not_found\""));
+        assert!(unknown.contains("\"lease_expires_at\":null"));
+    }
 
     /// Regression test: the STRINGS substitution must never emit a second
     /// `const STRINGS` declaration — that exact bug shipped once and killed

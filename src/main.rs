@@ -164,20 +164,28 @@ async fn main() -> Result<(), Error> {
         tiktokdownloader::web_server::start_web_server(web_server_state, web_port).await;
     });
 
-    // Expiry sweeper for abandoned download requests: every 60 seconds,
-    // expire rows older than 30 minutes and notify each user once in their
-    // own language. Legacy rows were retired silently at startup migration.
+    // Expiry sweeper for abandoned sessions: every 60 seconds, expire the
+    // sessions whose LEASE has lapsed - the lease is pushed forward by the
+    // client heartbeat while the mini-app is open, so a user still on the
+    // webapp is never cut off - and notify each user exactly once, in their
+    // own language, with the message that matches what actually happened.
+    //
+    // Rows are never deleted: the funnel and the per-ymid joins depend on
+    // them. Legacy rows were retired silently at startup migration.
     let sweep_db = db_pool.clone();
     let sweep_bot = bot.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            match sweep_db.expire_stale_pending(1800).await {
+            match sweep_db
+                .expire_stale_pending(tiktokdownloader::database::EXPIRY_BATCH_LIMIT)
+                .await
+            {
                 Ok(stale) => {
                     for (ymid, user_id) in stale {
                         let lang = sweep_db.get_effective_lang(user_id, None).await;
-                        log::warn!("Expiring abandoned download {} for user {}", ymid, user_id);
+                        log::warn!("Expiring abandoned session {} for user {}", ymid, user_id);
                         let _ = sweep_bot
                             .send_message(
                                 ChatId(user_id),

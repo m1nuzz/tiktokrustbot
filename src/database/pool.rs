@@ -31,6 +31,30 @@ pub enum ClaimVia {
     Admin,
 }
 
+/// Lease window pushed forward by every client heartbeat while the mini-app is
+/// open. The sweeper expires a row only once this window has lapsed, so an
+/// open webapp keeps its session claimable for as long as the user stays on it
+/// instead of being cut off at a fixed 30 minutes.
+pub const SESSION_LEASE_SECS: i64 = 1800;
+
+/// Hard ceiling for one session, measured from the row's creation: every
+/// heartbeat is clamped to it, so no row stays claimable forever even if a
+/// client keeps pinging. `completed` and `expired` remain the only exits and
+/// both are terminal.
+///
+/// Tradeoff: 24 hours is far longer than any real funnel step, and the whole
+/// point of the ceiling is that a valued postback Monetag sends minutes after
+/// the user left for the advertiser's page is still honoured while they are
+/// away. A session that is genuinely never finished therefore keeps its row
+/// (and its ad) alive for up to a day - the cost is a small amount of dead
+/// rows in the funnel, paid for so no earned reward is thrown away.
+pub const SESSION_LEASE_CEILING_SECS: i64 = 24 * 60 * 60;
+
+/// Rows one sweeper tick may notify, oldest first. Without a bound a service
+/// start would flush every accumulated backlog into chats in a single burst;
+/// whatever does not fit is notified by the following ticks.
+pub const EXPIRY_BATCH_LIMIT: u32 = 200;
+
 /// Per-day aggregates for the weekly admin report.
 #[derive(Debug, Clone)]
 pub struct WeeklyDayStats {
@@ -257,15 +281,21 @@ impl DatabasePool {
         }).await.map_err(|e| anyhow::anyhow!("Failed to set setting {}: {}", key, e))
     }
 
-    /// Create a pending download record and return its unique ID (ymid)
+    /// Create a pending download record and return its unique ID (ymid).
+    /// The row starts with a live lease so it is claimable from the first
+    /// second, before the client sends its first heartbeat.
     pub async fn create_pending_download(&self, user_id: i64, video_url: &str) -> Result<String, anyhow::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let id_owned = id.clone();
         let video_url_owned = video_url.to_string();
+        let lease_secs = SESSION_LEASE_SECS;
         
         self.execute_with_timeout(move |conn| {
             conn.execute(
-                "INSERT INTO pending_downloads (id, user_id, video_url) VALUES (?1, ?2, ?3)",
+                &format!(
+                    "INSERT INTO pending_downloads (id, user_id, video_url, lease_expires_at) VALUES (?1, ?2, ?3, datetime('now', '+{} seconds'))",
+                    lease_secs
+                ),
                 params![id_owned, user_id, video_url_owned],
             )?;
             Ok(())
@@ -492,6 +522,60 @@ impl DatabasePool {
         }).await.map_err(|e| anyhow::anyhow!("Failed to get status for {}: {}", id, e))
     }
 
+    /// Push an open session's lease `lease_secs` into the future and return
+    /// `(status, lease_expires_at)`, or `None` when there is nothing to extend:
+    /// an unknown ymid, or a row that is already terminal. The deadline is
+    /// clamped to `SESSION_LEASE_CEILING_SECS` from creation, and it is handed
+    /// back so the client learns the deadline from the server instead of
+    /// running a timer of its own.
+    ///
+    /// Closing the webapp deliberately does NOT release the lease. Telegram
+    /// fires `visibilitychange`/`pagehide` the moment the user leaves for the
+    /// advertiser's page, so a release-on-close would make the row terminal
+    /// while the user is away and the valued postback Monetag sends after that
+    /// close would be refused - exactly the "the video is in the chat on
+    /// return" case. Stopping the heartbeat only stops extending; the sweeper
+    /// still expires the row once the lease lapses.
+    pub async fn refresh_session_lease(&self, id: &str, lease_secs: i64) -> Result<Option<(String, String)>, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                &format!(
+                    "UPDATE pending_downloads SET lease_expires_at = min(datetime('now', '+{lease_secs} seconds'), datetime(created_at, '+{ceiling_secs} seconds')) WHERE id = ?1 AND status IN ('pending', 'verified') AND notified_at IS NULL",
+                    ceiling_secs = SESSION_LEASE_CEILING_SECS,
+                ),
+                params![&id_owned],
+            )?;
+            // Re-read instead of trusting the UPDATE count: the row must come
+            // back with a lease, which is what proves it was extended.
+            let row: Option<(String, String)> = conn.query_row(
+                "SELECT status, lease_expires_at FROM pending_downloads WHERE id = ?1 AND status IN ('pending', 'verified') AND lease_expires_at IS NOT NULL",
+                params![id_owned],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            Ok(row)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to refresh lease for {}: {}", id, e))
+    }
+
+    /// Status and lease deadline of one row in a single read, so a client
+    /// never pairs a status from one moment with a lease from another.
+    /// The lease is NULL for rows created before the lease column existed.
+    pub async fn get_session_state(&self, id: &str) -> Result<Option<(String, Option<String>)>, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let row: Option<(String, Option<String>)> = conn.query_row(
+                "SELECT status, lease_expires_at FROM pending_downloads WHERE id = ?1",
+                params![id_owned],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            Ok(row)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read session state for {}: {}", id, e))
+    }
+
     /// Record that a user blocked the bot (MyChatMember -> Banned).
     pub async fn record_block(&self, user_id: i64) -> Result<(), anyhow::Error> {
         self.execute_with_timeout(move |conn| {
@@ -622,25 +706,48 @@ impl DatabasePool {
         }).await.map_err(|e| anyhow::anyhow!("Failed to get ref stats: {}", e))
     }
 
-    /// Expire abandoned download requests older than `older_than_secs` and
-    /// return the ones that still need a user notification, marking them
-    /// notified atomically so a second run never double-notifies.
-    pub async fn expire_stale_pending(&self, older_than_secs: i64) -> Result<Vec<(String, i64)>, anyhow::Error> {
+    /// Expire sessions whose LEASE has lapsed and return the rows that still need
+    /// exactly one user notification, oldest first and bounded by `limit`.
+    ///
+    /// The predicate is the lease, not the row age: a heartbeat keeps an open
+    /// session claimable, so a user still sitting on the webapp is never
+    /// expired. `notified_at IS NULL` is the notify-once guard (a row already
+    /// messaged is never returned again) and the LIMIT keeps a service start
+    /// from flushing a backlog into chats in one burst.
+    ///
+    /// Each row is `(ymid, user_id)`. The row is never deleted; the funnel and
+    /// the per-ymid joins depend on it.
+    pub async fn expire_stale_pending(&self, limit: u32) -> Result<Vec<(String, i64)>, anyhow::Error> {
         self.execute_with_timeout(move |conn| {
-            let cutoff = format!("datetime('now', '-{} seconds')", older_than_secs);
-            let mut stmt = conn.prepare(&format!(
-                "SELECT id, user_id FROM pending_downloads WHERE status IN ('pending', 'verified') AND notified_at IS NULL AND created_at < {cutoff}"
-            ))?;
-            let rows: Vec<(String, i64)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .filter_map(|r| r.ok()).collect();
-            for (id, _) in &rows {
-                conn.execute(
-                    "UPDATE pending_downloads SET status = 'expired', notified_at = CURRENT_TIMESTAMP WHERE id = ?1",
-                    params![id],
+            let lease_secs = SESSION_LEASE_SECS;
+            let candidates: Vec<(String, i64)> = {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT id, user_id FROM pending_downloads WHERE status IN ('pending', 'verified') AND notified_at IS NULL AND COALESCE(lease_expires_at, datetime(created_at, '+{lease_secs} seconds')) < datetime('now') ORDER BY created_at ASC LIMIT ?1"
+                ))?;
+                stmt.query_map(params![limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .filter_map(|row| row.ok())
+                    .collect()
+            };
+            let mut expired_rows: Vec<(String, i64)> = Vec::new();
+            for (id, user_id) in candidates {
+                // The lease and the notify-once flag are re-checked in the
+                // write itself: a heartbeat that landed between the SELECT and
+                // here must keep the row, and a second sweeper tick must not
+                // notify the same row again.
+                let expired = conn.execute(
+                    &format!(
+                        "UPDATE pending_downloads SET status = 'expired', notified_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('pending', 'verified') AND notified_at IS NULL AND COALESCE(lease_expires_at, datetime(created_at, '+{lease_secs} seconds')) < datetime('now')"
+                    ),
+                    params![&id],
                 )?;
+                if expired == 1 {
+                    expired_rows.push((id, user_id));
+                }
             }
-            Ok(rows)
-        }).await.map_err(|e| anyhow::anyhow!("Failed to expire stale pending downloads: {}", e))
+            Ok(expired_rows)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to expire stale pending downloads: {}", e))
     }
 
     /// Check if user has active premium status
@@ -830,7 +937,7 @@ pub(crate) async fn setup_test_db() -> (DatabasePool, tempfile::NamedTempFile) {
             (),
         )?;
         conn.execute(
-            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL)",
+            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL)",
             (),
         )?;
         conn.execute(
@@ -900,6 +1007,34 @@ pub(crate) async fn setup_gate_row(
 mod tests {
     use super::*;
 
+    /// Seconds between a row's creation and its lease deadline, computed by
+    /// SQLite so the assertions never do timestamp arithmetic themselves.
+    async fn lease_span_secs(pool: &DatabasePool, ymid: &str) -> i64 {
+        let ymid_owned = ymid.to_string();
+        pool.execute_with_timeout(move |conn| {
+            conn.query_row(
+                "SELECT CAST(strftime('%s', lease_expires_at) AS INTEGER) - CAST(strftime('%s', created_at) AS INTEGER) FROM pending_downloads WHERE id = ?1",
+                params![ymid_owned],
+                |row| row.get(0),
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn shrink_lease_to_one_minute(pool: &DatabasePool, ymid: &str) {
+        let ymid_owned = ymid.to_string();
+        pool.execute_with_timeout(move |conn| {
+            conn.execute(
+                "UPDATE pending_downloads SET lease_expires_at = datetime('now', '+1 minute') WHERE id = ?1",
+                params![ymid_owned],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn test_settings_get_set() {
         let (pool, _file) = setup_test_db().await;
@@ -958,13 +1093,13 @@ mod tests {
             Ok(())
         }).await.unwrap();
 
-        let first = pool.expire_stale_pending(1800).await.unwrap();
+        let first = pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].0, "stale");
         assert_eq!(first[0].1, 2);
 
         // Second run: nothing left to notify.
-        let second = pool.expire_stale_pending(1800).await.unwrap();
+        let second = pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap();
         assert!(second.is_empty());
 
         // Stale row is expired now, fresh row still pending.
@@ -972,6 +1107,168 @@ mod tests {
         assert_eq!(status, Some("expired".to_string()));
         let status = pool.get_pending_download_status("fresh").await.unwrap();
         assert_eq!(status, Some("pending".to_string()));
+    }
+
+    /// The row survives because its lease is alive, and the heartbeat moves
+    /// that lease forward: the sweeper must leave the row alone.
+    #[tokio::test]
+    async fn heartbeat_extends_the_lease_and_the_sweeper_leaves_the_row_alone() {
+        let (pool, _file) = setup_test_db().await;
+        let ymid = pool.create_pending_download(42, "http://v").await.unwrap();
+        assert_eq!(lease_span_secs(&pool, &ymid).await, SESSION_LEASE_SECS);
+
+        // Pretend the last heartbeat was a while ago, so the deadline is close.
+        shrink_lease_to_one_minute(&pool, &ymid).await;
+        let (_, close_deadline) = pool.get_session_state(&ymid).await.unwrap().unwrap();
+        let close_deadline = close_deadline.unwrap();
+
+        let (status, renewed) = pool
+            .refresh_session_lease(&ymid, SESSION_LEASE_SECS)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, "pending");
+        assert!(
+            renewed > close_deadline,
+            "a heartbeat must push the deadline forward: {} is not later than {}",
+            renewed,
+            close_deadline
+        );
+
+        let swept = pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap();
+        assert!(swept.is_empty(), "a live lease must not be expired");
+        assert_eq!(
+            pool.get_pending_download_status(&ymid).await.unwrap(),
+            Some("pending".to_string())
+        );
+    }
+
+    /// A lapsed lease is expired and notified exactly once, and the row is
+    /// kept (never deleted) so the funnel and per-ymid joins still work.
+    #[tokio::test]
+    async fn lapsed_lease_is_expired_exactly_once_and_the_row_is_kept() {
+        let (pool, _file) = setup_test_db().await;
+        pool.execute_with_timeout(|conn| {
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, lease_expires_at) VALUES ('lapsed', 5, 'http://v', datetime('now', '-1 minute'))",
+                (),
+            )?;
+            Ok(())
+        }).await.unwrap();
+
+        let first = pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, "lapsed");
+
+        let second = pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap();
+        assert!(second.is_empty(), "notify-once: the second tick is silent");
+
+        let (status, lease) = pool.get_session_state("lapsed").await.unwrap().unwrap();
+        assert_eq!(status, "expired");
+        assert!(lease.is_some(), "the row itself must survive, not be deleted");
+    }
+
+    /// Stale-state probe: a heartbeat for a row that is already delivered is a
+    /// no-op. It must not extend anything and must not resurrect the row.
+    #[tokio::test]
+    async fn heartbeat_for_a_completed_row_changes_nothing() {
+        let (pool, _file) = setup_test_db().await;
+        pool.execute_with_timeout(|conn| {
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status, lease_expires_at) VALUES ('done', 6, 'http://v', 'completed', datetime('now', '+10 minutes'))",
+                (),
+            )?;
+            Ok(())
+        }).await.unwrap();
+        let (_, deadline_before) = pool.get_session_state("done").await.unwrap().unwrap();
+
+        assert!(
+            pool.refresh_session_lease("done", SESSION_LEASE_SECS)
+                .await
+                .unwrap()
+                .is_none(),
+            "a terminal row has no lease left to extend"
+        );
+        assert!(
+            pool.refresh_session_lease("never-existed", SESSION_LEASE_SECS)
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown ymid has no lease"
+        );
+
+        let (status, deadline_after) = pool.get_session_state("done").await.unwrap().unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(
+            deadline_after,
+            deadline_before,
+            "the deadline of a delivered row must be untouched"
+        );
+        assert!(pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap().is_empty());
+    }
+
+    /// The ceiling holds: no amount of pinging can push a row's lease past
+    /// 24 hours from its creation.
+    #[tokio::test]
+    async fn heartbeat_cannot_push_the_lease_past_the_ceiling() {
+        let (pool, _file) = setup_test_db().await;
+        pool.execute_with_timeout(|conn| {
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, created_at) VALUES ('almost-a-day-old', 8, 'http://v', datetime('now', '-23 hours'))",
+                (),
+            )?;
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url) VALUES ('brand-new', 9, 'http://v')",
+                (),
+            )?;
+            Ok(())
+        }).await.unwrap();
+
+        for ymid in ["brand-new", "almost-a-day-old"] {
+            assert!(
+                pool.refresh_session_lease(ymid, SESSION_LEASE_SECS)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{} must still be claimable",
+                ymid
+            );
+        }
+        assert!(lease_span_secs(&pool, "brand-new").await >= SESSION_LEASE_SECS);
+        assert_eq!(
+            lease_span_secs(&pool, "almost-a-day-old").await,
+            SESSION_LEASE_CEILING_SECS,
+            "a 23-hour-old session is clamped to the ceiling, not extended by 30 min"
+        );
+        assert!(pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap().is_empty());
+    }
+
+    /// A backlog must never be flushed into chats in one burst: the tick is
+    /// bounded and the rest waits for the next one.
+    #[tokio::test]
+    async fn expiry_batch_is_bounded_and_the_rest_waits_for_later_ticks() {
+        let (pool, _file) = setup_test_db().await;
+        let total = EXPIRY_BATCH_LIMIT as usize + 5;
+        pool.execute_with_timeout(move |conn| {
+            for i in 0..total {
+                conn.execute(
+                    "INSERT INTO pending_downloads (id, user_id, video_url, created_at, lease_expires_at) VALUES (?1, ?2, 'http://v', datetime('now', ?3), datetime('now', '-1 minute'))",
+                    params![format!("row-{:05}", i), i as i64, format!("-{} minutes", total - i)],
+                )?;
+            }
+            Ok(())
+        }).await.unwrap();
+
+        let first = pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap();
+        assert_eq!(first.len(), EXPIRY_BATCH_LIMIT as usize);
+        // Oldest first: row-00000 is the oldest of the batch.
+        assert_eq!(first[0].0, "row-00000");
+
+        let second = pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap();
+        assert_eq!(second.len(), 5, "the remainder goes out on the next tick");
+        assert!(
+            pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap().is_empty()
+        );
     }
 
     #[tokio::test]
