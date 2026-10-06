@@ -171,9 +171,10 @@
             pollInterval: 3000,
             maxPolls: 60, // ~3 min safety cap, then error screen
             popupMaxTries: 2,
-            // The server unlocks a pending row only via the strict gate
-            // (valued impression plus watch plus click-or-90s), so a claim
-            // must be retried patiently: early attempts answer "not yet".
+            // The server unlocks a pending row once Monetag's valued
+            // postback lands, which can trail the ad closing by seconds,
+            // so a claim is retried patiently: early attempts answer
+            // "not yet". The claim is single-use, so retries are safe.
             claimMaxAttempts: 8,
             claimRetryInterval: 8000,
             // Ad-blocked devices get a text-only screen; the watchdog reloads
@@ -1337,7 +1338,7 @@
             trySDKAd();
         }
 
-        // Popup tries exhausted: claim via the strict gate, no taps.
+        // Popup tries exhausted: claim straight away, no taps.
         function showGuaranteedClaim() {
             stopPolling();
             cancelRetry();
@@ -1353,8 +1354,8 @@
 
         // Single auto-claim: fired after any ad/popup resolves or when the user
         // takes the video, guarded so concurrent callers can't double-fire.
-        // The server answers "not yet" until the strict gate passes, so
-        // this retries patiently instead of giving up and looking broken.
+        // The server answers "not yet" until the valued postback has landed,
+        // so this retries patiently instead of giving up and looking broken.
         async function autoClaim() {
             if (claimFired) return;
             claimFired = true;
