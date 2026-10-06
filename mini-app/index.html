@@ -271,6 +271,7 @@
         let adblockWatchdogId = null; // background SDK reload while blocked
         let adAttemptToken = 0; // guards async ad verdicts against stale attempts
         let impressionSeen = false; // this ymid already presented an ad: no new show()
+        let adRequested = false; // an interstitial was already REQUESTED for this ymid
         let adShownAt = 0; // timestamp of the last show() call: proves one ran
         let watchedFastDelivered = false; // per ymid: one fast-path delivery, no doubles
         let sdkInjectCount = 0; // cache-buster for repeated SDK injections
@@ -648,12 +649,14 @@
         }
 
 // ========== LEVEL 1: SDK Ad ==========
-        function trySDKAd() {
+        function trySDKAd(fromRecovery) {
             // One ymid = one show: repeated show() calls with the same ymid
             // spam duplicate impression postbacks that Monetag prices at zero
             // (frequency/fraud filtering drove our CPM to dust). Once an
-            // impression exists, route to the quiet wait instead.
-            if (impressionSeen) {
+            // impression exists, route to the quiet wait instead. Background
+            // recovery is exempt: re-showing after a blocker was lifted is the
+            // whole point of that path, and it does not come from a retry tap.
+            if ((adRequested || impressionSeen) && !fromRecovery) {
                 trackEvent('retry_suppressed');
                 waitQuietlyForReward();
                 return;
@@ -670,6 +673,13 @@
             loaderText.innerText = t('MiniStartingAdTitle');
             loaderSubtext.innerText = t('MiniStartingAdSub');
             currentAdSource = 'sdk';
+            // Arm the cap the moment an interstitial is REQUESTED, not when it
+            // resolves: there is no oracle round-trip in front of the ad any
+            // more, so an unresolved first attempt would otherwise let a retry
+            // tap fire a second interstitial on the same ymid. Background
+            // recovery is exempt - re-showing after a blocker was lifted is
+            // exactly what it exists for.
+            if (!fromRecovery) adRequested = true;
 
             const token = ++adAttemptToken;
             // NOTE: the shipped SDK build does not implement `catchIfNoFeed`
@@ -861,28 +871,19 @@
                 showAdblock();
                 return;
             }
-            // Fresh page, impressed ymid (reopen/reload after an ad already
-            // presented): do not fire another show(), wait quietly for the
-            // reward instead.
-            if (await impressionKnown()) {
-                trackEvent('retry_suppressed');
-                waitQuietlyForReward();
-                return;
-            }
+            // No pre-show oracle round-trip here on purpose. It used to cost
+            // impressionRetries x impressionRetryDelay of dead time (2.4s) before
+            // the ad could appear, and it guards a case that session rotation
+            // already prevents: every press is handed its own ymid, so a fresh
+            // press cannot land on an impressed one. A reopen inside this same
+            // document is still covered by the in-memory impressionSeen flag,
+            // and the oracle is still consulted AFTER the ad settles, where it
+            // decides the claim.
             trySDKAd();
         }
 
         // Cap helper: has this ymid already produced an impression (this page
         // or an earlier one, e.g. before a reload)? If yes, no new show().
-        async function impressionKnown() {
-            if (impressionSeen) return true;
-            if (await hasAdImpression()) {
-                impressionSeen = true;
-                trackEvent('oracle_impression');
-                return true;
-            }
-            return false;
-        }
 
         // Injects the SDK script tag. Repeatable: used by the startup probe
         // and by the ad-block watchdog. onError lets the watchdog settle its
@@ -1335,7 +1336,7 @@
             // Background recovery (watchdog tick / return from the offer page):
             // it must be invisible and must not touch the current screen. The
             // ad overlay is its own visual; the loader view is never shown.
-            trySDKAd();
+            trySDKAd(true);
         }
 
         // Popup tries exhausted: claim straight away, no taps.
