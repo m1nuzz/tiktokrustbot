@@ -486,16 +486,20 @@ impl DatabasePool {
         estimated_price: Option<f64>,
         request_var: Option<&str>,
         sub_zone_id: Option<&str>,
+        zone_id: Option<&str>,
+        telegram_user_id: Option<&str>,
     ) -> Result<(), anyhow::Error> {
         let ymid_owned = ymid.to_string();
         let event_owned = event_type.map(|s| s.to_string());
         let reward_owned = reward_event_type.to_string();
         let request_owned = request_var.map(|s| s.chars().take(64).collect::<String>());
         let sub_owned = sub_zone_id.map(|s| s.chars().take(64).collect::<String>());
+        let zone_owned = zone_id.map(|s| s.chars().take(64).collect::<String>());
+        let telegram_owned = telegram_user_id.map(|s| s.chars().take(64).collect::<String>());
         self.execute_with_timeout(move |conn| {
             conn.execute(
-                "INSERT INTO monetag_postbacks (ymid, event_type, reward_event_type, estimated_price, request_var, sub_zone_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![ymid_owned, event_owned, reward_owned, estimated_price, request_owned, sub_owned],
+                "INSERT INTO monetag_postbacks (ymid, event_type, reward_event_type, estimated_price, request_var, sub_zone_id, zone_id, telegram_user_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![ymid_owned, event_owned, reward_owned, estimated_price, request_owned, sub_owned, zone_owned, telegram_owned],
             )?;
             Ok(())
         })
@@ -595,12 +599,22 @@ impl DatabasePool {
     ///
     /// The claim itself is the single-use atomic UPDATE in
     /// `claim_verified_download`, so concurrent callers cannot both deliver.
-    pub async fn claim_if_valued(
+    /// Claim a download for a session where an ad was really displayed.
+    ///
+    /// The proof is a journaled Monetag impression of ANY reward type, not a
+    /// `valued` one: the product rule is that finishing the ad earns the video,
+    /// and Monetag's `valued` / `non_valued` split decides what we are PAID for,
+    /// not whether the user may have what they watched through. A `valued`
+    /// impression is still tracked separately for revenue.
+    ///
+    /// The row must be `verified` - a real ad display is what verifies it - so
+    /// an empty `ymid` or a hand-made request cannot mint a download.
+    pub async fn claim_if_ad_presented(
         &self,
         id: &str,
     ) -> Result<(i64, String, ClaimVia), anyhow::Error> {
-        if !self.has_valued_impression(id).await.unwrap_or(false) {
-            return Err(anyhow::anyhow!("no valued impression for {}", id));
+        if !self.has_ad_impression(id).await.unwrap_or(false) {
+            return Err(anyhow::anyhow!("no ad impression for {}", id));
         }
         self.claim_verified_download(id)
             .await
@@ -1690,7 +1704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_claim_if_valued_valued_impression_delivers() {
+    async fn test_claim_if_ad_presented_valued_impression_delivers() {
         let (pool, _file) = setup_test_db().await;
         setup_gate_row(
             &pool,
@@ -1700,7 +1714,7 @@ mod tests {
             &[("impression", "valued", 20), ("click", "non_valued", 5)],
         )
         .await;
-        let (user_id, url, via) = pool.claim_if_valued("gate-valued").await.unwrap();
+        let (user_id, url, via) = pool.claim_if_ad_presented("gate-valued").await.unwrap();
         assert_eq!(user_id, 7);
         assert_eq!(url, "http://v");
         assert_eq!(via, ClaimVia::Verified);
@@ -1716,7 +1730,7 @@ mod tests {
     /// with no click and no age to spare, still delivers. Monetag already
     /// priced this impression, so our own timers must not refuse it.
     #[tokio::test]
-    async fn test_claim_if_valued_delivers_without_click_or_age() {
+    async fn test_claim_if_ad_presented_delivers_without_click_or_age() {
         let (pool, _file) = setup_test_db().await;
         setup_gate_row(
             &pool,
@@ -1726,7 +1740,7 @@ mod tests {
             &[("impression", "valued", 0)],
         )
         .await;
-        let (user_id, url, via) = pool.claim_if_valued("gate-fresh").await.unwrap();
+        let (user_id, url, via) = pool.claim_if_ad_presented("gate-fresh").await.unwrap();
         assert_eq!(user_id, 7);
         assert_eq!(url, "http://v");
         assert_eq!(via, ClaimVia::Verified);
@@ -1739,10 +1753,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_claim_if_valued_no_postback_err() {
+    async fn test_claim_if_ad_presented_no_postback_err() {
         let (pool, _file) = setup_test_db().await;
         setup_gate_row(&pool, "gate-silent", "verified", 600, &[]).await;
-        assert!(pool.claim_if_valued("gate-silent").await.is_err());
+        assert!(pool.claim_if_ad_presented("gate-silent").await.is_err());
         assert_eq!(
             pool.get_pending_download_status("gate-silent")
                 .await
@@ -1752,9 +1766,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_claim_if_valued_non_valued_impression_does_not_unlock() {
+    async fn test_claim_if_ad_presented_non_valued_impression_still_unlocks() {
         let (pool, _file) = setup_test_db().await;
-        // Monetag priced nothing here, so nothing is owed.
+        // Monetag priced this display at zero, but the user still sat through
+        // the ad, so the video is owed. Revenue is tracked separately; the
+        // reward split must not decide what the user gets.
         setup_gate_row(
             &pool,
             "gate-free",
@@ -1763,20 +1779,43 @@ mod tests {
             &[("impression", "non_valued", 595)],
         )
         .await;
-        assert!(pool.claim_if_valued("gate-free").await.is_err());
+        let (user_id, url, via) = pool.claim_if_ad_presented("gate-free").await.unwrap();
+        assert_eq!(user_id, 7);
+        assert_eq!(url, "http://v");
+        assert_eq!(via, ClaimVia::Verified);
         assert_eq!(
             pool.get_pending_download_status("gate-free").await.unwrap(),
+            Some("completed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_if_ad_presented_a_click_alone_never_unlocks() {
+        let (pool, _file) = setup_test_db().await;
+        // A click is a duplicate of a display we must already have journaled,
+        // so on its own it is not proof that an ad ran.
+        setup_gate_row(
+            &pool,
+            "gate-click-only",
+            "verified",
+            600,
+            &[("click", "valued", 599)],
+        )
+        .await;
+        assert!(pool.claim_if_ad_presented("gate-click-only").await.is_err());
+        assert_eq!(
+            pool.get_pending_download_status("gate-click-only").await.unwrap(),
             Some("verified".to_string())
         );
     }
 
     #[tokio::test]
-    async fn test_claim_if_valued_backstop_gone() {
+    async fn test_claim_if_ad_presented_backstop_gone() {
         let (pool, _file) = setup_test_db().await;
         // 20s-old pending row with zero postbacks: the deleted timer backstop
         // would have delivered this, the valued gate must not.
         setup_gate_row(&pool, "gate-stale", "pending", 20, &[]).await;
-        assert!(pool.claim_if_valued("gate-stale").await.is_err());
+        assert!(pool.claim_if_ad_presented("gate-stale").await.is_err());
         assert_eq!(
             pool.get_pending_download_status("gate-stale")
                 .await
@@ -1788,7 +1827,7 @@ mod tests {
     /// The postback path marks the row verified before it claims, so a row
     /// still sitting in `pending` is not deliverable yet.
     #[tokio::test]
-    async fn test_claim_if_valued_requires_verified_status() {
+    async fn test_claim_if_ad_presented_requires_verified_status() {
         let (pool, _file) = setup_test_db().await;
         setup_gate_row(
             &pool,
@@ -1798,7 +1837,7 @@ mod tests {
             &[("impression", "valued", 0)],
         )
         .await;
-        assert!(pool.claim_if_valued("gate-pending").await.is_err());
+        assert!(pool.claim_if_ad_presented("gate-pending").await.is_err());
         assert_eq!(
             pool.get_pending_download_status("gate-pending")
                 .await
@@ -1811,7 +1850,7 @@ mod tests {
     /// lands on an already-delivered row can neither redeliver nor resurrect
     /// the row.
     #[tokio::test]
-    async fn test_claim_if_valued_completed_row_never_delivers_twice() {
+    async fn test_claim_if_ad_presented_completed_row_never_delivers_twice() {
         let (pool, _file) = setup_test_db().await;
         setup_gate_row(
             &pool,
@@ -1821,11 +1860,11 @@ mod tests {
             &[("impression", "valued", 5)],
         )
         .await;
-        assert!(pool.claim_if_valued("gate-once").await.is_ok());
+        assert!(pool.claim_if_ad_presented("gate-once").await.is_ok());
 
         // Duplicate postbacks and a second client POST both arrive here.
-        assert!(pool.claim_if_valued("gate-once").await.is_err());
-        assert!(pool.claim_if_valued("gate-once").await.is_err());
+        assert!(pool.claim_if_ad_presented("gate-once").await.is_err());
+        assert!(pool.claim_if_ad_presented("gate-once").await.is_err());
         assert_eq!(
             pool.get_pending_download_status("gate-once").await.unwrap(),
             Some("completed".to_string())
@@ -1834,7 +1873,7 @@ mod tests {
 
     /// Race probe: two claims at once, exactly one wins.
     #[tokio::test]
-    async fn test_claim_if_valued_two_concurrent_claims_have_one_winner() {
+    async fn test_claim_if_ad_presented_two_concurrent_claims_have_one_winner() {
         let (pool, _file) = setup_test_db().await;
         setup_gate_row(
             &pool,
@@ -1849,8 +1888,8 @@ mod tests {
         let second_pool = pool.clone();
 
         let (first, second) = tokio::join!(
-            first_pool.claim_if_valued("gate-race"),
-            second_pool.claim_if_valued("gate-race")
+            first_pool.claim_if_ad_presented("gate-race"),
+            second_pool.claim_if_ad_presented("gate-race")
         );
 
         let winners = [first, second].iter().filter(|r| r.is_ok()).count();
@@ -2065,7 +2104,7 @@ mod tests {
         // Even once the impression journal has caught up, the request-time
         // marker keeps the ymid spent: the two signals are independent.
         pool.mark_ad_requested(&rotated.ymid).await.unwrap();
-        pool.log_postback(&rotated.ymid, Some("impression"), "valued", None, None, None)
+        pool.log_postback(&rotated.ymid, Some("impression"), "valued", None, None, None, None)
             .await
             .unwrap();
         let again = pool

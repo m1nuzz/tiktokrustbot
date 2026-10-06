@@ -1,5 +1,5 @@
 use axum::{
-    extract::{State, Query},
+    extract::{RawQuery, State, Query},
     routing::{get, post},
     Json, Router,
     response::Html,
@@ -47,6 +47,17 @@ pub struct PostbackQuery {
     pub request_var: Option<String>,
     #[serde(default, alias = "subZoneId", alias = "sub")]
     pub sub_zone_id: Option<String>,
+    // Placement attribution. Monetag documents both macros; we accepted only
+    // sub_zone_id and silently dropped zone_id, so a postback landing in a
+    // different zone looked identical to a normal one. Captured for diagnosis,
+    // and the raw query is logged so unknown macros are visible instead of
+    // being discarded by the extractor.
+    #[serde(default, alias = "zoneId", alias = "zone")]
+    pub zone_id: Option<String>,
+    // Monetag falls back to the Telegram user id when no ymid is supplied, so
+    // it is the only cross-check we have for attributing a stray postback.
+    #[serde(default, alias = "telegramId", alias = "telegram_id")]
+    pub telegram_user_id: Option<String>,
     // Optional shared secret (MONETAG_POSTBACK_SECRET env must match when set)
     #[serde(default)]
     pub secret: Option<String>,
@@ -531,7 +542,7 @@ enum ValuedPostbackResult {
 /// this runs many times per ymid and the atomic claim - not luck - is what
 /// keeps delivery at exactly one. Every outcome is logged: a silent task is as
 /// bad as the dropped handler future it replaced.
-async fn run_valued_delivery(db: &Arc<DatabasePool>, ymid: &str) -> ValuedPostbackResult {
+async fn deliver_after_ad_display(db: &Arc<DatabasePool>, ymid: &str) -> ValuedPostbackResult {
     let rows = match db.mark_as_verified_with_logging(ymid).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -578,7 +589,7 @@ async fn run_valued_delivery(db: &Arc<DatabasePool>, ymid: &str) -> ValuedPostba
     match claim_with_bounded_wait(AUTO_DELIVERY_ATTEMPTS, AUTO_DELIVERY_INTERVAL, move || {
         let claim_db = claim_db.clone();
         let claim_ymid = claim_ymid.clone();
-        async move { claim_db.claim_if_valued(&claim_ymid).await }
+        async move { claim_db.claim_if_ad_presented(&claim_ymid).await }
     })
     .await
     {
@@ -598,11 +609,27 @@ async fn run_valued_delivery(db: &Arc<DatabasePool>, ymid: &str) -> ValuedPostba
 async fn monetag_postback(
     State(state): State<AppState>,
     Query(query): Query<PostbackQuery>,
+    RawQuery(raw): RawQuery,
 ) -> impl axum::response::IntoResponse {
     let reward = query.reward_event_type.to_lowercase();
+    // The extractor drops any macro absent from PostbackQuery, so the parsed
+    // view can never tell us what we are NOT capturing. Log the raw query once
+    // per postback: an unexpected parameter has to be visible in the journal,
+    // not silently dropped.
+    if let Some(raw) = raw.as_deref() {
+        log::info!("Monetag postback query: {}", raw);
+    } else {
+        log::warn!("Monetag postback arrived with no query string to inspect");
+    }
     log::info!(
-        "Received Monetag postback: ymid={}, type={}, event={:?}, price={:?}",
-        query.ymid, reward, query.event_type, query.estimated_price
+        "Received Monetag postback: ymid={}, type={}, event={:?}, price={:?}, zone={:?}, sub_zone={:?}, placement={:?}",
+        query.ymid,
+        reward,
+        query.event_type,
+        query.estimated_price,
+        query.zone_id,
+        query.sub_zone_id,
+        query.request_var
     );
 
     // Optional shared secret: when MONETAG_POSTBACK_SECRET is set, requests
@@ -627,16 +654,34 @@ async fn monetag_postback(
             query.estimated_price,
             query.request_var.as_deref(),
             query.sub_zone_id.as_deref(),
+            query.zone_id.as_deref(),
+            query.telegram_user_id.as_deref(),
         )
         .await
     {
         log::error!("Failed to journal postback for ymid {}: {}", query.ymid, e);
     }
 
-    // Gate: only valued unlocks. Non-valued is counted above, nothing more.
-    if reward != "valued" {
-        log::info!("Non-valued postback for ymid {}, no unlock", query.ymid);
+    // Gate: a real ad DISPLAY earns the video, whatever Monetag valued it at.
+    // `valued` vs `non_valued` decides what we are paid, not what the user gets
+    // for sitting through the ad - that is the product rule. A click is a
+    // duplicate of a display we already have, so it never unlocks on its own.
+    // No display means no proof an ad ran, and an empty ymid stays locked.
+    let is_display = matches!(query.event_type.as_deref(), None | Some("impression"));
+    if !is_display {
+        log::info!(
+            "Postback for ymid {} is not a display (event={:?}, reward={}), nothing to unlock",
+            query.ymid,
+            query.event_type,
+            reward
+        );
         return axum::http::StatusCode::OK;
+    }
+    if reward != "valued" {
+        log::info!(
+            "Ad display for ymid {} was not valued - delivering anyway, revenue stays 0",
+            query.ymid
+        );
     }
 
     let task_state = state.clone();
@@ -644,7 +689,7 @@ async fn monetag_postback(
     // Detached valued sequence: Monetag times out slow postback responses,
     // so the HTTP handler must answer 200 OK immediately.
     tokio::spawn(async move {
-        match run_valued_delivery(&task_state.db, &task_ymid).await {
+        match deliver_after_ad_display(&task_state.db, &task_ymid).await {
             ValuedPostbackResult::Delivered { user_id, url, via } => {
                 // Instant auto-delivery: the user may already be browsing the
                 // advertiser's page, so the chat must not wait for a return.
@@ -800,7 +845,7 @@ async fn claim_video(
         claim_with_bounded_wait(CLAIM_WAIT_ATTEMPTS, CLAIM_WAIT_INTERVAL, move || {
             let claim_db = claim_db.clone();
             let claim_ymid = claim_ymid.clone();
-            async move { claim_db.claim_if_valued(&claim_ymid).await }
+            async move { claim_db.claim_if_ad_presented(&claim_ymid).await }
         })
         .await;
 
@@ -1122,11 +1167,11 @@ mod tests {
         // Mirror the handler: the postback is journaled before the delivery task
         // runs, and the journaled row IS the proof the gate reads. Without it this
         // ymid has no valued impression and the gate must refuse.
-        db.log_postback("valued-pending", Some("impression"), "valued", None, None, None)
+        db.log_postback("valued-pending", Some("impression"), "valued", None, None, None, None)
             .await
             .unwrap();
 
-        let outcome = run_valued_delivery(&db, "valued-pending").await;
+        let outcome = deliver_after_ad_display(&db, "valued-pending").await;
         assert_eq!(
             outcome,
             ValuedPostbackResult::Delivered {
@@ -1154,11 +1199,11 @@ mod tests {
 
         let mut deliveries = 0;
         for _ in 0..3 {
-            db.log_postback("retried", Some("impression"), "valued", None, None, None)
+            db.log_postback("retried", Some("impression"), "valued", None, None, None, None)
                 .await
                 .unwrap();
             if let ValuedPostbackResult::Delivered { .. } =
-                run_valued_delivery(&db, "retried").await
+                deliver_after_ad_display(&db, "retried").await
             {
                 deliveries += 1;
             }
@@ -1171,33 +1216,33 @@ mod tests {
         );
     }
 
-    /// Postback ordering: Monetag can journal a valued CLICK before the valued
-    /// IMPRESSION for the same event. The row becomes verified, but the gate -
-    /// a valued impression and nothing else - refuses, so nothing is delivered
-    /// and the row stays claimable for the impression that is still in flight.
-    /// This is the IS-3 guarantee on the server side: an unrewarded ad must not
-    /// look finished, and must not spawn a download job.
+    /// A click is not proof that an ad ran. Monetag can journal the CLICK for
+    /// an event before its IMPRESSION, so a click-only row must deliver nothing
+    /// and stay claimable. When the IMPRESSION lands - valued or not - the video
+    /// is owed, because finishing the ad is what earns it.
     #[tokio::test]
-    async fn valued_click_before_the_impression_delivers_nothing() {
+    async fn click_before_the_impression_delivers_nothing_until_a_display_lands() {
         let (pool, _file) = crate::database::setup_test_db().await;
         let db = Arc::new(pool);
-        crate::database::setup_gate_row(
-            &db,
-            "click-first",
-            "pending",
-            5,
-            &[("click", "valued", 1), ("impression", "non_valued", 2)],
-        )
-        .await;
+        crate::database::setup_gate_row(&db, "click-first", "pending", 5, &[]).await;
         assert!(
-            !db.has_valued_impression("click-first").await.unwrap(),
-            "a valued click and a non-valued impression are both outside the gate"
+            !db.has_ad_impression("click-first").await.unwrap(),
+            "a click on its own is not an ad display"
         );
 
-        db.log_postback("click-first", Some("click"), "valued", None, None, None)
-            .await
-            .unwrap();
-        let outcome = run_valued_delivery(&db, "click-first").await;
+        db.log_postback(
+            "click-first",
+            Some("click"),
+            "valued",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let outcome = deliver_after_ad_display(&db, "click-first").await;
 
         assert_eq!(outcome, ValuedPostbackResult::NotValuedYet);
         assert_eq!(
@@ -1213,11 +1258,13 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
         assert!(matches!(
-            run_valued_delivery(&db, "click-first").await,
+            deliver_after_ad_display(&db, "click-first").await,
             ValuedPostbackResult::Delivered { .. }
         ));
         assert_eq!(
@@ -1238,10 +1285,10 @@ mod tests {
         crate::database::setup_gate_row(&db, "too-late", "expired", 5, &[]).await;
 
         for ymid in ["already-done", "too-late", "never-existed"] {
-            db.log_postback(ymid, Some("impression"), "valued", None, None, None)
+            db.log_postback(ymid, Some("impression"), "valued", None, None, None, None)
                 .await
                 .unwrap();
-            let outcome = run_valued_delivery(&db, ymid).await;
+            let outcome = deliver_after_ad_display(&db, ymid).await;
             assert!(
                 matches!(&outcome, ValuedPostbackResult::NotDeliverable(_)),
                 "ymid {} must not deliver, got {:?}",

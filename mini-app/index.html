@@ -702,12 +702,12 @@
                     // intermediate screen.
                     if (await tryWatchedFastDeliver(token)) return;
                     if (token !== adAttemptToken) return;
-                    // Screen contract: the loading screen is up while an ad
-                    // attempt is in flight; the ad settling hides it and leaves
-                    // the page blank until delivery (tg.close) or a real content
-                    // card - nothing of ours changes in between, and a background
-                    // recovery (watchdog tick / return) never shows it again.
-                    loaderView.classList.add('hidden');
+                    // Monetag closes its own overlay when the user presses
+                    // Continue, so whatever we leave behind is what they see.
+                    // Keep the loading screen up while the reward settles:
+                    // blanking it here is what produced the empty window after
+                    // Continue. The screens that really answer (no-ads,
+                    // ad-blocked, valued, error) hide it themselves.
                     // Auto-claim first, then keep polling: whichever wins
                     // (claim gate or valued postback auto-delivery) delivers once.
                     autoClaim();
