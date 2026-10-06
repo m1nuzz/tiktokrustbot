@@ -139,11 +139,10 @@
     <div class="blob blob-2"></div>
 
     <div class="container">
-        <!-- Permanent: `hidden` stays forever, nothing may ever remove it. The
-             spinner card was rejected twice as a screen (it flashed after the
-             user pressed Continue in the ad), so no part of the flow may show
-             it — before the first content view, or while one is already up. -->
-        <div id="loader-view" class="spinner-container hidden">
+        <!-- The loading screen: it owns the first paint and stays up for as long
+             as an ad attempt is in flight. It is hidden again the moment the ad
+             settles, and a background recovery must never bring it back. -->
+        <div id="loader-view" class="spinner-container">
             <div class="spinner"></div>
             <h2 id="loader-text" style="font-size: 18px; color: var(--text-primary); margin: 0;">Loading...</h2>
             <span id="loader-subtext" style="font-size: 14px; color: var(--text-secondary);">Connecting to servers</span>
@@ -206,27 +205,21 @@
             // wait for it before declaring the device ad-blocked.
             sdkProbeAttempts: 2,
             sdkProbeTimeout: 2000,
-            // How long we wait for a show() call before treating the silence as
-            // "never presented" (blocked) instead of "no fill".
-            adTimeout: 25000,
+            // How long we wait for a show() call before giving up on its promise. This is
+            // belt-and-braces, NOT a proof: a fixed total timeout can never
+            // outlast a user-controlled close time plus Monetag's confirmation
+            // ladder (3 polls at 1.5s/3s/4.5s after the close, i.e. up to ~9s
+            // beyond it), so a late X can still exceed this. What actually
+            // closes that path is the timeout reclassification below (a timeout
+            // is decided by the server oracle, never by the clock), the bounded
+            // server-side wait and the server-side auto-delivery.
+            adTimeout: 45000,
             // Server oracle: whether Monetag ever journaled an ad view for this
             // ymid. Only the server knows; the client cannot infer it.
             impressionUrl: '/api/ad-impression',
             impressionRetries: 2,
             impressionRetryDelay: 1200,
-            // Watch-gate: the Continue button (and the video, server-side via
-            // the strict delivery gate) only unlocks after the ad was
-            // displayed this long. Monetag marks the impression valued at ad
-            // start, so without this gate both would jump ahead of watching.
-            requiredWatchMs: 15000,
         };
-
-        // Test hook: `?g=<ms>` overrides the watch gate so automated tests do
-        // not wait out production timings. Production links never set it.
-        try {
-            const gOverride = parseInt(new URLSearchParams(window.location.search).get('g'), 10);
-            if (Number.isFinite(gOverride) && gOverride >= 0) AD_CONFIG.requiredWatchMs = gOverride;
-        } catch (e) {}
 
         // ========== СОСТОЯНИЕ ==========
         let retryCount = 0;
@@ -245,7 +238,7 @@
         let adblockWatchdogId = null; // background SDK reload while blocked
         let adAttemptToken = 0; // guards async ad verdicts against stale attempts
         let impressionSeen = false; // this ymid already presented an ad: no new show()
-        let adShownAt = 0; // timestamp of the last show() call (watch-gate)
+        let adShownAt = 0; // timestamp of the last show() call: proves one ran
         let watchedFastDelivered = false; // per ymid: one fast-path delivery, no doubles
         let sdkInjectCount = 0; // cache-buster for repeated SDK injections
         let bonusPopupDone = false; // bonus offer already taken: no second round
@@ -255,6 +248,8 @@
 
         const tg = window.Telegram.WebApp;
         const loaderView = document.getElementById('loader-view');
+        const loaderText = document.getElementById('loader-text');
+        const loaderSubtext = document.getElementById('loader-subtext');
         const contentView = document.getElementById('content-view');
         const adBtn = document.getElementById('ad-btn');
         const claimBtn = document.getElementById('claim-btn');
@@ -398,6 +393,8 @@
                 showAdblock();
                 return;
             }
+            loaderText.innerText = t('MiniStartingAdTitle');
+            loaderSubtext.innerText = t('MiniStartingAdSub');
             currentAdSource = 'sdk';
 
             const token = ++adAttemptToken;
@@ -422,11 +419,17 @@
                     if (token !== adAttemptToken) return;
                     trackEvent('ad_resolve');
                     impressionSeen = true; // a resolved show presented an ad
-                    // Fast path first: an X-press after a full watch ends
-                    // the call as a resolve too, and must deliver + close
-                    // without an intermediate screen.
+                    // Fast path first: closing the ad ends the show() call as a
+                    // resolve too, and must deliver + close without an
+                    // intermediate screen.
                     if (await tryWatchedFastDeliver(token)) return;
                     if (token !== adAttemptToken) return;
+                    // Screen contract: the loading screen is up while an ad
+                    // attempt is in flight; the ad settling hides it and leaves
+                    // the page blank until delivery (tg.close) or a real content
+                    // card - nothing of ours changes in between, and a background
+                    // recovery (watchdog tick / return) never shows it again.
+                    loaderView.classList.add('hidden');
                     // Auto-claim first, then keep polling: whichever wins
                     // (claim gate or valued postback auto-delivery) delivers once.
                     autoClaim();
@@ -434,8 +437,11 @@
                 })
                 .catch((e) => {
                     console.error("Ad failed", e);
-                    // A timeout means nothing was ever presented (the ad call
-                    // hung), so it is treated as blocking, not as no-fill.
+                    // A timeout is our own clock giving up, not proof that nothing
+                    // was ever presented: the user may have watched the ad and
+                    // closed it late while Monetag's confirmation ladder was
+                    // still running. So it is never treated as blocking here -
+                    // handleAdFailure() decides it through the server oracle.
                     const kind = (e && typeof e.message === 'string' && e.message.indexOf('timeout') !== -1)
                         ? 'timeout'
                         : 'reject';
@@ -453,13 +459,13 @@
         // call looked dead):
         //   a view    -> the ad was presented -> no-fill screen (working claim)
         //   no view   -> nothing was ever presented -> ad-blocked, text-only
-        // Fast path for an X-press after a full watch: the show() call
-        // settled (resolve or reject/timeout — closing the ad ends the call
-        // either way) after the ad was displayed for the full watch gate,
-        // and the server oracle confirms an impression for this ymid. One
-        // attested claim-video POST (watched_full:true); success closes the
-        // webapp at once with no intermediate screen. Anything else returns
-        // false so the caller falls through to the existing flow unchanged.
+        // Fast path for an ad that was really shown: the show() call settled
+        // (resolve or reject/timeout - closing the ad ends the call either way)
+        // and the server oracle confirms an impression for this ymid. Monetag
+        // owns the duration, so the client attests nothing: one claim-video POST
+        // carrying only the ymid, and success closes the webapp at once with no
+        // intermediate screen. Anything else returns false so the caller falls
+        // through to the existing flow unchanged.
         // Token-guarded throughout: a stale attempt never closes the app or
         // disturbs a newer attempt (the token check and the claimFired set
         // run with no await between them, so no newer attempt can slip in
@@ -469,7 +475,6 @@
             if (token !== adAttemptToken) return false;
             if (watchedFastDelivered || claimFired) return false;
             if (!adShownAt) return false;
-            if (Date.now() - adShownAt < AD_CONFIG.requiredWatchMs) return false;
             let hadView = false;
             try {
                 hadView = await hasAdImpression();
@@ -479,12 +484,12 @@
             if (token !== adAttemptToken) return false;
             if (!hadView) return false;
             trackEvent('oracle_impression');
-            claimFired = true; // single attested claim for this attempt
+            claimFired = true; // single claim for this attempt
             try {
                 const res = await fetch(`${apiBase}/api/claim-video`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ ymid: ymid, watched_full: true })
+                    body: JSON.stringify({ ymid: ymid })
                 });
                 const data = await res.json();
                 if (token !== adAttemptToken) return false;
@@ -503,21 +508,30 @@
 
         async function handleAdFailure(kind, token) {
             if (token !== adAttemptToken) return;
-            // X-press after a full watch delivers + closes without any
+            loaderView.classList.add('hidden');
+            // An ad that was really shown delivers + closes without any
             // intermediate screen; anything else falls through unchanged.
             if (await tryWatchedFastDeliver(token)) return;
             if (token !== adAttemptToken) return;
-            // Even a timeout consults the oracle: on iOS the user may have
-            // tapped the creative and left for the offer page while show()
-            // stayed pending. Declaring "blocked" without asking strands them
-            // on the adblock screen when they come back.
+            // A timeout is our own clock, not a verdict: on iOS the user may
+            // have tapped the creative and left for the offer page, or closed
+            // the ad late, while show() stayed pending. Declaring "blocked"
+            // without asking strands them on the adblock screen when they come
+            // back - so every kind, timeout included, is decided by the oracle.
             const hadView = await hasAdImpression();
             if (token !== adAttemptToken) return;
             trackEvent(hadView ? 'oracle_impression' : 'oracle_none');
-            if (hadView) {
-                showNoAds();
-            } else {
+            if (!hadView) {
                 showAdblock();
+            } else if (kind === 'timeout') {
+                // The ad was presented and we simply lost the promise to it, so
+                // with an impression on record it is handled exactly like a
+                // resolve: one claim attempt, then poll silently for the valued
+                // postback. Only a definitive "no view" is blocking.
+                autoClaim();
+                startPolling();
+            } else {
+                showNoAds();
             }
         }
 
@@ -552,6 +566,8 @@
         // blockers answer with a stub page instead of failing — so the only
         // reliable test is loading the SDK script itself.
         async function startAdFlow() {
+            loaderText.innerText = t('MiniCheckingNetTitle');
+            loaderSubtext.innerText = t('MiniCheckingNetSub');
             trackEvent('probe_start');
             for (let attempt = 1; attempt <= AD_CONFIG.sdkProbeAttempts; attempt++) {
                 if (typeof window[AD_CONFIG.sdkFn] === 'function') { break; }
@@ -648,6 +664,8 @@
                 return;
             }
             popupTries++;
+            loaderText.innerText = t('MiniOpeningOfferTitle');
+            loaderSubtext.innerText = t('MiniOpeningOfferSub');
             const token = ++adAttemptToken;
             try {
                 adShownAt = Date.now();
@@ -660,10 +678,11 @@
                 sdkWithTimeout(popupPromise, AD_CONFIG.adTimeout, 'popup')
                     .then(async () => {
                         if (token !== adAttemptToken) return;
-                        // Same fast path as the interstitial resolve: a full
-                        // watch ended by the X delivers + closes at once.
+                        // Same fast path as the interstitial resolve: closing the offer
+                        // delivers + closes at once.
                         if (await tryWatchedFastDeliver(token)) return;
                         if (token !== adAttemptToken) return;
+                        loaderView.classList.add('hidden');
                         // Auto-claim first, then keep polling: whichever wins
                         // (claim gate or valued postback auto-delivery) delivers once.
                         autoClaim();
@@ -671,9 +690,13 @@
                     })
                     .catch((e) => {
                         console.error("Popup failed", e);
+                        // Same rule as the interstitial: a timeout is our clock
+                        // running out, never proof that no offer was presented,
+                        // so it is the oracle that classifies it.
                         const kind = (e && typeof e.message === 'string' && e.message.indexOf('timeout') !== -1)
                             ? 'timeout'
                             : 'reject';
+                        trackEvent(kind === 'timeout' ? 'ad_timeout' : 'ad_reject');
                         handleAdFailure(kind, token);
                     });
             } catch (e) {
@@ -1085,37 +1108,24 @@
             claimBtn.classList.add('hidden');
             adBtn.classList.add('hidden');
             directBtn.classList.add('hidden');
-            // Watch-gate: the Continue appears only after the ad was actually
-            // displayed for requiredWatchMs. The server holds delivery by the
-            // same watch floor (strict gate), so neither the
-            // button nor the video can jump ahead of watching.
+            // Monetag owns the duration and the client no longer keeps a watch
+            // clock of its own, so there is nothing left to wait for here: the
+            // valued/green Continue appears as soon as the server reports the
+            // row delivered, with no client-side watch wait.
             // Green Continue: the video is already on its way (server
             // auto-delivers on valued), so this tap is a pure bonus — a
             // popup offer that can only add revenue, never lose the video.
             // After the bonus was taken once, the button is a plain close
             // so returning from the offer cannot loop back into another one.
-            const revealToken = adAttemptToken;
-            const revealContinue = () => {
-                if (revealToken !== adAttemptToken) return;
-                if (contentView.classList.contains('hidden')) return;
-                if (document.getElementById('title').innerText !== t('MiniSuccessTitle')) return;
-                if (bonusPopupDone) {
-                    directBtn.innerText = t('MiniBtnContinueBot');
-                    directAction = 'close';
-                } else {
-                    directBtn.innerText = t('MiniBtnContinue');
-                    directAction = 'bonus_popup';
-                    trackEvent('bonus_popup_shown');
-                }
-                directBtn.classList.remove('hidden');
-            };
-            const waitMs = AD_CONFIG.requiredWatchMs - (Date.now() - (adShownAt || 0));
-            if (waitMs > 0) {
-                description.innerText = t('MiniThanksWatching');
-                setTimeout(revealContinue, waitMs);
+            if (bonusPopupDone) {
+                directBtn.innerText = t('MiniBtnContinueBot');
+                directAction = 'close';
             } else {
-                revealContinue();
+                directBtn.innerText = t('MiniBtnContinue');
+                directAction = 'bonus_popup';
+                trackEvent('bonus_popup_shown');
             }
+            directBtn.classList.remove('hidden');
             autoClaim();
 
             if (tg.HapticFeedback) {
@@ -1124,6 +1134,8 @@
         }
 
         // ========== ИНИЦИАЛИЗАЦИЯ ==========
+        loaderText.innerText = t('MiniLoadingTitle');
+        loaderSubtext.innerText = t('MiniLoadingSub');
         tg.ready();
         tg.expand();
         // No claim buttons anywhere: keep the main button hidden defensively.
@@ -1164,8 +1176,10 @@ if (data.enabled) {
             claimFired = false; // new attempt: allow one auto-claim
             adBtn.classList.add('hidden');
             claimBtn.classList.add('hidden');
-            // The attempt itself is the ad overlay; the card underneath is
-            // left exactly as it is instead of switching to the loader view.
+            // A tapped retry is a fresh ad fetch, so the loading screen comes
+            // back for it: there is nothing to read on the card meanwhile.
+            loaderView.classList.remove('hidden');
+            contentView.classList.add('hidden');
             trySDKAd();
         });
 
