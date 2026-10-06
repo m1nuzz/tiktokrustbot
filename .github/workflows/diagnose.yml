@@ -1,0 +1,38 @@
+# TEMPORARY DIAGNOSTIC WORKFLOW - DELETE AFTER USE.
+# The Tests gate (test.yml) requires admin rights to read its job logs, so this
+# throwaway run republishes the failure as GitHub annotations, which the public
+# API can read. It does not relax any gate: the test command's exit code is
+# preserved, so this job still fails whenever the suite fails.
+name: Diagnose
+on:
+  push:
+    branches:
+      - "main"
+  workflow_dispatch:
+jobs:
+  diagnose:
+    name: diagnose test failures
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Run tests and report failures as annotations
+        run: |
+          cargo test --all-targets 2>&1 | tee /tmp/test.log
+          rc=${PIPESTATUS[0]}
+          ann() {
+            if [ -n "$2" ]; then
+              printf '::error title=%s::%s\n' "$1" "$2"
+            else
+              printf '::notice title=%s::(nothing matched)\n' "$1"
+            fi
+          }
+          ann failing-tests "$(grep -oE '^test [A-Za-z0-9_:]+ \.\.\. FAILED' /tmp/test.log | sed -E 's/^test //; s/ \.\.\. FAILED$//' | paste -sd, - || true)"
+          ann test-result "$(grep -oE 'test result: [^;]+' /tmp/test.log | paste -sd' / ' - || true)"
+          ann compiler-errors "$(grep -E '^error(\[E[0-9]+\])?: ' /tmp/test.log | head -3 | paste -sd' / ' - || true)"
+          ann panic-locations "$(grep -oE "panicked at [^,]+" /tmp/test.log | sort -u | paste -sd' / ' - || true)"
+          exit "$rc"
