@@ -8,7 +8,7 @@ use axum::http::{header, HeaderMap, HeaderValue};
 use tower_http::cors::CorsLayer;
 use std::sync::Arc;
 use std::time::Duration;
-use crate::database::{ClaimVia, DatabasePool};
+use crate::database::{ClaimVia, DatabasePool, SessionYmid};
 use crate::yt_dlp_interface::YoutubeFetcher;
 use crate::mtproto_uploader::MTProtoUploader;
 use crate::utils::task_manager::TaskManager;
@@ -110,6 +110,70 @@ pub struct AdImpressionQuery {
     pub ymid: String,
 }
 
+/// One ad event = one ymid. Monetag's docs require a unique ymid per event and
+/// leave frequency capping to the publisher, and live traffic showed one ymid
+/// accumulating valued impression+click pairs for eight hours (duplicate
+/// impressions are priced at zero).
+///
+/// The mini-app calls this once at load, before any ad call, and then uses the
+/// returned ymid for every show_*() and every API call. The entry ymid is the one
+/// the bot button put in the URL.
+#[derive(Deserialize)]
+pub struct NewSessionRequest {
+    pub ymid: String,
+}
+
+#[derive(Serialize)]
+pub struct NewSessionResponse {
+    /// False means "keep the ymid you already have": rotation must never block
+    /// the funnel, so every failure path answers this instead of an error the
+    /// client would have to handle as fatal.
+    pub success: bool,
+    pub ymid: String,
+    pub reused: bool,
+}
+
+fn new_session_response(session: SessionYmid) -> NewSessionResponse {
+    NewSessionResponse {
+        success: true,
+        ymid: session.ymid,
+        reused: session.reused,
+    }
+}
+
+fn new_session_refusal(ymid: &str) -> NewSessionResponse {
+    NewSessionResponse {
+        success: false,
+        ymid: ymid.to_string(),
+        reused: false,
+    }
+}
+
+async fn new_session(
+    State(state): State<AppState>,
+    Json(payload): Json<NewSessionRequest>,
+) -> Json<NewSessionResponse> {
+    match state.db.resolve_session_ymid(&payload.ymid).await {
+        Ok(Some(session)) => {
+            log::info!(
+                "Session rotation for entry ymid {}: {} ({})",
+                payload.ymid,
+                session.ymid,
+                if session.reused { "reused" } else { "minted" }
+            );
+            Json(new_session_response(session))
+        }
+        Ok(None) => {
+            log::warn!("Session rotation for unknown entry ymid {}", payload.ymid);
+            Json(new_session_refusal(&payload.ymid))
+        }
+        Err(e) => {
+            log::error!("Session rotation failed for {}: {}", payload.ymid, e);
+            Json(new_session_refusal(&payload.ymid))
+        }
+    }
+}
+
 /// Unchanged wording on purpose: the mini-app renders its own localised text,
 /// so this string is only the API/log field.
 const CLAIM_PENDING_ERROR: &str =
@@ -201,6 +265,7 @@ pub async fn start_web_server(state: AppState, port: u16) {
         .route("/api/mini-app-event", post(log_mini_app_event))
         .route("/api/claim-video", post(claim_video))
         .route("/api/session-ping", post(session_ping))
+        .route("/api/new-session", post(new_session))
         .fallback(serve_mini_app)
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -880,9 +945,42 @@ mod tests {
         assert_eq!(unknown["status"], "not_found");
     }
 
+    /// Rotation must never block the funnel: a refusal answers 200 with
+    /// `success:false` and hands the client back the ymid it already had, so the
+    /// ad can still run under it.
     #[test]
-    fn classify_verify_separates_moved_already_verified_and_terminal() {
-        assert_eq!(
+    fn new_session_refusal_hands_the_entry_ymid_back() {
+        let refused = new_session_refusal("entry-ymid");
+        assert!(!refused.success);
+        assert_eq!(refused.ymid, "entry-ymid");
+        assert!(!refused.reused);
+    }
+
+    /// The success answer is what the client adopts: the new ymid plus whether an
+    /// existing row was reused, which is the observable difference between the
+    /// cheap path and a mint.
+    #[test]
+    fn new_session_success_carries_the_ymid_and_the_reuse_flag() {
+        let minted = new_session_response(SessionYmid {
+            ymid: "fresh".to_string(),
+            reused: false,
+        });
+        let payload = serde_json::to_string(&minted).unwrap();
+        assert!(payload.contains("\"success\":true"));
+        assert!(payload.contains("\"ymid\":\"fresh\""));
+        assert!(payload.contains("\"reused\":false"));
+
+        let reused = new_session_response(SessionYmid {
+            ymid: "entry".to_string(),
+            reused: true,
+        });
+        assert!(serde_json::to_string(&reused)
+            .unwrap()
+            .contains("\"reused\":true"));
+    }
+
+    #[test]
+    fn classify_verify_separates_moved_already_verified_and_terminal() {        assert_eq!(
             classify_verify(1, Some("verified")),
             VerifyOutcome::Verified
         );

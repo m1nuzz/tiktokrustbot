@@ -233,6 +233,18 @@
             // Bounded wait for the one status probe that picks the first
             // screen: a hung probe must never hold the funnel hostage.
             sessionProbeTimeoutMs: 4000,
+            // Session rotation. The ymid the bot put in the URL is an entry
+            // point: this asks the server which ymid this press may use. One
+            // attempt, bounded, never retried - rotation must never block the
+            // funnel, so a failure keeps the current ymid and the ad runs anyway.
+            newSessionUrl: '/api/new-session',
+            sessionRotateTimeoutMs: 4000,
+            // One rotation per WebView, not per document: the ad-block reload
+            // escalation deliberately reloads with the SAME ymid so the popup it
+            // fires correlates to that row, and rotating there would orphan the
+            // postbacks it just produced. sessionStorage outlives the reload
+            // inside one WebView.
+            sessionRotateMarker: 'session_rotated_ymid',
             // After this many fast polls the wait drops to a slow cadence
             // instead of ending in an error screen. An ad that was never
             // rewarded is not a failure state - the session is still claimable
@@ -284,7 +296,11 @@
         const statusMsg = document.getElementById('status-message');
         const description = document.getElementById('description');
         const urlParams = new URLSearchParams(window.location.search);
-        const ymid = urlParams.get('ymid') || 'unknown_request';
+        // Mutable on purpose: this is the ymid the current ad event runs under.
+        // The value the bot button supplied is an entry point; rotateSessionYmid()
+        // may replace it before the first ad call, and every API call and every
+        // show_*() below then uses the new one.
+        let ymid = urlParams.get('ymid') || 'unknown_request';
         const apiBase = window.location.origin;
 
         // Localised UI strings, injected per request by the server
@@ -459,6 +475,71 @@
             startPolling();
         }
 
+        // True when this document is a reload of a ymid that was already rotated
+        // in this WebView (the ad-block reload escalation, an in-page retry).
+        function rotationAlreadySpent() {
+            try {
+                return window.sessionStorage.getItem(AD_CONFIG.sessionRotateMarker) === ymid;
+            } catch (e) {
+                return false; // storage denied: assume a fresh open, rotate once
+            }
+        }
+
+        function rememberRotatedYmid() {
+            try {
+                window.sessionStorage.setItem(AD_CONFIG.sessionRotateMarker, ymid);
+            } catch (e) {
+                // Private mode: at worst a reload rotates again.
+            }
+        }
+
+        // Rewrites our own address bar so a reload, a WebView restore or the
+        // reload escalation cannot fall back to the spent entry ymid. The `r=`
+        // nonce also matches what the WebApp URL already guarantees: every open
+        // is a distinct document.
+        function replaceUrlYmid() {
+            try {
+                const params = new URLSearchParams(window.location.search);
+                params.set('ymid', ymid);
+                params.set('r', Date.now().toString(36) + Math.random().toString(36).slice(2, 10));
+                window.history.replaceState(null, '', window.location.pathname + '?' + params.toString());
+            } catch (e) {
+                // No History API: the in-memory ymid is still the one in use.
+            }
+        }
+
+        // Asks the server which ymid this ad event runs under. Exactly one
+        // bounded attempt: any failure keeps the ymid we already have and the ad
+        // proceeds, because a rotation that blocks the funnel costs a video.
+        async function rotateSessionYmid() {
+            if (rotationAlreadySpent()) return false;
+            try {
+                const res = await sdkWithTimeout(
+                    fetch(`${apiBase}${AD_CONFIG.newSessionUrl}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ymid: ymid })
+                    }),
+                    AD_CONFIG.sessionRotateTimeoutMs,
+                    'new-session'
+                );
+                const data = await res.json();
+                if (!data || data.success !== true || typeof data.ymid !== 'string' || !data.ymid) {
+                    return false;
+                }
+                ymid = data.ymid;
+                // The old row's deadline says nothing about the new one.
+                leaseDeadlineAt = 0;
+                replaceUrlYmid();
+                rememberRotatedYmid();
+                trackEvent(data.reused === true ? 'session_reused' : 'session_rotated');
+                return true;
+            } catch (e) {
+                // Keep the current ymid and carry on.
+                return false;
+            }
+        }
+
         // This row can never be delivered. The only useful action left is a
         // fresh session, so the screen says that and offers a way back to the
         // bot - no retry button, because a retry here could never work.
@@ -586,6 +667,10 @@
             // handleAdFailure() + the server impression oracle instead.
             let adPromise;
             try {
+                // Request-time marker: the server stamps ad_requested_at from
+                // this beacon, which is what proves later that this ymid already
+                // carried an ad and must never be reused for another event.
+                trackEvent('ad_requested');
                 adShownAt = Date.now();
                 adPromise = window[AD_CONFIG.sdkFn]({ ymid: ymid, catchIfNoFeed: true, requestVar: 'sdk_interstitial' });
             } catch (e) {
@@ -849,6 +934,7 @@
             loaderSubtext.innerText = t('MiniOpeningOfferSub');
             const token = ++adAttemptToken;
             try {
+                trackEvent('ad_requested');
                 adShownAt = Date.now();
                 const popupPromise = window[AD_CONFIG.sdkFn]({
                     ymid: ymid,
@@ -1020,6 +1106,7 @@
             if (typeof window[AD_CONFIG.sdkFn] === 'function') {
                 sdkPresent = true;
                 try {
+                    trackEvent('ad_requested');
                     popupPromise = window[AD_CONFIG.sdkFn]({
                         ymid: ymid,
                         type: 'pop',
@@ -1089,7 +1176,8 @@
             'watchdog_recover', 'bonus_popup_shown', 'bonus_popup_tapped',
             'adblock_popup_shown', 'adblock_popup_tapped', 'retry_suppressed',
             'claim_tapped', 'already_delivered', 'watched_deliver',
-            'session_expired', 'session_failed', 'lease_offer_surface'
+            'session_expired', 'session_failed', 'lease_offer_surface',
+            'ad_requested', 'session_rotated', 'session_reused'
         ]);
         const trackedSent = new Set();
 
@@ -1371,11 +1459,16 @@
 // Проверяем статус рекламы (ymid — чтобы сервер решил персонально:
         // админ с Admin Ads ON увидит реальную рекламу даже при глобальном OFF)
         async function boot() {
+            // Probe the entry ymid first: a row the server already delivered must
+            // close the webapp, not start a second ad for the same video.
             const terminal = await probeSessionBeforeAd();
             if (terminal) {
                 handleTerminalStatus(terminal);
                 return;
             }
+            // Then settle which ymid this ad event runs under - before any ad
+            // call, so one press is never two ad events on one ymid.
+            await rotateSessionYmid();
             // The heartbeat starts before anything else can settle: it is what
             // keeps this session claimable while the user watches the ad.
             startLeaseHeartbeat();

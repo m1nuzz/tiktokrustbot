@@ -55,6 +55,18 @@ pub const SESSION_LEASE_CEILING_SECS: i64 = 24 * 60 * 60;
 /// whatever does not fit is notified by the following ticks.
 pub const EXPIRY_BATCH_LIMIT: u32 = 200;
 
+/// A session ymid the mini-app must use for its ad event, and whether it is an
+/// existing row the press may continue or a row minted for this press.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionYmid {
+    pub ymid: String,
+    pub reused: bool,
+}
+
+/// Mini-app funnel stage that doubles as the authoritative request-time marker
+/// for "an ad was requested for this ymid". Shared with the client contract.
+pub const AD_REQUESTED_EVENT: &str = "ad_requested";
+
 /// Per-day aggregates for the weekly admin report.
 #[derive(Debug, Clone)]
 pub struct WeeklyDayStats {
@@ -353,6 +365,117 @@ impl DatabasePool {
         }).await.map_err(|e| anyhow::anyhow!("Failed to mark job started for {}: {}", id, e))
     }
 
+    /// Stamp the authoritative "an ad was requested for this ymid" marker.
+    ///
+    /// Written at REQUEST time, from the beacon the client fires immediately
+    /// before every show_*() call. It deliberately is not the impression
+    /// journal: the impression postback lags the ad by seconds, so a predicate
+    /// built on it would let a second press inside that window reuse a ymid
+    /// that already carried an ad - two ad events on one ymid, which Monetag
+    /// prices at zero. Returns how many rows moved (0 = unknown ymid).
+    pub async fn mark_ad_requested(&self, id: &str) -> Result<usize, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let rows = conn.execute(
+                "UPDATE pending_downloads SET ad_requested_at = COALESCE(ad_requested_at, CURRENT_TIMESTAMP) WHERE id = ?1",
+                params![id_owned],
+            )?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to mark ad requested for {}: {}", id, e))
+    }
+
+    /// Resolve the ymid an ad event must run under.
+    ///
+    /// Monetag requires a unique ymid per ad event, so a press may only keep the
+    /// ymid it was given while that ymid has never carried an ad. A ymid that
+    /// already has `ad_requested_at`, or that is terminal, is spent and gets a
+    /// fresh row instead - the same video for the same user, so the funnel and
+    /// the per-ymid joins keep working.
+    ///
+    /// A fresh UNUSED session is never displaced: if the user already has one
+    /// (typically the very row this press opened), that row is returned as-is
+    /// and no second row is created. This is also the publisher-side frequency
+    /// cap - Monetag ignores zone frequency settings, so one live session per
+    /// user is ours to enforce.
+    ///
+    /// `user_id` is what makes the copy language-preserving: the effective
+    /// locale comes from that user's stored /language override (else the ?lang=
+    /// tag the bot button appends), so no language column is needed.
+    ///
+    /// The whole decision runs in one transaction: two concurrent presses of the
+    /// same entry ymid cannot both reuse it.
+    pub async fn resolve_session_ymid(&self, entry_ymid: &str) -> Result<Option<SessionYmid>, anyhow::Error> {
+        let entry_owned = entry_ymid.to_string();
+        self.execute_with_timeout(move |conn| {
+            let entry: Option<(i64, String)> = conn
+                .query_row(
+                    "SELECT user_id, video_url FROM pending_downloads WHERE id = ?1",
+                    params![entry_owned],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+
+            let (user_id, video_url) = match entry {
+                Some(row) => row,
+                None => return Ok(None),
+            };
+
+            // A ymid is reusable while it is still claimable, was never notified
+            // about, and never carried an ad. `ad_requested_at IS NULL` is the
+            // load-bearing part.
+            let reusable = |id: &str| -> Result<bool, rusqlite::Error> {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pending_downloads WHERE id = ?1 AND status IN ('pending', 'verified') AND notified_at IS NULL AND ad_requested_at IS NULL)",
+                    params![id],
+                    |row| row.get(0),
+                )
+            };
+
+            if reusable(&entry_owned)? {
+                return Ok(Some(SessionYmid {
+                    ymid: entry_owned,
+                    reused: true,
+                }));
+            }
+
+            // The user's own newest unused session wins over minting: one live
+            // session per user, and no orphan row in the common double-press case.
+            let sibling: Option<String> = conn
+                .query_row(
+                    &format!(
+                        "SELECT id FROM pending_downloads WHERE user_id = ?1 AND id <> ?2 AND status IN ('pending', 'verified') AND notified_at IS NULL AND ad_requested_at IS NULL AND COALESCE(lease_expires_at, datetime(created_at, '+{} seconds')) > datetime('now') ORDER BY created_at DESC, id DESC LIMIT 1",
+                        SESSION_LEASE_SECS
+                    ),
+                    params![user_id, entry_owned],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(ymid) = sibling {
+                return Ok(Some(SessionYmid {
+                    ymid,
+                    reused: true,
+                }));
+            }
+
+            let id = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                &format!(
+                    "INSERT INTO pending_downloads (id, user_id, video_url, entry_ymid, lease_expires_at) VALUES (?1, ?2, ?3, ?4, datetime('now', '+{} seconds'))",
+                    SESSION_LEASE_SECS
+                ),
+                params![id, user_id, video_url, entry_owned],
+            )?;
+            Ok(Some(SessionYmid {
+                ymid: id,
+                reused: false,
+            }))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to resolve session ymid for {}: {}", entry_ymid, e))
+    }
+
     /// Record every Monetag postback hit, even unknown ymids and non_valued:
     /// the journal backing the Ads revenue counters and mismatch alerts.
     pub async fn log_postback(
@@ -384,6 +507,14 @@ impl DatabasePool {
     /// `monetag_postbacks` by `ymid` to tell "no fill" from "ad blocked here".
     /// Long strings are truncated in SQL so a hostile client cannot bloat the
     /// database through this endpoint.
+    ///
+    /// The `ad_requested` stage is also load-bearing, not just telemetry: the
+    /// client fires it immediately before every show_*() call, so this is the
+    /// REQUEST-time signal that marks a ymid as spent (Monetag requires a unique
+    /// ymid per ad event). Reusing this existing fire-and-forget beacon instead
+    /// of adding an endpoint is deliberate: it already survives the webapp being
+    /// closed by Telegram, and the popup path must fire inside the user gesture,
+    /// so nothing there can be awaited before show().
     pub async fn log_mini_app_event(
         &self,
         ymid: &str,
@@ -397,11 +528,18 @@ impl DatabasePool {
         let platform_owned = platform.map(|s| s.chars().take(16).collect::<String>());
         let host_owned = sdk_host.map(|s| s.chars().take(64).collect::<String>());
         let ua_owned = user_agent.map(|s| s.chars().take(256).collect::<String>());
+        let ad_requested = event_owned == AD_REQUESTED_EVENT;
         self.execute_with_timeout(move |conn| {
             conn.execute(
                 "INSERT INTO mini_app_events (ymid, event, platform, sdk_host, user_agent) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![ymid_owned, event_owned, platform_owned, host_owned, ua_owned],
             )?;
+            if ad_requested {
+                conn.execute(
+                    "UPDATE pending_downloads SET ad_requested_at = COALESCE(ad_requested_at, CURRENT_TIMESTAMP) WHERE id = ?1",
+                    params![ymid_owned],
+                )?;
+            }
             Ok(())
         })
         .await
@@ -964,11 +1102,15 @@ pub(crate) async fn setup_test_db() -> (DatabasePool, tempfile::NamedTempFile) {
             (),
         )?;
         conn.execute(
-            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL, job_started_at DATETIME DEFAULT NULL)",
+            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL, job_started_at DATETIME DEFAULT NULL, entry_ymid TEXT DEFAULT NULL, ad_requested_at DATETIME DEFAULT NULL)",
             (),
         )?;
         conn.execute(
             "CREATE TABLE monetag_postbacks (id INTEGER PRIMARY KEY, ymid TEXT NOT NULL, event_type TEXT DEFAULT NULL, reward_event_type TEXT NOT NULL, estimated_price REAL DEFAULT NULL, request_var TEXT DEFAULT NULL, sub_zone_id TEXT DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE mini_app_events (id INTEGER PRIMARY KEY, ymid TEXT NOT NULL, event TEXT NOT NULL, platform TEXT DEFAULT NULL, sdk_host TEXT DEFAULT NULL, user_agent TEXT DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
             (),
         )?;
         conn.execute(
@@ -1734,6 +1876,226 @@ mod tests {
             pool.mark_as_verified_with_logging("no-such-ymid")
                 .await
                 .is_err()
+        );
+    }
+
+    async fn row_count(pool: &DatabasePool, ymid: &str) -> i64 {
+        let ymid_owned = ymid.to_string();
+        pool.execute_with_timeout(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM pending_downloads WHERE id = ?1",
+                params![ymid_owned],
+                |row| row.get(0),
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn user_rows(pool: &DatabasePool, user_id: i64) -> i64 {
+        pool.execute_with_timeout(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM pending_downloads WHERE user_id = ?1",
+                params![user_id],
+                |row| row.get(0),
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn entry_ymid_of(pool: &DatabasePool, ymid: &str) -> Option<String> {
+        let ymid_owned = ymid.to_string();
+        pool.execute_with_timeout(move |conn| {
+            conn.query_row(
+                "SELECT entry_ymid FROM pending_downloads WHERE id = ?1",
+                params![ymid_owned],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The reuse predicate is `ad_requested_at IS NULL`, and nothing else. The
+    /// impression postback lags the ad by seconds, so a predicate built on the
+    /// impression journal would let a second press inside that window reuse a
+    /// ymid that already carried an ad: two ad events on one ymid, priced at
+    /// zero by Monetag. This test fails the moment anyone swaps the marker.
+    #[tokio::test]
+    async fn a_second_press_inside_the_postback_lag_window_mints_a_new_ymid() {
+        let (pool, _file) = setup_test_db().await;
+        let entry = pool.create_pending_download(31, "http://v").await.unwrap();
+
+        // The ad was requested, but no impression postback has landed yet - the
+        // exact window in which an impression-based check would wrongly reuse.
+        pool.mark_ad_requested(&entry).await.unwrap();
+        assert!(!pool.has_ad_impression(&entry).await.unwrap());
+
+        let rotated = pool.resolve_session_ymid(&entry).await.unwrap().unwrap();
+        assert!(!rotated.reused, "a spent ymid must never be reused");
+        assert_ne!(rotated.ymid, entry, "one ad event, one ymid");
+
+        // Even once the impression journal has caught up, the request-time
+        // marker keeps the ymid spent: the two signals are independent.
+        pool.mark_ad_requested(&rotated.ymid).await.unwrap();
+        pool.log_postback(&rotated.ymid, Some("impression"), "valued", None, None, None)
+            .await
+            .unwrap();
+        let again = pool
+            .resolve_session_ymid(&rotated.ymid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!again.reused);
+        assert_ne!(again.ymid, rotated.ymid);
+    }
+
+    /// The common case must stay cheap: a fresh press on a ymid that has never
+    /// carried an ad reuses that exact row, and creates nothing.
+    #[tokio::test]
+    async fn rotating_a_live_unused_session_is_a_no_op() {
+        let (pool, _file) = setup_test_db().await;
+        let entry = pool.create_pending_download(32, "http://v").await.unwrap();
+        let before = user_rows(&pool, 32).await;
+
+        let resolved = pool.resolve_session_ymid(&entry).await.unwrap().unwrap();
+        assert_eq!(resolved.ymid, entry, "a live unused session is kept as-is");
+        assert!(resolved.reused);
+        assert_eq!(user_rows(&pool, 32).await, before, "no second row");
+        assert_eq!(row_count(&pool, &entry).await, 1);
+    }
+
+    /// The minted row is the same video for the same user, and remembers the
+    /// button ymid it came from so a press can be joined to its session. The
+    /// copied user is also what preserves the language: the effective locale is
+    /// resolved from that user's stored override, else the ?lang= tag.
+    #[tokio::test]
+    async fn a_spent_entry_ymid_mints_a_row_for_the_same_user_and_video() {
+        let (pool, _file) = setup_test_db().await;
+        pool.set_user_lang(33, "uk").await.unwrap();
+        let entry = pool.create_pending_download(33, "http://the-video").await.unwrap();
+        pool.mark_ad_requested(&entry).await.unwrap();
+
+        let rotated = pool.resolve_session_ymid(&entry).await.unwrap().unwrap();
+        assert!(!rotated.reused);
+        assert_eq!(pool.get_user_id_by_ymid(&rotated.ymid).await.unwrap(), 33);
+        assert_eq!(entry_ymid_of(&pool, &rotated.ymid).await, Some(entry.clone()));
+
+        let (minted_user, minted_url): (i64, String) = pool
+            .execute_with_timeout({
+                let ymid = rotated.ymid.clone();
+                move |conn| {
+                    conn.query_row(
+                        "SELECT user_id, video_url FROM pending_downloads WHERE id = ?1",
+                        params![ymid],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(minted_user, 33);
+        assert_eq!(minted_url, "http://the-video");
+        assert_eq!(
+            pool.get_effective_lang(minted_user, None).await,
+            "uk",
+            "the copied user carries the language"
+        );
+        // A fresh row must be claimable from the first second.
+        assert_eq!(
+            lease_span_secs(&pool, &rotated.ymid).await,
+            SESSION_LEASE_SECS
+        );
+    }
+
+    /// A terminal entry ymid is spent even if it never carried an ad (it was
+    /// delivered or it lapsed), and a second press of the SAME button ymid that
+    /// happens while the user still has a fresh unused session gets that session
+    /// instead of a new row.
+    #[tokio::test]
+    async fn a_terminal_entry_row_is_replaced_and_a_sibling_session_is_preferred() {
+        let (pool, _file) = setup_test_db().await;
+        pool.execute_with_timeout(|conn| {
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status, lease_expires_at) VALUES ('done', 34, 'http://v', 'completed', datetime('now', '+10 minutes'))",
+                (),
+            )?;
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, lease_expires_at) VALUES ('sibling', 34, 'http://v', datetime('now', '+10 minutes'))",
+                (),
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let resolved = pool.resolve_session_ymid("done").await.unwrap().unwrap();
+        assert_eq!(
+            resolved.ymid, "sibling",
+            "the user's fresh unused session wins over minting"
+        );
+        assert!(resolved.reused);
+        assert_eq!(user_rows(&pool, 34).await, 2, "still no orphan row");
+
+        // With no usable sibling left, the terminal row is replaced by a mint.
+        pool.mark_ad_requested("sibling").await.unwrap();
+        let minted = pool.resolve_session_ymid("done").await.unwrap().unwrap();
+        assert!(!minted.reused);
+        assert_ne!(minted.ymid, "done");
+        assert_eq!(user_rows(&pool, 34).await, 3);
+    }
+
+    /// An unknown entry ymid has nothing to copy, so the client must keep the
+    /// ymid it already has instead of being handed a broken session.
+    #[tokio::test]
+    async fn resolving_an_unknown_entry_ymid_yields_nothing() {
+        let (pool, _file) = setup_test_db().await;
+        assert!(pool
+            .resolve_session_ymid("never-existed")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    async fn ad_requested_at(pool: &DatabasePool, ymid: &str) -> Option<String> {
+        let ymid_owned = ymid.to_string();
+        pool.execute_with_timeout(move |conn| {
+            conn.query_row(
+                "SELECT ad_requested_at FROM pending_downloads WHERE id = ?1",
+                params![ymid_owned],
+                |row| row.get::<_, Option<String>>(0),
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The request-time marker rides the existing funnel beacon, and it is
+    /// first-write-wins so a second show() call cannot move it.
+    #[tokio::test]
+    async fn the_ad_requested_beacon_stamps_the_marker_once() {
+        let (pool, _file) = setup_test_db().await;
+        let ymid = pool.create_pending_download(35, "http://v").await.unwrap();
+
+        // Nothing is stamped before the client asks for an ad.
+        assert!(ad_requested_at(&pool, &ymid).await.is_none());
+
+        pool.log_mini_app_event(&ymid, AD_REQUESTED_EVENT, Some("ios"), None, None)
+            .await
+            .unwrap();
+        let first = ad_requested_at(&pool, &ymid).await;
+        assert!(first.is_some(), "the request-time beacon stamps the row");
+
+        // A later stage must not move the marker.
+        pool.log_mini_app_event(&ymid, "ad_resolve", Some("ios"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            ad_requested_at(&pool, &ymid).await,
+            first,
+            "first write wins"
         );
     }
 }

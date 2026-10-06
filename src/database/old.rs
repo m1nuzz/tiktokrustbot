@@ -154,7 +154,7 @@ pub fn init_database() -> Result<()> {
         (),
     )?;
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL, job_started_at DATETIME DEFAULT NULL)",
+        "CREATE TABLE IF NOT EXISTS pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL, job_started_at DATETIME DEFAULT NULL, entry_ymid TEXT DEFAULT NULL, ad_requested_at DATETIME DEFAULT NULL)",
         (),
     )?;
     // Column ensure + retirement run after the CREATE above so fresh
@@ -167,6 +167,14 @@ pub fn init_database() -> Result<()> {
     // "never earned the ad" from "the download failed".
     ensure_column(&conn, "pending_downloads", "lease_expires_at", "lease_expires_at DATETIME DEFAULT NULL")?;
     ensure_column(&conn, "pending_downloads", "job_started_at", "job_started_at DATETIME DEFAULT NULL")?;
+    // One ymid per ad event. `ad_requested_at` is stamped the moment the client
+    // asks for an ad and is what marks a ymid as spent: the impression postback
+    // lags the ad by seconds, so an impression-based test would let a second
+    // press reuse a ymid that already carried an ad. `entry_ymid` records which
+    // bot-button ymid a freshly minted session came from, so a press can be
+    // joined to the session that served it.
+    ensure_column(&conn, "pending_downloads", "entry_ymid", "entry_ymid TEXT DEFAULT NULL")?;
+    ensure_column(&conn, "pending_downloads", "ad_requested_at", "ad_requested_at DATETIME DEFAULT NULL")?;
     // Silently retire download requests abandoned before this startup (the
     // user never finished watching the ad). They are marked notified so the
     // expiry sweeper never messages them; only new rows get notified. The
