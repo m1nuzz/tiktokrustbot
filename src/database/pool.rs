@@ -1382,12 +1382,15 @@ mod tests {
     async fn heartbeat_cannot_push_the_lease_past_the_ceiling() {
         let (pool, _file) = setup_test_db().await;
         pool.execute_with_timeout(|conn| {
-            // 23h45m + 30m = 24h15m, past the 24h ceiling, so the `min()` clamp is
-            // what sets this row's deadline. Do NOT "simplify" the age to 23h: that
-            // leaves the ceiling an hour away, the lease is then the earlier of the
-            // two, and the clamp stops being observable at all.
+            // 85500s = 23h45m, so a fresh 30-minute lease overshoots the 24h ceiling
+            // and the `min()` clamp is what sets this row's deadline. Two traps:
+            // a 23h age leaves the ceiling an hour away, so the lease is the
+            // earlier of the two and the clamp is unobservable; and SQLite
+            // rejects a multi-unit modifier ("-23 hours 45 minutes" returns
+            // NULL), which silently gives the row a NULL created_at, hence a
+            // NULL ceiling and a NULL lease - so the age must stay single-unit.
             conn.execute(
-                "INSERT INTO pending_downloads (id, user_id, video_url, created_at) VALUES ('almost-a-day-old', 8, 'http://v', datetime('now', '-23 hours 45 minutes'))",
+                "INSERT INTO pending_downloads (id, user_id, video_url, created_at) VALUES ('almost-a-day-old', 8, 'http://v', datetime('now', '-85500 seconds'))",
                 (),
             )?;
             conn.execute(
