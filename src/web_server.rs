@@ -7,6 +7,7 @@ use axum::{
 use axum::http::{header, HeaderMap, HeaderValue};
 use tower_http::cors::CorsLayer;
 use std::sync::Arc;
+use std::time::Duration;
 use crate::database::{ClaimVia, DatabasePool};
 use crate::yt_dlp_interface::YoutubeFetcher;
 use crate::mtproto_uploader::MTProtoUploader;
@@ -51,16 +52,12 @@ pub struct PostbackQuery {
     pub secret: Option<String>,
 }
 
+/// Only the ymid is read from a claim body. serde ignores unknown fields, so
+/// a body sent by an already-open older client still deserializes: whatever
+/// attestation it carries is dropped and is not part of the gate any more.
 #[derive(Deserialize)]
 pub struct ClaimRequest {
     pub ymid: String,
-    /// Client attestation that the ad was displayed for the full watch gate
-    /// (X-press after a full watch). Old clients omit it; serde defaults it
-    /// to false, which keeps the click/90s branches as the only engagement
-    /// proof. The gate still requires the valued impression and the 15s
-    /// floor server-side, so an attestation alone unlocks nothing early.
-    #[serde(default)]
-    pub watched_full: bool,
 }
 
 #[derive(Deserialize)]
@@ -289,6 +286,150 @@ async fn spawn_download_job(
     });
 }
 
+/// Bounded retry for the postback ordering race only: the valued postback
+/// that triggered this task is journaled before the task starts, so the gate
+/// normally passes on the first attempt.
+const AUTO_DELIVERY_ATTEMPTS: u32 = 3;
+const AUTO_DELIVERY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// One client POST races Monetag's postback: the ad settles before the backend
+/// confirmation is journaled, so the first attempt can lose by a second or
+/// two. Three attempts 1.5s apart cover that window; `success:false` is only
+/// answered once the wait is exhausted.
+const CLAIM_WAIT_ATTEMPTS: u32 = 3;
+const CLAIM_WAIT_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// Retry a single-use claim within a bounded window. Split out from the
+/// handler so the wait itself is testable without axum wiring.
+async fn claim_with_bounded_wait<F, Fut>(
+    attempts: u32,
+    interval: Duration,
+    mut claim_once: F,
+) -> Result<(i64, String, ClaimVia), anyhow::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(i64, String, ClaimVia), anyhow::Error>>,
+{
+    let mut last: Result<(i64, String, ClaimVia), anyhow::Error> =
+        Err(anyhow::anyhow!("claim never attempted"));
+    for attempt in 0..attempts {
+        match claim_once().await {
+            Ok(won) => return Ok(won),
+            Err(e) => last = Err(e),
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(interval).await;
+        }
+    }
+    last
+}
+
+/// What a valued postback actually did to the row. The first two can still
+/// deliver; the last two never can.
+#[derive(Debug, PartialEq, Eq)]
+enum VerifyOutcome {
+    Verified,
+    AlreadyVerified,
+    Terminal(String),
+    Unknown,
+}
+
+/// `mark_as_verified_with_logging` reports affected rows, so 0 rows only means
+/// "this postback changed nothing" - the row itself says why.
+fn classify_verify(rows: usize, status: Option<&str>) -> VerifyOutcome {
+    if rows > 0 {
+        return VerifyOutcome::Verified;
+    }
+    match status {
+        Some("verified") => VerifyOutcome::AlreadyVerified,
+        Some(other) => VerifyOutcome::Terminal(other.to_string()),
+        None => VerifyOutcome::Unknown,
+    }
+}
+
+/// Result of processing one valued postback. `Delivered` is the only variant
+/// that may spawn a download job.
+#[derive(Debug, PartialEq, Eq)]
+enum ValuedPostbackResult {
+    Delivered {
+        user_id: i64,
+        url: String,
+        via: ClaimVia,
+    },
+    NotDeliverable(String),
+    NotValuedYet,
+    DbError(String),
+}
+
+/// One valued postback end to end: verify the row truthfully, then take the
+/// single-use claim. Monetag retries any postback that does not answer 200, so
+/// this runs many times per ymid and the atomic claim - not luck - is what
+/// keeps delivery at exactly one. Every outcome is logged: a silent task is as
+/// bad as the dropped handler future it replaced.
+async fn run_valued_delivery(db: &Arc<DatabasePool>, ymid: &str) -> ValuedPostbackResult {
+    let rows = match db.mark_as_verified_with_logging(ymid).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            log::error!(
+                "Valued postback for {}: mark-as-verified failed: {}",
+                ymid,
+                e
+            );
+            return ValuedPostbackResult::DbError(e.to_string());
+        }
+    };
+    let status = match db.get_pending_download_status(ymid).await {
+        Ok(status) => status,
+        Err(e) => {
+            log::error!("Valued postback for {}: status read failed: {}", ymid, e);
+            return ValuedPostbackResult::DbError(e.to_string());
+        }
+    };
+
+    match classify_verify(rows, status.as_deref()) {
+        VerifyOutcome::Verified => log::info!("Valued postback: row {} marked verified", ymid),
+        VerifyOutcome::AlreadyVerified => {
+            log::info!("Valued postback for row {}: already verified", ymid)
+        }
+        VerifyOutcome::Terminal(status) => {
+            log::info!(
+                "Valued postback for row {} ignored: terminal row ({}), no delivery",
+                ymid,
+                status
+            );
+            return ValuedPostbackResult::NotDeliverable(status);
+        }
+        VerifyOutcome::Unknown => {
+            log::warn!("Valued postback for unknown ymid {}, no delivery", ymid);
+            return ValuedPostbackResult::NotDeliverable("unknown ymid".to_string());
+        }
+    }
+
+    // The postback that triggered this task is already journaled, so the gate
+    // normally passes on the first attempt. The retries exist only for
+    // ordering: a valued click can be journaled before its valued impression.
+    let claim_db = db.clone();
+    let claim_ymid = ymid.to_string();
+    match claim_with_bounded_wait(AUTO_DELIVERY_ATTEMPTS, AUTO_DELIVERY_INTERVAL, move || {
+        let claim_db = claim_db.clone();
+        let claim_ymid = claim_ymid.clone();
+        async move { claim_db.claim_if_valued(&claim_ymid).await }
+    })
+    .await
+    {
+        Ok((user_id, url, via)) => ValuedPostbackResult::Delivered { user_id, url, via },
+        Err(e) => {
+            log::info!(
+                "Valued postback for row {}: no claim after {} attempts: {}",
+                ymid,
+                AUTO_DELIVERY_ATTEMPTS,
+                e
+            );
+            ValuedPostbackResult::NotValuedYet
+        }
+    }
+}
+
 async fn monetag_postback(
     State(state): State<AppState>,
     Query(query): Query<PostbackQuery>,
@@ -336,50 +477,23 @@ async fn monetag_postback(
     let task_state = state.clone();
     let task_ymid = query.ymid.clone();
     // Detached valued sequence: Monetag times out slow postback responses,
-    // so the HTTP handler must answer 200 OK immediately. The whole valued
-    // sequence (verify, readiness wait, claim, spawn) runs in this task, and
-    // every outcome is logged — a silent task is as bad as the dropped
-    // handler future this replaces.
+    // so the HTTP handler must answer 200 OK immediately.
     tokio::spawn(async move {
-        match task_state.db.mark_as_verified(&task_ymid).await {
-            Ok(()) => log::info!("Download {} marked as VERIFIED (valued)", task_ymid),
-            Err(e) => log::error!(
-                "Failed to mark download as verified for ymid {}: {}",
-                task_ymid,
-                e
+        match run_valued_delivery(&task_state.db, &task_ymid).await {
+            ValuedPostbackResult::Delivered { user_id, url, via } => {
+                // Instant auto-delivery: the user may already be browsing the
+                // advertiser's page, so the chat must not wait for a return.
+                log::info!(
+                    "Auto-delivering download for user {} (valued postback)",
+                    user_id
+                );
+                spawn_download_job(task_state, user_id, url, task_ymid, via).await;
+            }
+            refused => log::debug!(
+                "Valued postback for ymid {} delivered nothing: {:?}",
+                task_ymid, refused
             ),
         }
-
-        // Readiness wait loop: the strict gate (valued impression, 15s watch,
-        // click or 90s) may still be ahead of this postback, and duplicate
-        // postbacks are Monetag retries, so poll until the gate passes.
-        const POLL_SECS: u64 = 5;
-        const DEADLINE_SECS: u64 = 150;
-        let tries = DEADLINE_SECS / POLL_SECS;
-        for _ in 0..tries {
-            match task_state.db.claim_if_ready(&task_ymid).await {
-                Ok((user_id, url, via)) => {
-                    // Instant auto-delivery: the user may already browse
-                    // another app/site. claim_if_ready is atomic single-use:
-                    // if the user already claimed via mini-app, this returns
-                    // Err and we skip (no doubles).
-                    log::info!(
-                        "Auto-delivering download for user {} (valued postback)",
-                        user_id
-                    );
-                    spawn_download_job(task_state, user_id, url, task_ymid, via).await;
-                    return;
-                }
-                Err(e) => {
-                    log::info!("Auto-delivery not ready for ymid {}: {}", task_ymid, e);
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
-        }
-        log::warn!(
-            "Valued delivery window elapsed for ymid {} without gate pass",
-            task_ymid
-        );
     });
 
     axum::http::StatusCode::OK
@@ -441,12 +555,31 @@ async fn claim_video(
         return Json(json!({ "success": false, "error": "Invalid request ID" }));
     }
 
-    // 2. Single shared gate for everyone, admins included: valued
-    // impression plus 15s watch plus click-or-90s-or-attested-full-watch.
-    // No admin bypass (admin testing must reproduce the user experience)
-    // and no timer backstop: without a valued postback the download stays
-    // locked. Completed rows below still return idempotent success.
-    let claim_result = db.claim_if_ready_watched(&ymid, payload.watched_full).await;
+    // 2. Already delivered (by the valued-postback auto-delivery or by an
+    // earlier POST): idempotent success, and no reason to wait for a postback.
+    if let Ok(Some(status)) = db.get_pending_download_status(&ymid).await {
+        if status == "completed" {
+            log::info!(
+                "Claim for ymid {} already completed, returning success",
+                ymid
+            );
+            return Json(json!({ "success": true }));
+        }
+    }
+
+    // 3. One gate for everyone, admins included: a valued impression is the
+    // reward. No admin bypass (admin testing must reproduce the user
+    // experience), no timer backstop and no client attestation is read. The
+    // bounded wait lets this one request win the race against postback lag.
+    let claim_db = db.clone();
+    let claim_ymid = ymid.clone();
+    let claim_result =
+        claim_with_bounded_wait(CLAIM_WAIT_ATTEMPTS, CLAIM_WAIT_INTERVAL, move || {
+            let claim_db = claim_db.clone();
+            let claim_ymid = claim_ymid.clone();
+            async move { claim_db.claim_if_valued(&claim_ymid).await }
+        })
+        .await;
 
     match claim_result {
         Ok((user_id, url, via)) => {
@@ -455,21 +588,26 @@ async fn claim_video(
             Json(json!({ "success": true }))
         },
         Err(e) => {
-            // Idempotent success: a concurrent auto-delivery (valued postback)
-            // may have completed this row first, so the video is on its way.
+            // The valued postback's own auto-delivery may have completed this
+            // row while we were waiting, so the video is on its way.
             if let Ok(Some(status)) = db.get_pending_download_status(&ymid).await {
                 if status == "completed" {
                     log::info!(
-                        "Claim for ymid {} already completed, returning success",
+                        "Claim for ymid {} completed by auto-delivery while waiting, returning success",
                         ymid
                     );
                     return Json(json!({ "success": true }));
                 }
             }
-            log::error!("Claim failed for ymid {}: {}", ymid, e);
-            Json(json!({ 
-                "success": false, 
-                "error": "Ad verification not received yet. Please finish watching the ad or wait a few seconds." 
+            log::error!(
+                "Claim failed for ymid {} after {} attempts: {}",
+                ymid,
+                CLAIM_WAIT_ATTEMPTS,
+                e
+            );
+            Json(json!({
+                "success": false,
+                "error": "Ad verification not received yet. Please finish watching the ad or wait a few seconds."
             }))
         }
     }
@@ -500,5 +638,166 @@ mod tests {
         assert!(!out.contains("}null"), "leftover null after the dict");
         assert!(out.contains("<html lang=\"ru\">"));
         assert!(out.contains("\"MiniNoAdsTitle\":\"x\""));
+    }
+
+    /// serde drops unknown body fields instead of rejecting them, so a body
+    /// from an already-open older client still reaches the gate.
+    #[test]
+    fn claim_request_ignores_unknown_body_fields() {
+        let parsed: ClaimRequest =
+            serde_json::from_str(r#"{"ymid":"legacy-ymid","legacy_attestation":true}"#).unwrap();
+        assert_eq!(parsed.ymid, "legacy-ymid");
+    }
+
+    #[test]
+    fn classify_verify_separates_moved_already_verified_and_terminal() {
+        assert_eq!(
+            classify_verify(1, Some("verified")),
+            VerifyOutcome::Verified
+        );
+        assert_eq!(
+            classify_verify(0, Some("verified")),
+            VerifyOutcome::AlreadyVerified
+        );
+        assert_eq!(
+            classify_verify(0, Some("completed")),
+            VerifyOutcome::Terminal("completed".to_string())
+        );
+        assert_eq!(
+            classify_verify(0, Some("expired")),
+            VerifyOutcome::Terminal("expired".to_string())
+        );
+        assert_eq!(classify_verify(0, None), VerifyOutcome::Unknown);
+    }
+
+    /// The race the wait exists for: the valued postback lands while the
+    /// handler is still retrying, so the same request delivers.
+    #[tokio::test]
+    async fn claim_wait_delivers_value_that_arrives_mid_wait() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+
+        let won = claim_with_bounded_wait(3, Duration::ZERO, move || {
+            let counter = counter.clone();
+            async move {
+                if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Err(anyhow::anyhow!("no valued impression for now"))
+                } else {
+                    Ok((7, "http://v".to_string(), ClaimVia::Verified))
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(won.2, ClaimVia::Verified);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// The wait is bounded: a request that never gets its postback gives up
+    /// after exactly `attempts` tries instead of holding the connection.
+    #[tokio::test]
+    async fn claim_wait_gives_up_after_the_bounded_attempts() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+
+        let result = claim_with_bounded_wait(3, Duration::ZERO, move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err::<(i64, String, ClaimVia), anyhow::Error>(anyhow::anyhow!(
+                    "no valued impression"
+                ))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn valued_postback_delivers_a_pending_row() {
+        let (pool, _file) = crate::database::setup_test_db().await;
+        let db = Arc::new(pool);
+        crate::database::setup_gate_row(&db, "valued-pending", "pending", 5, &[]).await;
+
+        let outcome = run_valued_delivery(&db, "valued-pending").await;
+        assert_eq!(
+            outcome,
+            ValuedPostbackResult::Delivered {
+                user_id: 7,
+                url: "http://v".to_string(),
+                via: ClaimVia::Verified,
+            }
+        );
+        assert_eq!(
+            db.get_pending_download_status("valued-pending")
+                .await
+                .unwrap(),
+            Some("completed".to_string())
+        );
+    }
+
+    /// Replay probe: Monetag retries any postback that does not answer 200, so
+    /// one ymid can carry several valued impressions. The atomic claim must
+    /// keep that at exactly one delivery.
+    #[tokio::test]
+    async fn three_valued_postbacks_deliver_exactly_once() {
+        let (pool, _file) = crate::database::setup_test_db().await;
+        let db = Arc::new(pool);
+        crate::database::setup_gate_row(&db, "retried", "pending", 5, &[]).await;
+
+        let mut deliveries = 0;
+        for _ in 0..3 {
+            db.log_postback("retried", Some("impression"), "valued", None, None, None)
+                .await
+                .unwrap();
+            if let ValuedPostbackResult::Delivered { .. } =
+                run_valued_delivery(&db, "retried").await
+            {
+                deliveries += 1;
+            }
+        }
+
+        assert_eq!(deliveries, 1, "three valued postbacks, one delivery");
+        assert_eq!(
+            db.get_pending_download_status("retried").await.unwrap(),
+            Some("completed".to_string())
+        );
+    }
+
+    /// Stale-state probe: a valued postback for a row that can no longer be
+    /// delivered must never spawn a job, whatever the postback claims.
+    #[tokio::test]
+    async fn valued_postback_never_delivers_for_terminal_or_unknown_ymid() {
+        let (pool, _file) = crate::database::setup_test_db().await;
+        let db = Arc::new(pool);
+        crate::database::setup_gate_row(&db, "already-done", "completed", 5, &[]).await;
+        crate::database::setup_gate_row(&db, "too-late", "expired", 5, &[]).await;
+
+        for ymid in ["already-done", "too-late", "never-existed"] {
+            db.log_postback(ymid, Some("impression"), "valued", None, None, None)
+                .await
+                .unwrap();
+            let outcome = run_valued_delivery(&db, ymid).await;
+            assert!(
+                matches!(&outcome, ValuedPostbackResult::NotDeliverable(_)),
+                "ymid {} must not deliver, got {:?}",
+                ymid,
+                outcome
+            );
+        }
+
+        assert_eq!(
+            db.get_pending_download_status("already-done")
+                .await
+                .unwrap(),
+            Some("completed".to_string())
+        );
+        assert_eq!(
+            db.get_pending_download_status("too-late").await.unwrap(),
+            Some("expired".to_string())
+        );
     }
 }
