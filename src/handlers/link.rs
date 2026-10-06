@@ -31,7 +31,22 @@ lazy_static::lazy_static! {
 
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes per download attempt
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes per upload attempt
-const JOB_BUDGET: Duration = Duration::from_secs(1800); // 30 minutes for the whole job (Tier 2)
+/// Wall-clock ceiling for one download+upload job. It must end strictly
+/// before the session lease window (`SESSION_LEASE_SECS`), so a job that is
+/// going to fail fails on its own terms while its row is still unambiguous,
+/// instead of racing the sweeper into deciding the same row's fate twice.
+///
+/// Headroom: 5 minutes (1500s against a 1800s lease). User-visible cost: a
+/// download that would have finished at minute 26 now fails at minute 25. That
+/// is the deliberate trade for one notification per row - the alternative was
+/// a user getting both a "download failed" and an "ad session expired" for the
+/// same video.
+const JOB_BUDGET_SECS: u64 = 1500;
+const JOB_BUDGET: Duration = Duration::from_secs(JOB_BUDGET_SECS);
+const _: () = assert!(
+    JOB_BUDGET_SECS < crate::database::SESSION_LEASE_SECS as u64,
+    "the job budget must end before the session lease window"
+);
 const TELEGRAM_BOT_API_FILE_LIMIT: u64 = 48 * 1024 * 1024; // 48MB
 
 /// Owns a URL claim and releases it even when processing exits with an error.
@@ -77,6 +92,21 @@ fn classify_download_error(err: &anyhow::Error) -> MsgKey {
     }
 }
 
+/// Which message an expired session earns.
+///
+/// The expiry sweeper only ever sees rows whose ad was never valued, so for
+/// most of them no download was ever attempted and the honest message is "the
+/// session expired", not "the video failed to download". `job_started` comes
+/// from `pending_downloads.job_started_at`, which is written only when a
+/// download job really begins - that one case is a genuine failure.
+pub fn expiry_message_key(job_started: bool) -> MsgKey {
+    if job_started {
+        MsgKey::DownloadFailed
+    } else {
+        MsgKey::SessionExpired
+    }
+}
+
 /// Terminal-failure path: record it, mark the pending row failed, and tell
 /// the user in their own language. Internal details stay in the log.
 #[allow(clippy::too_many_arguments)]
@@ -93,8 +123,12 @@ async fn fail_request(
 ) {
     log::error!("Download job failed for {} (ymid {:?}): {}", url, ymid, err);
     if let Some(id) = ymid {
-        if let Err(e) = db_pool.mark_pending_failed(id).await {
-            log::error!("Failed to mark {} as failed: {}", id, e);
+        match db_pool.mark_pending_failed(id).await {
+            // 0 rows means the row was already terminal: somebody else owns
+            // this row's single notification, so do not log a success here.
+            Ok(0) => log::warn!("Row {} was already terminal, not re-marked failed", id),
+            Ok(_) => {}
+            Err(e) => log::error!("Failed to mark {} as failed: {}", id, e),
         }
     }
     let _ = progress_bar.delete().await;
@@ -456,6 +490,7 @@ pub async fn process_video_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
 
     #[test]
     fn download_errors_classified_for_immediate_reply() {
@@ -472,6 +507,81 @@ mod tests {
         assert_eq!(classify_download_error(&generic), crate::i18n::MsgKey::DownloadFailed);
     }
 
+    /// The message split: a session that expired before it earned the ad must
+    /// never be told the video failed to download, and only a row with a
+    /// started job may be.
+    #[tokio::test]
+    async fn expiry_message_routes_by_what_actually_happened() {
+        let (pool, _file) = ads_test_db().await;
+        let lapsed = pool
+            .create_pending_download(1, "http://x")
+            .await
+            .unwrap();
+        pool.execute_with_timeout({
+            let lapsed = lapsed.clone();
+            move |conn| {
+                conn.execute(
+                    "UPDATE pending_downloads SET lease_expires_at = datetime('now', '-1 minute') WHERE id = ?1",
+                    params![lapsed],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        let swept = pool
+            .expire_stale_pending(crate::database::EXPIRY_BATCH_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(swept.len(), 1);
+        let (ymid, _user_id, job_started) = swept.into_iter().next().unwrap();
+        assert_eq!(ymid, lapsed);
+        assert!(!job_started);
+        assert_eq!(expiry_message_key(job_started), MsgKey::SessionExpired);
+        assert_ne!(expiry_message_key(job_started), MsgKey::DownloadFailed);
+
+        // The same row, but a download really started for it.
+        assert_eq!(pool.mark_job_started(&lapsed).await.unwrap(), 1);
+        pool.execute_with_timeout({
+            let lapsed = lapsed.clone();
+            move |conn| {
+                conn.execute(
+                    "UPDATE pending_downloads SET status = 'pending', notified_at = NULL, lease_expires_at = datetime('now', '-1 minute') WHERE id = ?1",
+                    params![lapsed],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        let (_, _, job_started) = pool
+            .expire_stale_pending(crate::database::EXPIRY_BATCH_LIMIT)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(job_started);
+        assert_eq!(expiry_message_key(job_started), MsgKey::DownloadFailed);
+    }
+
+    /// One message per row: the job budget has to end before the lease window
+    /// does, otherwise a slow download is killed by the budget and swept in the
+    /// same instant.
+    #[test]
+    fn job_budget_ends_before_the_session_lease_window() {
+        assert!(
+            JOB_BUDGET_SECS < crate::database::SESSION_LEASE_SECS as u64,
+            "JOB_BUDGET must be strictly below the lease window"
+        );
+        assert!(
+            JOB_BUDGET.as_secs() == JOB_BUDGET_SECS,
+            "the duration and the compared constant must be the same value"
+        );
+    }
+
     async fn ads_test_db() -> (DatabasePool, tempfile::NamedTempFile) {
         let temp_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap().to_string();
@@ -486,7 +596,7 @@ mod tests {
                 (),
             )?;
             conn.execute(
-                "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL)",
+                "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL, job_started_at DATETIME DEFAULT NULL)",
                 (),
             )?;
             Ok(())

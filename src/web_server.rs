@@ -294,6 +294,14 @@ async fn spawn_download_job(
         ClaimVia::Admin => "delivered_admin",
     };
     state.db.log_funnel_event(user_id, reason).await;
+    // A download really begins here, so record it: this is what lets the
+    // expiry sweeper tell a failed download from a session that never earned
+    // its ad, and therefore which of the two messages the user gets.
+    match state.db.mark_job_started(&ymid).await {
+        Ok(0) => log::warn!("Job start recorded for unknown ymid {}", ymid),
+        Ok(_) => {}
+        Err(e) => log::error!("Failed to record job start for {}: {}", ymid, e),
+    }
     // Resolve locale from the stored /language override (no Telegram
     // User object in this flow, so no device language available).
     let lang = state.db.get_effective_lang(user_id, None).await;

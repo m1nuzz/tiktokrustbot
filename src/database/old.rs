@@ -154,16 +154,19 @@ pub fn init_database() -> Result<()> {
         (),
     )?;
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL)",
+        "CREATE TABLE IF NOT EXISTS pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL, job_started_at DATETIME DEFAULT NULL)",
         (),
     )?;
     // Column ensure + retirement run after the CREATE above so fresh
     // databases (where the table does not exist yet) don't error.
     ensure_column(&conn, "pending_downloads", "notified_at", "notified_at DATETIME DEFAULT NULL")?;
     // Heartbeat-extended lease: the deadline a client heartbeat pushes
-    // forward while the mini-app is open, which is what lets the sweeper expire
-    // a lapsed session instead of a session the user is still sitting on.
+    // forward while the mini-app is open, and the record that a download job
+    // really started. Both are what let the sweeper expire a lapsed session
+    // instead of a session the user is still sitting on, and what lets it tell
+    // "never earned the ad" from "the download failed".
     ensure_column(&conn, "pending_downloads", "lease_expires_at", "lease_expires_at DATETIME DEFAULT NULL")?;
+    ensure_column(&conn, "pending_downloads", "job_started_at", "job_started_at DATETIME DEFAULT NULL")?;
     // Silently retire download requests abandoned before this startup (the
     // user never finished watching the ad). They are marked notified so the
     // expiry sweeper never messages them; only new rows get notified. The

@@ -317,17 +317,40 @@ impl DatabasePool {
         }).await.map_err(|e| anyhow::anyhow!("Failed to verify download {}: {}", id, e))
     }
 
-    /// Mark a pending row as terminally failed (download/upload error or job
-    /// budget exceeded). Notified immediately so the sweeper skips it.
-    pub async fn mark_pending_failed(&self, id: &str) -> Result<(), anyhow::Error> {
+    /// Mark a still-claimable row as terminally failed (download/upload error
+    /// or job budget exceeded) and return how many rows actually moved, so the
+    /// caller can tell "this job failed" from "the row was already terminal".
+    ///
+    /// The status guard is the point: without it a row could be flipped to
+    /// `failed` twice - once by the job and once by the sweeper - and the row
+    /// that owns the single failure notification must be unique. Notified
+    /// immediately so the sweeper skips it.
+    pub async fn mark_pending_failed(&self, id: &str) -> Result<usize, anyhow::Error> {
         let id_owned = id.to_string();
         self.execute_with_timeout(move |conn| {
-            conn.execute(
-                "UPDATE pending_downloads SET status = 'failed', notified_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            let rows = conn.execute(
+                "UPDATE pending_downloads SET status = 'failed', notified_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('pending', 'verified')",
                 params![id_owned],
             )?;
-            Ok(())
+            Ok(rows)
         }).await.map_err(|e| anyhow::anyhow!("Failed to mark {} as failed: {}", id, e))
+    }
+
+    /// Record that a download job really began for this row, returning how
+    /// many rows moved (0 = unknown ymid).
+    ///
+    /// This is the gate for the failure message: the sweeper tells a lapsed
+    /// session from a failed download by exactly this column, so a row that
+    /// never started a job can never be told the video failed to download.
+    pub async fn mark_job_started(&self, id: &str) -> Result<usize, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let rows = conn.execute(
+                "UPDATE pending_downloads SET job_started_at = COALESCE(job_started_at, CURRENT_TIMESTAMP) WHERE id = ?1",
+                params![id_owned],
+            )?;
+            Ok(rows)
+        }).await.map_err(|e| anyhow::anyhow!("Failed to mark job started for {}: {}", id, e))
     }
 
     /// Record every Monetag postback hit, even unknown ymids and non_valued:
@@ -715,21 +738,25 @@ impl DatabasePool {
     /// messaged is never returned again) and the LIMIT keeps a service start
     /// from flushing a backlog into chats in one burst.
     ///
-    /// Each row is `(ymid, user_id)`. The row is never deleted; the funnel and
-    /// the per-ymid joins depend on it.
-    pub async fn expire_stale_pending(&self, limit: u32) -> Result<Vec<(String, i64)>, anyhow::Error> {
+    /// Each row is `(ymid, user_id, job_started)`: `job_started` says whether
+    /// a download job really began for this row and is what picks the message -
+    /// a session that never earned its ad is not a failed download. The row is
+    /// never deleted; the funnel and the per-ymid joins depend on it.
+    pub async fn expire_stale_pending(&self, limit: u32) -> Result<Vec<(String, i64, bool)>, anyhow::Error> {
         self.execute_with_timeout(move |conn| {
             let lease_secs = SESSION_LEASE_SECS;
-            let candidates: Vec<(String, i64)> = {
+            let candidates: Vec<(String, i64, bool)> = {
                 let mut stmt = conn.prepare(&format!(
-                    "SELECT id, user_id FROM pending_downloads WHERE status IN ('pending', 'verified') AND notified_at IS NULL AND COALESCE(lease_expires_at, datetime(created_at, '+{lease_secs} seconds')) < datetime('now') ORDER BY created_at ASC LIMIT ?1"
+                    "SELECT id, user_id, job_started_at IS NOT NULL FROM pending_downloads WHERE status IN ('pending', 'verified') AND notified_at IS NULL AND COALESCE(lease_expires_at, datetime(created_at, '+{lease_secs} seconds')) < datetime('now') ORDER BY created_at ASC LIMIT ?1"
                 ))?;
-                stmt.query_map(params![limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
-                    .filter_map(|row| row.ok())
-                    .collect()
+                stmt.query_map(params![limit as i64], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .filter_map(|row| row.ok())
+                .collect()
             };
-            let mut expired_rows: Vec<(String, i64)> = Vec::new();
-            for (id, user_id) in candidates {
+            let mut expired_rows: Vec<(String, i64, bool)> = Vec::new();
+            for (id, user_id, job_started) in candidates {
                 // The lease and the notify-once flag are re-checked in the
                 // write itself: a heartbeat that landed between the SELECT and
                 // here must keep the row, and a second sweeper tick must not
@@ -741,7 +768,7 @@ impl DatabasePool {
                     params![&id],
                 )?;
                 if expired == 1 {
-                    expired_rows.push((id, user_id));
+                    expired_rows.push((id, user_id, job_started));
                 }
             }
             Ok(expired_rows)
@@ -937,7 +964,7 @@ pub(crate) async fn setup_test_db() -> (DatabasePool, tempfile::NamedTempFile) {
             (),
         )?;
         conn.execute(
-            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL)",
+            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL, job_started_at DATETIME DEFAULT NULL)",
             (),
         )?;
         conn.execute(
@@ -1243,6 +1270,42 @@ mod tests {
         assert!(pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap().is_empty());
     }
 
+    /// The message split depends on this column and nothing else: a row whose
+    /// download never started is a lapsed session, a row with a started job
+    /// is a genuine failure.
+    #[tokio::test]
+    async fn expiry_reports_whether_a_download_job_really_started() {
+        let (pool, _file) = setup_test_db().await;
+        pool.execute_with_timeout(|conn| {
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, lease_expires_at) VALUES ('never-earned', 1, 'http://x', datetime('now', '-1 minute'))",
+                (),
+            )?;
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, lease_expires_at, job_started_at) VALUES ('job-running', 2, 'http://y', datetime('now', '-1 minute'), CURRENT_TIMESTAMP)",
+                (),
+            )?;
+            Ok(())
+        }).await.unwrap();
+
+        assert_eq!(pool.mark_job_started("never-earned").await.unwrap(), 1);
+        pool.execute_with_timeout(|conn| {
+            conn.execute(
+                "UPDATE pending_downloads SET lease_expires_at = datetime('now', '-1 minute'), job_started_at = NULL WHERE id = 'never-earned'",
+                (),
+            )?;
+            Ok(())
+        }).await.unwrap();
+
+        let mut swept = pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap();
+        swept.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(swept.len(), 2);
+        assert_eq!(swept[0].0, "job-running");
+        assert!(swept[0].2, "a started job reports job_started");
+        assert_eq!(swept[1].0, "never-earned");
+        assert!(!swept[1].2, "a row with no job reports job_started = false");
+    }
+
     /// A backlog must never be flushed into chats in one burst: the tick is
     /// bounded and the rest waits for the next one.
     #[tokio::test]
@@ -1268,6 +1331,38 @@ mod tests {
         assert_eq!(second.len(), 5, "the remainder goes out on the next tick");
         assert!(
             pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap().is_empty()
+        );
+    }
+
+    /// A row can be failed twice only if the write is unguarded: the sweeper
+    /// and a slow job must not both own the same notification.
+    #[tokio::test]
+    async fn mark_pending_failed_only_moves_a_non_terminal_row() {
+        let (pool, _file) = setup_test_db().await;
+        pool.execute_with_timeout(|conn| {
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('delivered', 1, 'http://x', 'completed')",
+                (),
+            )?;
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('live', 2, 'http://y', 'pending')",
+                (),
+            )?;
+            Ok(())
+        }).await.unwrap();
+
+        assert_eq!(pool.mark_pending_failed("delivered").await.unwrap(), 0);
+        assert_eq!(
+            pool.get_pending_download_status("delivered").await.unwrap(),
+            Some("completed".to_string()),
+            "a delivered row must not be flipped back to failed"
+        );
+
+        assert_eq!(pool.mark_pending_failed("live").await.unwrap(), 1);
+        assert_eq!(pool.mark_pending_failed("live").await.unwrap(), 0);
+        assert_eq!(
+            pool.get_pending_download_status("live").await.unwrap(),
+            Some("failed".to_string())
         );
     }
 

@@ -170,8 +170,13 @@ async fn main() -> Result<(), Error> {
     // webapp is never cut off - and notify each user exactly once, in their
     // own language, with the message that matches what actually happened.
     //
-    // Rows are never deleted: the funnel and the per-ymid joins depend on
-    // them. Legacy rows were retired silently at startup migration.
+    // The message matters: the rows selected here are the ones whose ad was
+    // never valued and where no download was ever attempted, so telling them
+    // "couldn't download the video" was a lie 30 minutes after giving up. A
+    // row is only told the download failed when a download job really started
+    // for it (`job_started_at`). Rows are never deleted: the funnel and the
+    // per-ymid joins depend on them. Legacy rows were retired silently at
+    // startup migration.
     let sweep_db = db_pool.clone();
     let sweep_bot = bot.clone();
     tokio::spawn(async move {
@@ -183,16 +188,19 @@ async fn main() -> Result<(), Error> {
                 .await
             {
                 Ok(stale) => {
-                    for (ymid, user_id) in stale {
+                    for (ymid, user_id, job_started) in stale {
                         let lang = sweep_db.get_effective_lang(user_id, None).await;
-                        log::warn!("Expiring abandoned session {} for user {}", ymid, user_id);
+                        let key = tiktokdownloader::handlers::link::expiry_message_key(job_started);
+                        log::warn!(
+                            "Expiring abandoned session {} for user {} (download started: {})",
+                            ymid,
+                            user_id,
+                            job_started
+                        );
                         let _ = sweep_bot
                             .send_message(
                                 ChatId(user_id),
-                                tiktokdownloader::i18n::t(
-                                    tiktokdownloader::i18n::MsgKey::DownloadFailed,
-                                    Some(lang.as_str()),
-                                ),
+                                tiktokdownloader::i18n::t(key, Some(lang.as_str())),
                             )
                             .await;
                     }
