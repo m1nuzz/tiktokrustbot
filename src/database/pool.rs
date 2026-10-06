@@ -1120,7 +1120,7 @@ pub(crate) async fn setup_test_db() -> (DatabasePool, tempfile::NamedTempFile) {
             (),
         )?;
         conn.execute(
-            "CREATE TABLE monetag_postbacks (id INTEGER PRIMARY KEY, ymid TEXT NOT NULL, event_type TEXT DEFAULT NULL, reward_event_type TEXT NOT NULL, estimated_price REAL DEFAULT NULL, request_var TEXT DEFAULT NULL, sub_zone_id TEXT DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE monetag_postbacks (id INTEGER PRIMARY KEY, ymid TEXT NOT NULL, event_type TEXT DEFAULT NULL, reward_event_type TEXT NOT NULL, estimated_price REAL DEFAULT NULL, request_var TEXT DEFAULT NULL, sub_zone_id TEXT DEFAULT NULL, zone_id TEXT DEFAULT NULL, telegram_user_id TEXT DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
             (),
         )?;
         conn.execute(
