@@ -178,7 +178,6 @@ async fn main() -> Result<(), Error> {
     // per-ymid joins depend on them. Legacy rows were retired silently at
     // startup migration.
     let sweep_db = db_pool.clone();
-    let sweep_bot = bot.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
@@ -189,20 +188,20 @@ async fn main() -> Result<(), Error> {
             {
                 Ok(stale) => {
                     for (ymid, user_id, job_started) in stale {
-                        let lang = sweep_db.get_effective_lang(user_id, None).await;
-                        let key = tiktokdownloader::handlers::link::expiry_message_key(job_started);
+                        // Silent on purpose. This used to message the user; the
+                        // data showed it was wrong, because practically every
+                        // expired session was one where NO ad was displayed -
+                        // so it told people who never saw an ad to resend a link
+                        // that could not help. The row still becomes `expired`
+                        // so the funnel stays honest; only the notification is
+                        // gone. Rows are kept, not deleted: that table is the
+                        // record of what happened and costs ~3.5 MB.
                         log::warn!(
                             "Expiring abandoned session {} for user {} (download started: {})",
                             ymid,
                             user_id,
                             job_started
                         );
-                        let _ = sweep_bot
-                            .send_message(
-                                ChatId(user_id),
-                                tiktokdownloader::i18n::t(key, Some(lang.as_str())),
-                            )
-                            .await;
                     }
                 }
                 Err(e) => log::error!("Expiry sweeper failed: {}", e),

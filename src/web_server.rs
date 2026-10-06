@@ -33,8 +33,11 @@ pub struct AppState {
 pub struct PostbackQuery {
     pub ymid: String,
     // Accept both "value" (per Monetag docs) and "reward_event_type" for backwards compatibility
-    #[serde(alias = "value", alias = "reward_event_type")]
-    pub reward_event_type: String,
+    // Optional on purpose: a required field made the whole struct fail to
+    // deserialize, so a postback arriving without it was dropped silently and
+    // the user got nothing. Absent now means "no verdict", never "valued".
+    #[serde(default, alias = "value", alias = "reward_event_type")]
+    pub reward_event_type: Option<String>,
     #[serde(default)]
     pub event_type: Option<String>,
     #[serde(default)]
@@ -265,6 +268,10 @@ async fn log_mini_app_event(
 pub struct AdImpressionResponse {
     /// True when Monetag journaled at least one ad view for this ymid.
     pub impression: bool,
+    /// True when at least one of those views was `valued`, i.e. Monetag paid for
+    /// it. The client branches on this after the ad closes: valued delivers the
+    /// video now, non-valued offers the single retry.
+    pub valued: bool,
 }
 
 pub async fn start_web_server(state: AppState, port: u16) {
@@ -611,7 +618,10 @@ async fn monetag_postback(
     Query(query): Query<PostbackQuery>,
     RawQuery(raw): RawQuery,
 ) -> impl axum::response::IntoResponse {
-    let reward = query.reward_event_type.to_lowercase();
+    let reward = query
+        .reward_event_type
+        .unwrap_or_default()
+        .to_lowercase();
     // The extractor drops any macro absent from PostbackQuery, so the parsed
     // view can never tell us what we are NOT capturing. Log the raw query once
     // per postback: an unexpected parameter has to be visible in the journal,
@@ -679,22 +689,28 @@ async fn monetag_postback(
     }
     if reward != "valued" {
         log::info!(
-            "Ad display for ymid {} was not valued - delivering anyway, revenue stays 0",
+            "Ad display for ymid {} was not valued - the client offers one retry",
             query.ymid
         );
     }
 
+    // No delivery from here: Monetag's verdict arrives ~4s after the ad STARTS,
+    // so delivering at this point put the video on screen while the ad was still
+    // playing and made the user's close meaningless. The row is verified so the
+    // client's claim on close succeeds.
+    if let Err(e) = state.db.mark_as_verified_with_logging(&query.ymid).await {
+        log::warn!("Could not verify row for ymid {}: {}", query.ymid, e);
+    }
+
     let task_state = state.clone();
     let task_ymid = query.ymid.clone();
-    // Detached valued sequence: Monetag times out slow postback responses,
-    // so the HTTP handler must answer 200 OK immediately.
+    // Safety net for the case the client never comes back: a valued postback
+    // that arrives long after the ad, with nobody left to press anything.
     tokio::spawn(async move {
         match deliver_after_ad_display(&task_state.db, &task_ymid).await {
             ValuedPostbackResult::Delivered { user_id, url, via } => {
-                // Instant auto-delivery: the user may already be browsing the
-                // advertiser's page, so the chat must not wait for a return.
                 log::info!(
-                    "Auto-delivering download for user {} (valued postback)",
+                    "Delivering download for user {} (valued postback, client did not claim)",
                     user_id
                 );
                 spawn_download_job(task_state, user_id, url, task_ymid, via).await;
@@ -797,14 +813,18 @@ async fn get_ad_impression(
     let db = state.db.clone();
     let ymid = query.ymid.clone();
 
-    match db.has_ad_impression(&ymid).await {
-        Ok(true) => Json(AdImpressionResponse { impression: true }),
-        Ok(false) => Json(AdImpressionResponse { impression: false }),
-        Err(e) => {
-            log::warn!("ad-impression check failed for ymid {}: {}", ymid, e);
-            Json(AdImpressionResponse { impression: false })
-        }
-    }
+    let impression = db.has_ad_impression(&ymid).await.unwrap_or_else(|e| {
+        log::warn!("ad-impression check failed for ymid {}: {}", ymid, e);
+        false
+    });
+    let valued = db.has_valued_impression(&ymid).await.unwrap_or_else(|e| {
+        log::warn!("ad-valued check failed for ymid {}: {}", ymid, e);
+        false
+    });
+    Json(AdImpressionResponse {
+        impression,
+        valued,
+    })
 }
 
 async fn claim_video(

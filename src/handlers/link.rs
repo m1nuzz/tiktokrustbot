@@ -93,20 +93,6 @@ fn classify_download_error(err: &anyhow::Error) -> MsgKey {
 }
 
 /// Which message an expired session earns.
-///
-/// The expiry sweeper only ever sees rows whose ad was never valued, so for
-/// most of them no download was ever attempted and the honest message is "the
-/// session expired", not "the video failed to download". `job_started` comes
-/// from `pending_downloads.job_started_at`, which is written only when a
-/// download job really begins - that one case is a genuine failure.
-pub fn expiry_message_key(job_started: bool) -> MsgKey {
-    if job_started {
-        MsgKey::DownloadFailed
-    } else {
-        MsgKey::SessionExpired
-    }
-}
-
 /// Terminal-failure path: record it, mark the pending row failed, and tell
 /// the user in their own language. Internal details stay in the log.
 #[allow(clippy::too_many_arguments)]
@@ -505,66 +491,6 @@ mod tests {
 
         let generic = anyhow::anyhow!("yt-dlp failed: ERROR: Video unavailable");
         assert_eq!(classify_download_error(&generic), crate::i18n::MsgKey::DownloadFailed);
-    }
-
-    /// The message split: a session that expired before it earned the ad must
-    /// never be told the video failed to download, and only a row with a
-    /// started job may be.
-    #[tokio::test]
-    async fn expiry_message_routes_by_what_actually_happened() {
-        let (pool, _file) = ads_test_db().await;
-        let lapsed = pool
-            .create_pending_download(1, "http://x")
-            .await
-            .unwrap();
-        pool.execute_with_timeout({
-            let lapsed = lapsed.clone();
-            move |conn| {
-                conn.execute(
-                    "UPDATE pending_downloads SET lease_expires_at = datetime('now', '-1 minute') WHERE id = ?1",
-                    params![lapsed],
-                )?;
-                Ok(())
-            }
-        })
-        .await
-        .unwrap();
-
-        let swept = pool
-            .expire_stale_pending(crate::database::EXPIRY_BATCH_LIMIT)
-            .await
-            .unwrap();
-        assert_eq!(swept.len(), 1);
-        let (ymid, _user_id, job_started) = swept.into_iter().next().unwrap();
-        assert_eq!(ymid, lapsed);
-        assert!(!job_started);
-        assert_eq!(expiry_message_key(job_started), MsgKey::SessionExpired);
-        assert_ne!(expiry_message_key(job_started), MsgKey::DownloadFailed);
-
-        // The same row, but a download really started for it.
-        assert_eq!(pool.mark_job_started(&lapsed).await.unwrap(), 1);
-        pool.execute_with_timeout({
-            let lapsed = lapsed.clone();
-            move |conn| {
-                conn.execute(
-                    "UPDATE pending_downloads SET status = 'pending', notified_at = NULL, lease_expires_at = datetime('now', '-1 minute') WHERE id = ?1",
-                    params![lapsed],
-                )?;
-                Ok(())
-            }
-        })
-        .await
-        .unwrap();
-
-        let (_, _, job_started) = pool
-            .expire_stale_pending(crate::database::EXPIRY_BATCH_LIMIT)
-            .await
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        assert!(job_started);
-        assert_eq!(expiry_message_key(job_started), MsgKey::DownloadFailed);
     }
 
     /// One message per row: the job budget has to end before the lease window

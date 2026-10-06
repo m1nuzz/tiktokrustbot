@@ -48,7 +48,7 @@ pub const SESSION_LEASE_SECS: i64 = 1800;
 /// away. A session that is genuinely never finished therefore keeps its row
 /// (and its ad) alive for up to a day - the cost is a small amount of dead
 /// rows in the funnel, paid for so no earned reward is thrown away.
-pub const SESSION_LEASE_CEILING_SECS: i64 = 24 * 60 * 60;
+pub const SESSION_LEASE_CEILING_SECS: i64 = 3 * 24 * 60 * 60;
 
 /// Rows one sweeper tick may notify, oldest first. Without a bound a service
 /// start would flush every accumulated backlog into chats in a single burst;

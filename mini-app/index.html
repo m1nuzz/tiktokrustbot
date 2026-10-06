@@ -272,6 +272,8 @@
         let adAttemptToken = 0; // guards async ad verdicts against stale attempts
         let impressionSeen = false; // this ymid already presented an ad: no new show()
         let adRequested = false; // an interstitial was already REQUESTED for this ymid
+        let retryAsPopup = false; // the ad was not counted: the retry button offers the popup
+        let retryUsed = false; // the retry popup has already been shown
         let adShownAt = 0; // timestamp of the last show() call: proves one ran
         let watchedFastDelivered = false; // per ymid: one fast-path delivery, no doubles
         let sdkInjectCount = 0; // cache-buster for repeated SDK injections
@@ -649,6 +651,41 @@
         }
 
 // ========== LEVEL 1: SDK Ad ==========
+        // What the server knows about this ymid: was an ad shown at all, and
+        // did Monetag count it. Only the counted half decides whether the user
+        // gets the video now or the single retry first.
+        async function fetchAdVerdict() {
+            try {
+                const res = await fetch(`${apiBase}${AD_CONFIG.impressionUrl}?ymid=${encodeURIComponent(ymid)}`);
+                const data = await res.json();
+                return { impression: !!(data && data.impression), valued: !!(data && data.valued) };
+            } catch (e) {
+                return { impression: false, valued: false };
+            }
+        }
+
+        // The ad is over. Counted -> the video goes out now. Not counted -> the
+        // retry screen, whose button opens the popup instead of another banner.
+        // Either way the user ends up with the video; the ad is the money
+        // attempt, not the permission.
+        async function settleOutcome() {
+            const v = await fetchAdVerdict();
+            if (v.valued) {
+                autoClaim();
+                startPolling();
+                return;
+            }
+            trackEvent(v.impression ? 'ad_unvalued' : 'ad_not_shown');
+            retryAsPopup = true;
+            showNoAds();
+        }
+
+        // The retry popup was not counted either. Nothing left to try, so the
+        // video goes out anyway after a short wait.
+        function deliverAfterFailedRetry() {
+            setTimeout(() => { autoClaim(); startPolling(); }, 15000);
+        }
+
         function trySDKAd(fromRecovery) {
             // One ymid = one show: repeated show() calls with the same ymid
             // spam duplicate impression postbacks that Monetag prices at zero
@@ -718,10 +755,9 @@
                     // blanking it here is what produced the empty window after
                     // Continue. The screens that really answer (no-ads,
                     // ad-blocked, valued, error) hide it themselves.
-                    // Auto-claim first, then keep polling: whichever wins
-                    // (claim gate or valued postback auto-delivery) delivers once.
-                    autoClaim();
-                    startPolling();
+                    // Counted ad -> the video goes out now. Not counted -> the
+                    // retry screen, whose button opens the popup.
+                    await settleOutcome();
                 })
                 .catch((e) => {
                     console.error("Ad failed", e);
@@ -964,10 +1000,11 @@
                         if (await tryWatchedFastDeliver(token)) return;
                         if (token !== adAttemptToken) return;
                         loaderView.classList.add('hidden');
-                        // Auto-claim first, then keep polling: whichever wins
-                        // (claim gate or valued postback auto-delivery) delivers once.
-                        autoClaim();
-                        startPolling();
+                        if (retryUsed) {
+                            deliverAfterFailedRetry();
+                            return;
+                        }
+                        await settleOutcome();
                     })
                     .catch((e) => {
                         console.error("Popup failed", e);
@@ -1198,6 +1235,7 @@
         const TRACKED_STAGES = new Set([
             'probe_start', 'sdk_host_ok', 'sdk_probe_fail', 'adblock_screen',
             'ad_resolve', 'ad_reject', 'ad_timeout', 'ad_throw',
+            'ad_unvalued', 'ad_not_shown',
             'oracle_impression', 'oracle_none', 'no_fill_screen', 'page_reload',
             'watchdog_recover', 'bonus_popup_shown', 'bonus_popup_tapped',
             'adblock_popup_shown', 'adblock_popup_tapped', 'retry_suppressed',
@@ -1522,6 +1560,15 @@
 
         // Обработчик кнопки Start Ad Manually / Try ad again
         adBtn.addEventListener('click', () => {
+            if (retryAsPopup) {
+                retryAsPopup = false;
+                retryUsed = true;
+                cancelRetry();
+                stopPolling();
+                claimFired = false;
+                tryPopup('valued_retry');
+                return;
+            }
             cancelRetry();
             stopPolling();
             retryCount = 0;
