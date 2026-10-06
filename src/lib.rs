@@ -43,6 +43,65 @@ pub type MyDialogue = dialogue::Dialogue<
     dialogue::InMemStorage<BroadcastState>,
 >;
 
+/// Which `/start` branch owns a message. Exhaustive on purpose: a deep link the
+/// bot issues itself must be routed to its own handler, and every other payload
+/// must keep reaching referral attribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartRoute {
+    /// `/start premium`: the ad-blocked mini-app's "buy premium" button. Raises
+    /// the existing Stars invoice and is NOT a referral code.
+    Premium,
+    /// Any other payload (or none): register the user and attribute the ref.
+    Referral,
+}
+
+/// `None` means "not a /start at all", so no /start branch should claim it.
+fn start_route(text: Option<&str>) -> Option<StartRoute> {
+    match crate::handlers::command::parse_start_payload(text?) {
+        Some(Some(payload)) if payload == PREMIUM_START_PAYLOAD => Some(StartRoute::Premium),
+        Some(_) => Some(StartRoute::Referral),
+        None => None,
+    }
+}
+
+/// Deep-link token the ad-blocked screen's premium button opens.
+const PREMIUM_START_PAYLOAD: &str = "premium";
+
+/// `/start premium` from the mini-app's buy-premium button. Sends the existing
+/// Stars invoice and then the normal Welcome, so the session looks ordinary.
+///
+/// This branch must exist and must come BEFORE the generic payload branch:
+/// `start_with_payload_handler` never inspects the payload, so without it the
+/// token would be swallowed into referral attribution and write
+/// `ref_code='premium'` while only sending Welcome - the user would see no
+/// invoice at all. Pricing, payload, duration and the `buy_premium` callback are
+/// untouched; this only adds a way in.
+async fn premium_start_handler(
+    bot: Bot,
+    msg: Message,
+    db_pool: Arc<DatabasePool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let user_id = msg.chat.id.0;
+    // Register and touch last_active, but deliberately NOT ref_code: this token
+    // is ours, not a campaign's.
+    if let Err(e) =
+        handlers::command::record_start_attribution(&db_pool, user_id, None).await
+    {
+        log::error!("Failed to update user activity: {}", e);
+    }
+    db_pool.log_funnel_event(user_id, "premium_deep_link").await;
+    log::info!("User {} opened the premium deep link", user_id);
+
+    handlers::payments::send_premium_invoice(bot.clone(), msg.chat.id.into(), db_pool, None).await?;
+
+    let lang = db_pool.get_effective_lang(user_id, None).await;
+    bot.send_message(msg.chat.id, i18n::t(i18n::MsgKey::Welcome, Some(lang.as_str())))
+        .reply_markup(handlers::command::get_main_reply_keyboard())
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    Ok(())
+}
+
 // For deduplication
 lazy_static::lazy_static! {
     static ref PROCESSING: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -173,6 +232,9 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                     let ytdlp = exe_dir.join("lib").join("yt-dlp").to_string_lossy().to_string();
                     handlers::fingerprint::set_fingerprint_handler(bot, msg, db_pool, fp, &ytdlp).await
                 }))
+                .branch(Update::filter_message().filter(|msg: Message| start_route(msg.text()) == Some(StartRoute::Premium)).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+                    premium_start_handler(bot, msg, db_pool).await
+                }))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| crate::handlers::command::parse_start_payload(t).is_some())).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
                     start_with_payload_handler(bot, msg, db_pool).await
                 }))
@@ -255,4 +317,45 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                     Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
                 }))
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The routing is what keeps `/start premium` from becoming a ref_code, so
+    /// it is pinned per payload: our token to the invoice, everything else to
+    /// attribution.
+    #[test]
+    fn only_the_premium_token_claims_the_invoice_branch() {
+        assert_eq!(
+            start_route(Some("/start premium")),
+            Some(StartRoute::Premium)
+        );
+        assert_eq!(
+            start_route(Some("/start@tikyoubot premium")),
+            Some(StartRoute::Premium)
+        );
+
+        // Referral payloads and a bare /start must keep reaching attribution.
+        for text in [
+            "/start",
+            "/start site",
+            "/start premium2",
+            "/start Premium",
+            "/start ref premium",
+        ] {
+            assert_eq!(
+                start_route(Some(text)),
+                Some(StartRoute::Referral),
+                "{} must stay a referral payload",
+                text
+            );
+        }
+
+        // Not a /start at all: no /start branch may claim it.
+        assert_eq!(start_route(Some("/help")), None);
+        assert_eq!(start_route(Some("hello")), None);
+        assert_eq!(start_route(None), None);
+    }
 }

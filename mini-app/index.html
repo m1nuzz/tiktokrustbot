@@ -155,6 +155,7 @@
             
             <button id="ad-btn" class="btn hidden">🎬 Start Ad Manually</button>
             <button id="claim-btn" class="btn hidden">🎬 Get my video</button>
+            <button id="premium-btn" class="btn hidden"></button>
             <button id="direct-btn" class="btn btn-success hidden">🚀 Continue to Bot</button>
             
             <div id="status-message" style="margin-top: 20px; font-size: 14px;"></div>
@@ -292,6 +293,7 @@
         const contentView = document.getElementById('content-view');
         const adBtn = document.getElementById('ad-btn');
         const claimBtn = document.getElementById('claim-btn');
+        const premiumBtn = document.getElementById('premium-btn');
         const directBtn = document.getElementById('direct-btn');
         const statusMsg = document.getElementById('status-message');
         const description = document.getElementById('description');
@@ -308,6 +310,13 @@
         // ?lang= wins, else the stored /language override, else English).
         // Falls back to the key name when opened without injection.
         const STRINGS = /*STRINGS_INJECT*/null;
+
+        // Bot username, injected per request by the server from BOT_USERNAME so
+        // the ad-blocked screen can hand the user back to the bot for premium.
+        // Null when the deployment does not set it: the button is then simply
+        // not rendered. Never hardcoded here, and never a token.
+        const BOT_USERNAME = /*BOT_USERNAME_INJECT*/null;
+
         function t(key) {
             if (typeof STRINGS === 'object' && STRINGS !== null
                 && typeof STRINGS[key] === 'string' && STRINGS[key]) return STRINGS[key];
@@ -554,6 +563,7 @@
             description.innerText = t(messageKey);
             claimBtn.classList.add('hidden');
             adBtn.classList.add('hidden');
+            premiumBtn.classList.add('hidden');
             directBtn.innerText = t('MiniBtnContinueBot');
             directAction = 'close';
             directBtn.classList.remove('hidden');
@@ -566,6 +576,7 @@
             document.getElementById('title').innerText = t('MiniErrTitle');
             description.innerText = message;
             claimBtn.classList.add('hidden');
+            premiumBtn.classList.add('hidden');
             directAction = 'close';
             directBtn.classList.remove('hidden');
         }
@@ -578,6 +589,7 @@
             directAction = 'close';
             if (showDirect) directBtn.classList.remove('hidden');
             claimBtn.classList.add('hidden');
+            premiumBtn.classList.add('hidden');
         }
 
         // ========== POLLING МЕХАНИЗМ ==========
@@ -984,6 +996,7 @@
             description.innerText = t('MiniNoAdsDesc');
             // Every visible button must do something: claim / offer / retry.
             trackEvent('no_fill_screen');
+            premiumBtn.classList.add('hidden');
             claimBtn.innerText = t('MiniBtnGetVideo');
             claimBtn.classList.remove('hidden');
             directBtn.innerText = t('MiniBtnQuickOffer');
@@ -1023,6 +1036,17 @@
             directBtn.innerText = t('MiniBtnReloadOffer');
             directAction = 'reload_popup';
             directBtn.classList.remove('hidden');
+            // A blocked device is exactly the user who most wants to pay, and
+            // this screen used to be a dead end with nothing to act on. Its own
+            // button, not directBtn: directBtn is bound to the reload-offer
+            // action and its directAction is reset by showError/showFinalUI.
+            // Rendered only when the server injected a username.
+            if (typeof BOT_USERNAME === 'string' && BOT_USERNAME) {
+                premiumBtn.innerText = t('PremiumButton');
+                premiumBtn.classList.remove('hidden');
+            } else {
+                premiumBtn.classList.add('hidden');
+            }
             trackEvent('adblock_popup_shown');
             trackEvent('adblock_screen');
             armAdblockWatchdog();
@@ -1177,7 +1201,8 @@
             'adblock_popup_shown', 'adblock_popup_tapped', 'retry_suppressed',
             'claim_tapped', 'already_delivered', 'watched_deliver',
             'session_expired', 'session_failed', 'lease_offer_surface',
-            'ad_requested', 'session_rotated', 'session_reused'
+            'ad_requested', 'session_rotated', 'session_reused',
+            'premium_deep_link_tapped'
         ]);
         const trackedSent = new Set();
 
@@ -1392,6 +1417,7 @@
             description.innerText = t('MiniSuccessDesc');
             claimBtn.classList.add('hidden');
             adBtn.classList.add('hidden');
+            premiumBtn.classList.add('hidden');
             directBtn.classList.add('hidden');
             // Monetag owns the duration and the client no longer keeps a watch
             // clock of its own, so there is nothing left to wait for here: the
@@ -1541,6 +1567,22 @@
             } else {
                 closeWebapp();
             }
+        });
+
+        // Buy premium from the ad-blocked screen: hand the user back to the bot
+        // with a /start premium deep link, which the bot turns into the existing
+        // Stars invoice. A deep link rather than posting data out of the webapp:
+        // the bot raises the invoice itself, so there is no new update branch to
+        // add and no web-app query to answer.
+        premiumBtn.addEventListener('click', () => {
+            if (typeof BOT_USERNAME !== 'string' || !BOT_USERNAME) return;
+            trackEvent('premium_deep_link_tapped');
+            try {
+                tg.openTelegramLink('https://t.me/' + BOT_USERNAME + '?start=premium');
+            } catch (e) {
+                // Nothing to fall back to on this screen; closing is still right.
+            }
+            closeWebapp();
         });
 
         // The user may have tapped the creative and left for the offer page

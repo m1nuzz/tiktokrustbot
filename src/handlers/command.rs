@@ -34,6 +34,37 @@ pub fn parse_start_payload(text: &str) -> Option<Option<String>> {
 }
 
 
+/// Register the sender and store first-touch referral attribution.
+/// Extracted from the handler so the attribution rule is testable without a Bot:
+/// a deep link that is NOT a referral code must never reach this, or the bot
+/// attributes its own deep link to the campaign that owns `ref_code`.
+pub async fn record_start_attribution(
+    db_pool: &DatabasePool,
+    user_id: i64,
+    payload: Option<String>,
+) -> Result<(), anyhow::Error> {
+    db_pool
+        .execute_with_timeout(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO users (telegram_id) VALUES (?1)",
+                [user_id],
+            )?;
+            conn.execute(
+                "UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE telegram_id = ?1",
+                [user_id],
+            )?;
+            // First-touch attribution only: never overwrite an existing ref_code.
+            if let Some(r) = payload {
+                conn.execute(
+                    "UPDATE users SET ref_code = ?1 WHERE telegram_id = ?2 AND ref_code IS NULL",
+                    rusqlite::params![r, user_id],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+}
+
 /// /start entry point (takes precedence over the bare Command::Start arm so
 /// the deep-link payload survives parsing). Registers the user, stores the
 /// first-touch ref_code for traffic attribution, and sends the welcome.
@@ -48,21 +79,7 @@ pub async fn start_with_payload_handler(
         .and_then(parse_start_payload)
         .flatten();
 
-    let ref_owned = payload.clone();
-    let result = db_pool.execute_with_timeout(move |conn| {
-        conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?1)", [user_id])?;
-        conn.execute("UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE telegram_id = ?1", [user_id])?;
-        // First-touch attribution only: never overwrite an existing ref_code.
-        if let Some(r) = ref_owned {
-            conn.execute(
-                "UPDATE users SET ref_code = ?1 WHERE telegram_id = ?2 AND ref_code IS NULL",
-                rusqlite::params![r, user_id],
-            )?;
-        }
-        Ok(())
-    }).await;
-
-    if let Err(e) = result {
+    if let Err(e) = record_start_attribution(&db_pool, user_id, payload.clone()).await {
         log::error!("Failed to update user activity: {}", e);
     }
     if let Some(r) = &payload {
@@ -148,5 +165,45 @@ mod tests {
         assert_eq!(parse_start_payload("/help"), None);
         assert_eq!(parse_start_payload("hello"), None);
         assert_eq!(parse_start_payload("/startsomething"), None);
+    }
+
+    async fn ref_code_of(pool: &crate::database::DatabasePool, user_id: i64) -> Option<String> {
+        pool.execute_with_timeout(move |conn| {
+            conn.query_row(
+                "SELECT ref_code FROM users WHERE telegram_id = ?1",
+                [user_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A referral payload is still recorded, and first-touch wins: this is the
+    /// branch `/start premium` must be diverted away from.
+    #[tokio::test]
+    async fn start_attribution_records_the_ref_code_once() {
+        let (pool, _file) = crate::database::setup_test_db().await;
+
+        record_start_attribution(&pool, 71, Some("site".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(ref_code_of(&pool, 71).await, Some("site".to_string()));
+
+        // A later press must never overwrite the first touch.
+        record_start_attribution(&pool, 71, Some("other".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(ref_code_of(&pool, 71).await, Some("site".to_string()));
+    }
+
+    /// A `/start` with no payload registers the user without inventing
+    /// attribution for them.
+    #[tokio::test]
+    async fn start_without_a_payload_writes_no_ref_code() {
+        let (pool, _file) = crate::database::setup_test_db().await;
+
+        record_start_attribution(&pool, 72, None).await.unwrap();
+        assert_eq!(ref_code_of(&pool, 72).await, None);
     }
 }

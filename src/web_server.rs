@@ -294,6 +294,28 @@ fn inject_mini_app_strings(html: &str, lang: &str, dict: &serde_json::Value) -> 
     )
 }
 
+/// Substitutes the bot username into the mini-app template, the same way the
+/// STRINGS dict is injected.
+///
+/// The username lives nowhere in the codebase and must never be hardcoded in the
+/// client: it is only rendered into a `t.me/<username>` deep link, so the value
+/// is whitelisted down to the characters a Telegram username can contain (a
+/// leading `@` is dropped, everything else that is not `[A-Za-z0-9_]` is
+/// removed). Unset or unusable leaves the literal `null` in place, and the
+/// client then simply does not render the premium button.
+///
+/// A JSON string literal is emitted rather than raw interpolation, so no value
+/// can terminate the declaration or inject script.
+fn inject_bot_username(html: &str, username: Option<&str>) -> String {
+    let literal = username
+        .map(|name| name.trim().trim_start_matches('@'))
+        .map(|name| name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').collect::<String>())
+        .filter(|name| !name.is_empty())
+        .map(|name| serde_json::Value::String(name).to_string())
+        .unwrap_or_else(|| "null".to_string());
+    html.replace("/*BOT_USERNAME_INJECT*/null", &literal)
+}
+
 async fn serve_mini_app(
     State(state): State<AppState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
@@ -326,6 +348,11 @@ async fn serve_mini_app(
         );
     }
     let html = inject_mini_app_strings(&html, &lang, &serde_json::Value::Object(dict));
+    // The bot username, injected the same way as the STRINGS dict so the
+    // ad-blocked screen can offer premium without the username ever appearing in
+    // the client source. Unset in the environment means no premium button.
+    let bot_username = std::env::var("BOT_USERNAME").ok();
+    let html = inject_bot_username(&html, bot_username.as_deref());
     // Never cache the document: Telegram WebViews keep serving a stale copy
     // otherwise, and users get stuck on old funnel screens (e.g. a blue,
     // always-visible Continue from a build before btn-success/watch-gate).
@@ -868,11 +895,53 @@ mod tests {
         assert!(out.contains("\"MiniNoAdsTitle\":\"x\""));
     }
 
+    /// The username injection must never break the inline script: a second
+    /// `const BOT_USERNAME`, a leftover marker or a stray `null` all killed the
+    /// whole page once already.
+    #[test]
+    fn bot_username_injection_emits_single_declaration() {
+        let template = "<script>const BOT_USERNAME = /*BOT_USERNAME_INJECT*/null;</script>";
+
+        let injected = inject_bot_username(template, Some("tikyoubot"));
+        assert_eq!(injected.matches("const BOT_USERNAME").count(), 1);
+        assert!(injected.contains("const BOT_USERNAME = \"tikyoubot\";"));
+        assert!(!injected.contains("BOT_USERNAME_INJECT"));
+
+        // Unset: the declaration survives with a null value, which is what makes
+        // the client skip the button instead of rendering a broken deep link.
+        let unset = inject_bot_username(template, None);
+        assert_eq!(unset.matches("const BOT_USERNAME").count(), 1);
+        assert!(unset.contains("const BOT_USERNAME = null;"));
+    }
+
+    /// The value is interpolated into served script, so it is whitelisted and
+    /// emitted as a JSON literal: no quote, angle bracket or statement can get
+    /// through, whatever the environment holds.
+    #[test]
+    fn bot_username_is_whitelisted_before_it_reaches_the_client() {
+        let template = "<script>const BOT_USERNAME = /*BOT_USERNAME_INJECT*/null;</script>";
+
+        assert!(inject_bot_username(template, Some("@Some_Bot1"))
+            .contains("\"Some_Bot1\""));
+        // Anything outside [A-Za-z0-9_] is dropped, including an attempt to end
+        // the declaration and start new script.
+        let hostile = inject_bot_username(template, Some("bot\";alert(1);//"));
+        assert!(
+            hostile.contains("const BOT_USERNAME = \"botalert1\";"),
+            "hostile value must be reduced to plain characters, got {}",
+            hostile
+        );
+        assert!(!hostile.contains("alert(1);//\""));
+
+        // Whitespace-only and empty are treated as unset.
+        assert!(inject_bot_username(template, Some("   ")).contains("null;"));
+        assert!(inject_bot_username(template, Some("")).contains("null;"));
+    }
+
     /// serde drops unknown body fields instead of rejecting them, so a body
     /// from an already-open older client still reaches the gate.
     #[test]
-    fn claim_request_ignores_unknown_body_fields() {
-        let parsed: ClaimRequest =
+    fn claim_request_ignores_unknown_body_fields() {        let parsed: ClaimRequest =
             serde_json::from_str(r#"{"ymid":"legacy-ymid","legacy_attestation":true}"#).unwrap();
         assert_eq!(parsed.ymid, "legacy-ymid");
     }

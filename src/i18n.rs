@@ -1572,6 +1572,9 @@ pub const MINI_APP_STRINGS: &[(&str, MsgKey)] = &[
     ("MiniErrTooLong", MsgKey::MiniErrTooLong),
     ("MiniErrNoServer", MsgKey::MiniErrNoServer),
     ("MiniErrClaim", MsgKey::MiniErrClaim),
+    // The ad-blocked screen's premium button reuses the already-translated bot
+    // button text instead of adding a second string for the same words.
+    ("PremiumButton", MsgKey::PremiumButton),
 ];
 
 #[cfg(test)]
