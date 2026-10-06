@@ -60,17 +60,6 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Res
 pub fn init_database() -> Result<()> {
     let db_path = get_database_path();
     let conn = Connection::open(db_path)?;
-    // Monetag documents zone_id and telegram_id as postback macros; both were
-    // being dropped, so a postback attributed to another zone was
-    // indistinguishable from a normal one.
-    ensure_column(&conn, "monetag_postbacks", "zone_id", "zone_id TEXT DEFAULT NULL")?;
-    ensure_column(
-        &conn,
-        "monetag_postbacks",
-        "telegram_user_id",
-        "telegram_user_id TEXT DEFAULT NULL",
-    )?;
-
     conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME, lang TEXT DEFAULT NULL)",
@@ -219,6 +208,17 @@ pub fn init_database() -> Result<()> {
     // Runs after the CREATE above so fresh databases don't error.
     ensure_column(&conn, "monetag_postbacks", "request_var", "request_var TEXT DEFAULT NULL")?;
     ensure_column(&conn, "monetag_postbacks", "sub_zone_id", "sub_zone_id TEXT DEFAULT NULL")?;
+    // Monetag documents zone_id and telegram_id as postback macros; both were
+    // being dropped, so a postback attributed to another zone was
+    // indistinguishable from a normal one. Also after the CREATE: ALTER TABLE on
+    // a table that does not exist yet fails outright.
+    ensure_column(&conn, "monetag_postbacks", "zone_id", "zone_id TEXT DEFAULT NULL")?;
+    ensure_column(
+        &conn,
+        "monetag_postbacks",
+        "telegram_user_id",
+        "telegram_user_id TEXT DEFAULT NULL",
+    )?;
     // Client-side ad-funnel telemetry. The mini-app cannot tell "no fill" from
     // "ad blocked on this device", so every stage transition is reported here
     // and correlated with monetag_postbacks by ymid.
