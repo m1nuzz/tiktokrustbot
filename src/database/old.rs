@@ -63,9 +63,9 @@ pub fn init_database() -> Result<()> {
     // Monetag documents zone_id and telegram_id as postback macros; both were
     // being dropped, so a postback attributed to another zone was
     // indistinguishable from a normal one.
-    ensure_column(conn, "monetag_postbacks", "zone_id", "zone_id TEXT DEFAULT NULL")?;
+    ensure_column(&conn, "monetag_postbacks", "zone_id", "zone_id TEXT DEFAULT NULL")?;
     ensure_column(
-        conn,
+        &conn,
         "monetag_postbacks",
         "telegram_user_id",
         "telegram_user_id TEXT DEFAULT NULL",

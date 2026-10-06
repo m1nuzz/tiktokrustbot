@@ -1167,7 +1167,7 @@ mod tests {
         // Mirror the handler: the postback is journaled before the delivery task
         // runs, and the journaled row IS the proof the gate reads. Without it this
         // ymid has no valued impression and the gate must refuse.
-        db.log_postback("valued-pending", Some("impression"), "valued", None, None, None, None)
+        db.log_postback("valued-pending", Some("impression"), "valued", None, None, None, None, None)
             .await
             .unwrap();
 
@@ -1199,7 +1199,7 @@ mod tests {
 
         let mut deliveries = 0;
         for _ in 0..3 {
-            db.log_postback("retried", Some("impression"), "valued", None, None, None, None)
+            db.log_postback("retried", Some("impression"), "valued", None, None, None, None, None)
                 .await
                 .unwrap();
             if let ValuedPostbackResult::Delivered { .. } =
@@ -1285,7 +1285,7 @@ mod tests {
         crate::database::setup_gate_row(&db, "too-late", "expired", 5, &[]).await;
 
         for ymid in ["already-done", "too-late", "never-existed"] {
-            db.log_postback(ymid, Some("impression"), "valued", None, None, None, None)
+            db.log_postback(ymid, Some("impression"), "valued", None, None, None, None, None)
                 .await
                 .unwrap();
             let outcome = deliver_after_ad_display(&db, ymid).await;

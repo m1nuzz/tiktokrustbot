@@ -2104,7 +2104,7 @@ mod tests {
         // Even once the impression journal has caught up, the request-time
         // marker keeps the ymid spent: the two signals are independent.
         pool.mark_ad_requested(&rotated.ymid).await.unwrap();
-        pool.log_postback(&rotated.ymid, Some("impression"), "valued", None, None, None, None)
+        pool.log_postback(&rotated.ymid, Some("impression"), "valued", None, None, None, None, None)
             .await
             .unwrap();
         let again = pool
