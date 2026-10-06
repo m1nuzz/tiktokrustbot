@@ -1119,6 +1119,12 @@ mod tests {
         let (pool, _file) = crate::database::setup_test_db().await;
         let db = Arc::new(pool);
         crate::database::setup_gate_row(&db, "valued-pending", "pending", 5, &[]).await;
+        // Mirror the handler: the postback is journaled before the delivery task
+        // runs, and the journaled row IS the proof the gate reads. Without it this
+        // ymid has no valued impression and the gate must refuse.
+        db.log_postback("valued-pending", Some("impression"), "valued", None, None, None)
+            .await
+            .unwrap();
 
         let outcome = run_valued_delivery(&db, "valued-pending").await;
         assert_eq!(

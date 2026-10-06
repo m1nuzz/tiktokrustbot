@@ -1382,8 +1382,12 @@ mod tests {
     async fn heartbeat_cannot_push_the_lease_past_the_ceiling() {
         let (pool, _file) = setup_test_db().await;
         pool.execute_with_timeout(|conn| {
+            // 23h45m + 30m = 24h15m, past the 24h ceiling, so the `min()` clamp is
+            // what sets this row's deadline. Do NOT "simplify" the age to 23h: that
+            // leaves the ceiling an hour away, the lease is then the earlier of the
+            // two, and the clamp stops being observable at all.
             conn.execute(
-                "INSERT INTO pending_downloads (id, user_id, video_url, created_at) VALUES ('almost-a-day-old', 8, 'http://v', datetime('now', '-23 hours'))",
+                "INSERT INTO pending_downloads (id, user_id, video_url, created_at) VALUES ('almost-a-day-old', 8, 'http://v', datetime('now', '-23 hours 45 minutes'))",
                 (),
             )?;
             conn.execute(
@@ -1407,8 +1411,16 @@ mod tests {
         assert_eq!(
             lease_span_secs(&pool, "almost-a-day-old").await,
             SESSION_LEASE_CEILING_SECS,
-            "a 23-hour-old session is clamped to the ceiling, not extended by 30 min"
+            "a session 23h45m old is clamped to the ceiling, not extended by 30 min"
         );
+        // The invariant itself, checked for a clamped and an unclamped row alike.
+        for ymid in ["brand-new", "almost-a-day-old"] {
+            assert!(
+                lease_span_secs(&pool, ymid).await <= SESSION_LEASE_CEILING_SECS,
+                "{} must never be pushed past the ceiling",
+                ymid
+            );
+        }
         assert!(pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap().is_empty());
     }
 
@@ -1872,10 +1884,20 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert!(
+        // An unknown ymid is not a failure: the UPDATE simply matches no row.
+        // Reporting that as an error would make the caller bail into DbError and
+        // lose the truthful distinction, because the row itself is what says why
+        // nothing changed - here: there is no row at all (a `None` status, which
+        // the caller classifies as an unknown ymid rather than a terminal one).
+        assert_eq!(
             pool.mark_as_verified_with_logging("no-such-ymid")
                 .await
-                .is_err()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            pool.get_pending_download_status("no-such-ymid").await.unwrap(),
+            None
         );
     }
 
