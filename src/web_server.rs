@@ -110,6 +110,40 @@ pub struct AdImpressionQuery {
     pub ymid: String,
 }
 
+/// Unchanged wording on purpose: the mini-app renders its own localised text,
+/// so this string is only the API/log field.
+const CLAIM_PENDING_ERROR: &str =
+    "Ad verification not received yet. Please finish watching the ad or wait a few seconds.";
+
+const CLAIM_INVALID_REQUEST_ERROR: &str = "Invalid request ID";
+
+/// A refused claim, as a pure function of the row's state.
+///
+/// The client must tell three refusals apart: "not yet, keep waiting", "this
+/// session is gone" and "this ymid does not exist". Only the first is worth
+/// waiting on, and one generic answer left an expired session looking temporary
+/// - the screen promised a retry that could never work.
+fn claim_refusal(status: &str, error: &str) -> serde_json::Value {
+    json!({
+        "success": false,
+        "status": status,
+        "error": error,
+    })
+}
+
+/// Row state a refused claim reports, read once after the bounded wait.
+async fn claim_refusal_response(db: &Arc<DatabasePool>, ymid: &str) -> serde_json::Value {
+    let status = match db.get_pending_download_status(ymid).await {
+        Ok(Some(status)) => status,
+        Ok(None) => "not_found".to_string(),
+        Err(e) => {
+            log::error!("claim refusal status read failed for {}: {}", ymid, e);
+            "unknown".to_string()
+        }
+    };
+    claim_refusal(&status, CLAIM_PENDING_ERROR)
+}
+
 /// Client-side funnel beacon. Fire-and-forget: the mini-app must never wait
 /// for telemetry, so the response is empty and failures are logged only.
 #[derive(Deserialize)]
@@ -649,7 +683,7 @@ async fn claim_video(
     // them anyway, but with a less specific error).
     if let Err(e) = db.get_user_id_by_ymid(&ymid).await {
         log::error!("Claim failed: Ymid {} not found: {}", ymid, e);
-        return Json(json!({ "success": false, "error": "Invalid request ID" }));
+        return Json(claim_refusal("not_found", CLAIM_INVALID_REQUEST_ERROR));
     }
 
     // 2. Already delivered (by the valued-postback auto-delivery or by an
@@ -702,10 +736,7 @@ async fn claim_video(
                 CLAIM_WAIT_ATTEMPTS,
                 e
             );
-            Json(json!({
-                "success": false,
-                "error": "Ad verification not received yet. Please finish watching the ad or wait a few seconds."
-            }))
+            Json(claim_refusal_response(&db, &ymid).await)
         }
     }
 }
@@ -779,6 +810,74 @@ mod tests {
         let parsed: ClaimRequest =
             serde_json::from_str(r#"{"ymid":"legacy-ymid","legacy_attestation":true}"#).unwrap();
         assert_eq!(parsed.ymid, "legacy-ymid");
+    }
+
+    /// The refusal the client branches on: "not yet" must stay distinguishable
+    /// from a session that can never deliver, or the mini-app keeps waiting on
+    /// a dead row instead of telling the user to start a new one.
+    #[test]
+    fn claim_refusal_names_the_row_state_it_refused() {
+        for (status, expected) in [
+            ("pending", "pending"),
+            ("verified", "verified"),
+            ("expired", "expired"),
+            ("failed", "failed"),
+            ("not_found", "not_found"),
+        ] {
+            let payload = serde_json::to_string(&claim_refusal(status, CLAIM_PENDING_ERROR)).unwrap();
+            assert!(payload.contains("\"success\":false"));
+            assert!(
+                payload.contains(&format!("\"status\":\"{}\"", expected)),
+                "refusal must carry status {}, got {}",
+                expected,
+                payload
+            );
+        }
+
+        // The pre-existing answer wording is untouched, and a ymid that does not
+        // exist keeps its own message.
+        assert!(serde_json::to_string(&claim_refusal("pending", CLAIM_PENDING_ERROR))
+            .unwrap()
+            .contains(CLAIM_PENDING_ERROR));
+        assert!(serde_json::to_string(&claim_refusal("not_found", CLAIM_INVALID_REQUEST_ERROR))
+            .unwrap()
+            .contains(CLAIM_INVALID_REQUEST_ERROR));
+    }
+
+    /// Same contract against a real row: the status the client acts on is read
+    /// from the database, not guessed.
+    #[tokio::test]
+    async fn claim_refusal_reports_the_real_row_state() {
+        let (pool, _file) = crate::database::setup_test_db().await;
+        let db = Arc::new(pool);
+        for (ymid, status) in [
+            ("still-open", "pending"),
+            ("earned", "verified"),
+            ("gone", "expired"),
+        ] {
+            db.execute_with_timeout(move |conn| {
+                conn.execute(
+                    "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES (?1, 7, 'http://v', ?2)",
+                    rusqlite::params![ymid, status],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+
+        for (ymid, expected) in [
+            ("still-open", "pending"),
+            ("earned", "verified"),
+            ("gone", "expired"),
+        ] {
+            let payload = claim_refusal_response(&db, ymid).await;
+            assert_eq!(payload["status"], expected);
+            assert_eq!(payload["success"], false);
+        }
+
+        let unknown = claim_refusal_response(&db, "never-existed").await;
+        assert_eq!(unknown["status"], "not_found");
     }
 
     #[test]

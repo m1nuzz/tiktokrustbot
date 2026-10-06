@@ -219,6 +219,25 @@
             impressionUrl: '/api/ad-impression',
             impressionRetries: 2,
             impressionRetryDelay: 1200,
+            // Lease heartbeat. The server owns the deadline (it hands back
+            // lease_expires_at on every ping and status answer); this client
+            // only asks for it and keeps asking while the webapp is open. 60s
+            // is the cadence, not a deadline: nothing here decides anything.
+            leasePingUrl: '/api/session-ping',
+            leasePingIntervalMs: 60000,
+            // How close to the server's own deadline the recoverable screen may
+            // appear. This is a comparison against a deadline the server handed
+            // us, never a clock of our own: the decision is re-taken on each
+            // real ping/status answer, and an unknown deadline keeps waiting.
+            leaseOfferMarginMs: 5 * 60 * 1000,
+            // Bounded wait for the one status probe that picks the first
+            // screen: a hung probe must never hold the funnel hostage.
+            sessionProbeTimeoutMs: 4000,
+            // After this many fast polls the wait drops to a slow cadence
+            // instead of ending in an error screen. An ad that was never
+            // rewarded is not a failure state - the session is still claimable
+            // and the server auto-delivers when the valued postback lands.
+            pollIntervalSlow: 15000,
         };
 
         // ========== СОСТОЯНИЕ ==========
@@ -245,6 +264,14 @@
         let sdkHostIndex = 0; // rotates the first SDK host tried per injection
         let lastSdkHost = null; // host that actually registered the SDK global
         let adblockReloadId = null; // one-shot page reload while ad-blocked
+        // Server lease deadline for this session as epoch ms (0 = unknown).
+        // Never invented locally: every value comes from lease_expires_at in a
+        // ping or status answer.
+        let leaseDeadlineAt = 0;
+        let leasePingId = null; // heartbeat timer, null while stopped
+        let leasePingInFlight = false; // one ping at a time
+        let offerSurfaceShown = false; // the button/offer screen appeared once
+        let sessionTerminal = false; // row is completed/expired/failed
 
         const tg = window.Telegram.WebApp;
         const loaderView = document.getElementById('loader-view');
@@ -297,6 +324,160 @@
             return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
         }
 
+        // ========== СОСТОЯНИЕ СЕССИИ (сервер владеет дедлайном) ==========
+        // The session's lifetime is the SERVER's decision. Every screen below
+        // is derived from `lease_expires_at` in a ping/status answer, so the
+        // client never keeps a clock of its own and never invents a deadline it
+        // would then have to trust.
+        function parseLeaseDeadline(raw) {
+            if (typeof raw !== 'string' || !raw) return 0;
+            // SQLite datetime('now') is UTC, so the string is read as UTC.
+            const ms = Date.parse(raw.replace(' ', 'T') + 'Z');
+            return Number.isFinite(ms) ? ms : 0;
+        }
+
+        function noteLeaseDeadline(data) {
+            if (data && typeof data.lease_expires_at === 'string') {
+                leaseDeadlineAt = parseLeaseDeadline(data.lease_expires_at);
+            }
+        }
+
+        // Milliseconds left on the server lease, or null when the server has
+        // not told us (old row, or no answer yet). null is read as "keep
+        // waiting": surfacing the recoverable screen early is harmless, hiding
+        // a real expiry is not.
+        function leaseRemainingMs() {
+            if (!leaseDeadlineAt) return null;
+            return leaseDeadlineAt - Date.now();
+        }
+
+        // Every exit from the webapp goes through here. Closing only STOPS the
+        // heartbeat - the lease is deliberately never released, so the row keeps
+        // whatever time it had at the last ping and a valued postback Monetag
+        // sends while the user is on the advertiser's page still finds it live.
+        function closeWebapp() {
+            stopLeaseHeartbeat();
+            tg.close();
+        }
+
+        // Lease heartbeat: the only thing that keeps a session claimable beyond
+        // the initial window. Started once at load, suspended when the document
+        // is backgrounded, resumed on return, stopped for good on pagehide and
+        // on close. The answer carries the new deadline, so this doubles as the
+        // periodic re-read of the server's view of the row.
+        function startLeaseHeartbeat() {
+            if (leasePingId || sessionTerminal) return;
+            leasePingId = setInterval(leasePing, AD_CONFIG.leasePingIntervalMs);
+        }
+
+        function stopLeaseHeartbeat() {
+            if (leasePingId) {
+                clearInterval(leasePingId);
+                leasePingId = null;
+            }
+        }
+
+        async function leasePing() {
+            if (leasePingInFlight || sessionTerminal) return;
+            leasePingInFlight = true;
+            try {
+                const res = await fetch(`${apiBase}${AD_CONFIG.leasePingUrl}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ymid: ymid })
+                });
+                const data = await res.json();
+                noteLeaseDeadline(data);
+                if (data && data.live === true) {
+                    maybeSurfaceOfferScreen();
+                    return;
+                }
+                // `error` is NOT terminal - it is how the server reports a
+                // transient DB failure - so the heartbeat keeps running and the
+                // next ping decides. Everything else is a row that can no
+                // longer be claimed.
+                if (data && data.status && data.status !== 'error') {
+                    stopLeaseHeartbeat();
+                    handleTerminalStatus(data.status);
+                }
+            } catch (e) {
+                // Network hiccup: the next ping tries again.
+            } finally {
+                leasePingInFlight = false;
+            }
+        }
+
+        // What the server says about a row that can no longer be claimed.
+        // A delivered row closes the webapp (the video is already in the chat) -
+        // never the three-button screen. A lapsed or unknown row, and a row
+        // whose download really failed, both say what to do next instead of
+        // showing a retry that can never work.
+        function handleTerminalStatus(status) {
+            sessionTerminal = true;
+            stopPolling();
+            if (status === 'completed') {
+                trackEvent('already_delivered');
+                closeWebapp();
+                return;
+            }
+            if (status === 'expired' || status === 'not_found') {
+                trackEvent('session_expired');
+                showUnclaimableScreen('MiniSessionExpired');
+                return;
+            }
+            if (status === 'failed') {
+                // The chat already carries the download-failure message; the
+                // mini-app only has to stop pretending the video is coming.
+                trackEvent('session_failed');
+                showUnclaimableScreen('MiniErrClaim');
+            }
+        }
+
+        // The ONE place the button/offer screen is allowed to appear, and it is
+        // no longer the default result of an unrewarded ad: an ad that settled
+        // with nothing valued leaves the page blank and keeps waiting, and this
+        // runs only when the server's own lease is nearly gone (or already
+        // gone). Surfaced at most once per open.
+        function maybeSurfaceOfferScreen() {
+            if (offerSurfaceShown || sessionTerminal) return false;
+            const remaining = leaseRemainingMs();
+            if (remaining === null) return false; // deadline unknown: keep waiting
+            if (remaining > AD_CONFIG.leaseOfferMarginMs) return false;
+            offerSurfaceShown = true;
+            trackEvent('lease_offer_surface');
+            showNoAds();
+            return true;
+        }
+
+        // Waiting is not failing: an impression exists for this ymid, so no
+        // second show() may run (one ymid = one ad event), but the session is
+        // still claimable. Try the claim once, then poll silently for the valued
+        // postback instead of offering three buttons.
+        function waitQuietlyForReward() {
+            loaderView.classList.add('hidden');
+            autoClaim();
+            startPolling();
+        }
+
+        // This row can never be delivered. The only useful action left is a
+        // fresh session, so the screen says that and offers a way back to the
+        // bot - no retry button, because a retry here could never work.
+        function showUnclaimableScreen(messageKey) {
+            stopPolling();
+            cancelRetry();
+            stopLeaseHeartbeat();
+            noAdsShown = false;
+            loaderView.classList.add('hidden');
+            contentView.classList.remove('hidden');
+            document.getElementById('title').innerText = t('MiniErrTitle');
+            description.innerText = t(messageKey);
+            claimBtn.classList.add('hidden');
+            adBtn.classList.add('hidden');
+            directBtn.innerText = t('MiniBtnContinueBot');
+            directAction = 'close';
+            directBtn.classList.remove('hidden');
+        }
+
         function showError(message) {
             noAdsShown = false;
             loaderView.classList.add('hidden');
@@ -325,6 +506,7 @@
             try {
                 const res = await fetch(`${apiBase}/api/check-status?ymid=${ymid}`);
                 const data = await res.json();
+                noteLeaseDeadline(data);
 
                 if (data.status === 'verified') {
                     isPolling = false;
@@ -332,32 +514,30 @@
                     return;
                 }
 
-                // Already delivered (server auto-delivery won the race): the
-                // video is in the chat, so close instead of polling into a
-                // "taking too long" error for a delivered video.
-                if (data.status === 'completed') {
+                // Every terminal state is explicit, so the user never falls back
+                // onto the no-fill screen: a delivered row closes (the video is
+                // in the chat), a lapsed or unknown one says to start a new
+                // session.
+                if (data.status === 'completed' || data.status === 'expired'
+                    || data.status === 'not_found' || data.status === 'failed') {
                     isPolling = false;
-                    trackEvent('already_delivered');
-                    tg.close();
+                    handleTerminalStatus(data.status);
                     return;
                 }
 
-                if (data.status === 'expired' || data.status === 'not_found') {
-                    isPolling = false;
-                    showError(t('MiniErrExpired'));
-                    return;
-                }
+                // Nothing valued yet and the lease is alive: keep waiting
+                // quietly. The screen may come back only when the lease is close
+                // to lapsing or has lapsed.
+                if (maybeSurfaceOfferScreen()) return;
 
-                // Safety cap: don't poll forever if the backend never confirms
                 pollCount++;
-                if (pollCount >= AD_CONFIG.maxPolls) {
-                    isPolling = false;
-                    showError(t('MiniErrTooLong'));
-                    return;
-                }
-
-                // Polling continues so a late valued postback still auto-delivers.
-                pollTimeoutId = setTimeout(doPoll, AD_CONFIG.pollInterval);
+                // No hard stop any more: after the fast window the poll simply
+                // slows down. Ending the wait with an error screen is what made
+                // a perfectly claimable session look broken.
+                const delay = pollCount >= AD_CONFIG.maxPolls
+                    ? AD_CONFIG.pollIntervalSlow
+                    : AD_CONFIG.pollInterval;
+                pollTimeoutId = setTimeout(doPoll, delay);
             } catch (e) {
                 // При ошибке сети ждём дольше
                 pollTimeoutId = setTimeout(doPoll, AD_CONFIG.pollInterval * 2);
@@ -378,10 +558,10 @@
             // One ymid = one show: repeated show() calls with the same ymid
             // spam duplicate impression postbacks that Monetag prices at zero
             // (frequency/fraud filtering drove our CPM to dust). Once an
-            // impression exists, route to the working screen instead.
+            // impression exists, route to the quiet wait instead.
             if (impressionSeen) {
                 trackEvent('retry_suppressed');
-                showNoAds();
+                waitQuietlyForReward();
                 return;
             }
             claimFired = false; // new attempt: allow one auto-claim
@@ -496,7 +676,7 @@
                 if (data && data.success) {
                     watchedFastDelivered = true;
                     trackEvent('watched_deliver');
-                    tg.close();
+                    closeWebapp();
                     return true;
                 }
             } catch (e) {
@@ -584,10 +764,11 @@
                 return;
             }
             // Fresh page, impressed ymid (reopen/reload after an ad already
-            // presented): do not fire another show(), go to the working screen.
+            // presented): do not fire another show(), wait quietly for the
+            // reward instead.
             if (await impressionKnown()) {
                 trackEvent('retry_suppressed');
-                showNoAds();
+                waitQuietlyForReward();
                 return;
             }
             trySDKAd();
@@ -907,7 +1088,8 @@
             'oracle_impression', 'oracle_none', 'no_fill_screen', 'page_reload',
             'watchdog_recover', 'bonus_popup_shown', 'bonus_popup_tapped',
             'adblock_popup_shown', 'adblock_popup_tapped', 'retry_suppressed',
-            'claim_tapped', 'already_delivered', 'watched_deliver'
+            'claim_tapped', 'already_delivered', 'watched_deliver',
+            'session_expired', 'session_failed', 'lease_offer_surface'
         ]);
         const trackedSent = new Set();
 
@@ -1065,6 +1247,7 @@
             claimFired = true;
             for (let attempt = 1; attempt <= AD_CONFIG.claimMaxAttempts; attempt++) {
                 let ok = false;
+                let claimStatus = null;
                 try {
                     const claimRes = await fetch(`${apiBase}/api/claim-video`, {
                         method: 'POST',
@@ -1073,17 +1256,31 @@
                     });
                     const claimData = await claimRes.json();
                     ok = !!claimData.success;
+                    if (claimData && typeof claimData.status === 'string') claimStatus = claimData.status;
                 } catch (e) {
                     ok = false; // network hiccup: retry
                 }
 
                 if (ok) {
-                    tg.close();
+                    closeWebapp();
+                    return;
+                }
+
+                // The refusal names the row's state, so a session that is gone
+                // says so instead of masquerading as "not yet".
+                if (claimStatus === 'expired' || claimStatus === 'not_found'
+                    || claimStatus === 'completed') {
+                    handleTerminalStatus(claimStatus);
                     return;
                 }
 
                 if (attempt === AD_CONFIG.claimMaxAttempts) {
-                    showError(t('MiniErrClaim'));
+                    // Nothing valued yet is NOT a failure: the row is still
+                    // claimable, the server auto-delivers when the valued
+                    // postback lands, and the heartbeat keeps the session alive.
+                    // Stay silent; the screen returns only when the lease is
+                    // nearly gone.
+                    maybeSurfaceOfferScreen();
                     return;
                 }
 
@@ -1145,26 +1342,62 @@
             document.documentElement.style.setProperty('--accent-color', tg.themeParams.button_color);
         }
 
+        // The server's own view of this row picks the first screen: a delivered
+        // session closes straight away and a lapsed one says so, instead of
+        // reopening onto the no-fill screen. A failed/unreachable probe is not
+        // an answer - it falls through to the normal funnel unchanged.
+        // Bounded with the same race the SDK calls use: a hung probe must never
+        // hold the funnel hostage.
+        async function probeSessionBeforeAd() {
+            try {
+                const res = await sdkWithTimeout(
+                    fetch(`${apiBase}/api/check-status?ymid=${encodeURIComponent(ymid)}`),
+                    AD_CONFIG.sessionProbeTimeoutMs,
+                    'session-probe'
+                );
+                const data = await res.json();
+                noteLeaseDeadline(data);
+                const status = data && data.status;
+                if (status === 'completed' || status === 'expired'
+                    || status === 'not_found' || status === 'failed') {
+                    return status;
+                }
+            } catch (e) {
+                // Unknown state: fall through to the normal funnel.
+            }
+            return null;
+        }
+
 // Проверяем статус рекламы (ymid — чтобы сервер решил персонально:
         // админ с Admin Ads ON увидит реальную рекламу даже при глобальном OFF)
-        fetch(`${apiBase}/api/ads-status?ymid=${encodeURIComponent(ymid)}`)
-            .then(response => response.json())
-            .then(data => {
-if (data.enabled) {
+        async function boot() {
+            const terminal = await probeSessionBeforeAd();
+            if (terminal) {
+                handleTerminalStatus(terminal);
+                return;
+            }
+            // The heartbeat starts before anything else can settle: it is what
+            // keeps this session claimable while the user watches the ad.
+            startLeaseHeartbeat();
+            try {
+                const response = await fetch(`${apiBase}/api/ads-status?ymid=${encodeURIComponent(ymid)}`);
+                const data = await response.json();
+                if (data.enabled) {
         // Prove the SDK can load first, then run the ad. A blocked SDK host
-   // (ad-block / DNS filtering) must end on the text-only adblock screen,
+    // (ad-block / DNS filtering) must end on the text-only adblock screen,
   // never on the retry screen.
-        startAdFlow();
-    } else {
+                    startAdFlow();
+                } else {
                     directAction = 'close';
                     directBtn.innerText = t('MiniBtnContinueBot');
                     showFinalUI(t('MiniReadyTitle'), t('MiniReadyDesc'), true);
                 }
-            })
-            .catch(e => {
+            } catch (e) {
                 console.error(e);
                 showError(t('MiniErrNoServer'));
-            });
+            }
+        }
+        boot();
 
         // Обработчик кнопки Start Ad Manually / Try ad again
         adBtn.addEventListener('click', () => {
@@ -1213,7 +1446,7 @@ if (data.enabled) {
             } else if (directAction === 'reload_popup') {
                 reloadAndPopup();
             } else {
-                tg.close();
+                closeWebapp();
             }
         });
 
@@ -1235,7 +1468,18 @@ if (data.enabled) {
 
         // Visibility API: Мгновенный запрос при возврате в приложение
         document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState !== 'visible') return;
+            if (document.visibilityState !== 'visible') {
+                // Backgrounded - usually because the user tapped the creative
+                // and left for the advertiser's page. Stop extending the lease
+                // and never release it: the row keeps whatever remained at the
+                // last ping, which is what lets a valued postback that arrives
+                // while they are away still deliver.
+                stopLeaseHeartbeat();
+                return;
+            }
+            // Back in the app: resume the heartbeat and ask the server
+            // immediately instead of waiting for the next tick.
+            startLeaseHeartbeat();
             if (isPolling) {
                 clearTimeout(pollTimeoutId); // Отменяем ожидание
                 doPoll(); // Делаем запрос ПРЯМО СЕЙЧАС
@@ -1246,6 +1490,13 @@ if (data.enabled) {
                     if (!upgraded) retrySdkSilently();
                 });
             }
+        });
+
+        // Telegram tears the WebView down after tg.close(); pagehide is the last
+        // reliable signal that this document is gone for good. Stopping only
+        // stops EXTENDING - the lease is left exactly as it was.
+        window.addEventListener('pagehide', () => {
+            stopLeaseHeartbeat();
         });
     </script>
 </body>

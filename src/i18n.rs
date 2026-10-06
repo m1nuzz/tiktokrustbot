@@ -1565,6 +1565,10 @@ pub const MINI_APP_STRINGS: &[(&str, MsgKey)] = &[
     ("MiniReadyDesc", MsgKey::MiniReadyDesc),
     ("MiniErrTitle", MsgKey::MiniErrTitle),
     ("MiniErrExpired", MsgKey::MiniErrExpired),
+    // Reuses the existing, already-translated bot-side expiry text: it is the
+    // same event and the same instruction (start a new session), so the
+    // mini-app needs no new translation for the "this row is gone" screen.
+    ("MiniSessionExpired", MsgKey::SessionExpired),
     ("MiniErrTooLong", MsgKey::MiniErrTooLong),
     ("MiniErrNoServer", MsgKey::MiniErrNoServer),
     ("MiniErrClaim", MsgKey::MiniErrClaim),
