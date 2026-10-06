@@ -92,7 +92,13 @@ async fn premium_start_handler(
     db_pool.log_funnel_event(user_id, "premium_deep_link").await;
     log::info!("User {} opened the premium deep link", user_id);
 
-    handlers::payments::send_premium_invoice(bot.clone(), msg.chat.id.into(), db_pool, None).await?;
+    handlers::payments::send_premium_invoice(
+        bot.clone(),
+        msg.chat.id.into(),
+        db_pool.clone(),
+        None,
+    )
+    .await?;
 
     let lang = db_pool.get_effective_lang(user_id, None).await;
     bot.send_message(msg.chat.id, i18n::t(i18n::MsgKey::Welcome, Some(lang.as_str())))
