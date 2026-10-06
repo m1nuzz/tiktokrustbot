@@ -19,10 +19,11 @@ pub struct UserInfo {
 }
 
 /// How a download request was unlocked (for delivery-reason stats).
-/// Verified = strict gate (valued impression plus watch plus click/90s or an
-/// attested full watch); Timer = legacy 20s age-rule backstop (removed, kept
-/// for historic rows); Admin = historic admin bypass rows (no longer issued:
-/// admins go through the same strict gate as everyone else).
+/// Verified = the valued-impression gate, the only way to unlock today.
+/// Timer = legacy 20s age-rule backstop (removed, kept so historic rows keep
+/// their delivery reason); Admin = historic admin-bypass rows, kept only
+/// because rows delivered that way are still counted in the stats - it is no
+/// longer issued anywhere, admins go through the same gate as everyone else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimVia {
     Verified,
@@ -271,19 +272,10 @@ impl DatabasePool {
         }).await.map(|_| id).map_err(|e| anyhow::anyhow!("Failed to create pending download: {}", e))
     }
 
-    /// Mark a pending download as verified (ad watched but not yet claimed)
-    pub async fn mark_as_verified(&self, id: &str) -> Result<(), anyhow::Error> {
-        let id_owned = id.to_string();
-        self.execute_with_timeout(move |conn| {
-            conn.execute(
-                "UPDATE pending_downloads SET status = 'verified' WHERE id = ?1 AND status = 'pending'",
-                params![id_owned],
-            )?;
-            Ok(())
-        }).await.map_err(|e| anyhow::anyhow!("Failed to verify download {}: {}", id, e))
-    }
-
-    /// Mark as verified and return number of rows affected for better debugging
+    /// Mark a pending row as verified and return the number of rows affected, so
+    /// the caller can tell "this postback moved the row" from "the row was
+    /// already verified, terminal, or unknown" instead of logging a success
+    /// that changed nothing.
     pub async fn mark_as_verified_with_logging(&self, id: &str) -> Result<usize, anyhow::Error> {
         let id_owned = id.to_string();
         self.execute_with_timeout(move |conn| {
@@ -383,42 +375,6 @@ impl DatabasePool {
         .map_err(|e| anyhow::anyhow!("Failed to check impressions for {}: {}", ymid, e))
     }
 
-    /// Whether any click postback was journaled for this ymid (any reward:
-    /// a click proves the user engaged the creative, even an unpaid one).
-    pub async fn has_click_for_ymid(&self, id: &str) -> Result<bool, anyhow::Error> {
-        let id_owned = id.to_string();
-        self.execute_with_timeout(move |conn| {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM monetag_postbacks WHERE ymid = ?1 AND event_type = 'click'",
-                params![id_owned],
-                |row| row.get(0),
-            )?;
-            Ok(count > 0)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to check clicks for {}: {}", id, e))
-    }
-
-    /// Unix time of the first valued postback for this ymid, if any.
-    /// CAST is required: strftime('%s', ...) yields TEXT in SQLite and
-    /// rusqlite cannot decode TEXT into i64.
-    pub async fn first_valued_at(&self, id: &str) -> Result<Option<i64>, anyhow::Error> {
-        let id_owned = id.to_string();
-        self.execute_with_timeout(move |conn| {
-            let ts: Option<i64> = conn
-                .query_row(
-                    "SELECT MIN(CAST(strftime('%s', created_at) AS INTEGER)) FROM monetag_postbacks WHERE ymid = ?1 AND reward_event_type = 'valued'",
-                    params![id_owned],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .flatten();
-            Ok(ts)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to read first valued for {}: {}", id, e))
-    }
-
     /// Whether a valued impression was journaled for this ymid (payment
     /// proof). Stricter than has_ad_impression: the reward must be valued,
     /// so a non-valued impression alone never unlocks a download.
@@ -436,49 +392,24 @@ impl DatabasePool {
         .map_err(|e| anyhow::anyhow!("Failed to check valued impressions for {}: {}", id, e))
     }
 
-    /// Strict delivery gate. A download unlocks iff ALL hold:
-    /// 1. a valued impression exists (payment proof),
-    /// 2. at least WATCH_SECS passed since the first valued (watch the ad),
-    /// 3. a click exists OR CLICK_WAIT_SECS passed since the first valued
-    ///    (click-less formats like popup can never send one).
-    /// No timer backstop: without any valued event the download stays locked.
-    /// Atomic per attempt via claim_verified_download.
-    pub async fn claim_if_ready(&self, id: &str) -> Result<(i64, String, ClaimVia), anyhow::Error> {
-        self.claim_if_ready_watched(id, false).await
-    }
-
-    /// Watched-full variant of the strict gate. A client-attested full watch
-    /// counts as engagement proof equivalent to a click: it unlocks iff the
-    /// valued impression AND the watch floor already hold, i.e. an
-    /// attestation alone never unlocks anything early. The click/90s
-    /// branches are kept as-is for callers without an attestation.
-    pub async fn claim_if_ready_watched(
+    /// The delivery gate, and the only one: a download unlocks if and only if
+    /// Monetag's backend confirmed a valued impression for this ymid.
+    ///
+    /// That postback IS the reward. Monetag decides whether an ad was valued
+    /// and their postback docs state that only valued events should trigger a
+    /// user reward, so our own watch floor, click expectation and age timers
+    /// were guesses about their pipeline that could only ever refuse a reward
+    /// Monetag had already paid for. Nothing client-provided is trusted here:
+    /// no duration, no attestation, no click.
+    ///
+    /// The claim itself is the single-use atomic UPDATE in
+    /// `claim_verified_download`, so concurrent callers cannot both deliver.
+    pub async fn claim_if_valued(
         &self,
         id: &str,
-        watched_full: bool,
     ) -> Result<(i64, String, ClaimVia), anyhow::Error> {
-        const WATCH_SECS: i64 = 15;
-        const CLICK_WAIT_SECS: i64 = 90;
         if !self.has_valued_impression(id).await.unwrap_or(false) {
-            return Err(anyhow::anyhow!("not valued yet for {}", id));
-        }
-        let first = self
-            .first_valued_at(id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("no valued timestamp for {}", id))?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let age = now.saturating_sub(first);
-        if age < WATCH_SECS {
-            return Err(anyhow::anyhow!("watch window not elapsed for {}", id));
-        }
-        if !watched_full
-            && age < CLICK_WAIT_SECS
-            && !self.has_click_for_ymid(id).await.unwrap_or(false)
-        {
-            return Err(anyhow::anyhow!("no click yet for {}", id));
+            return Err(anyhow::anyhow!("no valued impression for {}", id));
         }
         self.claim_verified_download(id)
             .await
@@ -510,7 +441,9 @@ impl DatabasePool {
         .map_err(|e| anyhow::anyhow!("Failed to get postback stats: {}", e))
     }
 
-    /// Claim a verified download and trigger completion
+    /// Claim a verified download and trigger completion. The UPDATE repeats the
+    /// `status = 'verified'` predicate on purpose: it is the single-use gate,
+    /// and only the caller that flips exactly one row owns the delivery.
     pub async fn claim_verified_download(&self, id: &str) -> Result<(i64, String), anyhow::Error> {
         let id_owned = id.to_string();
         self.execute_with_timeout(move |conn| {
@@ -519,12 +452,16 @@ impl DatabasePool {
                 params![id_owned],
                 |row| Ok((row.get(0)?, row.get(1)?))
             )?;
-            
-            conn.execute(
-                "UPDATE pending_downloads SET status = 'completed' WHERE id = ?1",
+
+            let claimed = conn.execute(
+                "UPDATE pending_downloads SET status = 'completed' WHERE id = ?1 AND status = 'verified'",
                 params![id_owned],
             )?;
-            
+
+            if claimed == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+
             Ok((user_id, url))
         }).await.map_err(|e| anyhow::anyhow!("Failed to claim verified download {}: {}", id, e))
     }
@@ -874,51 +811,94 @@ impl DatabasePool {
     }
 }
 
+/// Shared test schema bootstrap. Lives outside the test module because the
+/// web_server's valued-postback tests need the same tables.
+#[cfg(test)]
+pub(crate) async fn setup_test_db() -> (DatabasePool, tempfile::NamedTempFile) {
+    let temp_file = tempfile::NamedTempFile::new().unwrap();
+    let db_path = temp_file.path().to_str().unwrap().to_string();
+    let pool = DatabasePool::new(db_path.clone(), 1);
+
+    // Initialize all necessary tables
+    pool.execute_with_timeout(|conn| {
+        conn.execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME, lang TEXT DEFAULT NULL, ref_code TEXT DEFAULT NULL)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE monetag_postbacks (id INTEGER PRIMARY KEY, ymid TEXT NOT NULL, event_type TEXT DEFAULT NULL, reward_event_type TEXT NOT NULL, estimated_price REAL DEFAULT NULL, request_var TEXT DEFAULT NULL, sub_zone_id TEXT DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE blocks (id INTEGER PRIMARY KEY, telegram_id BIGINT NOT NULL, blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE funnel_events (id INTEGER PRIMARY KEY, user_telegram_id BIGINT NOT NULL, event TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE downloads (id INTEGER PRIMARY KEY, user_telegram_id BIGINT, video_url TEXT NOT NULL, download_date DATETIME DEFAULT CURRENT_TIMESTAMP)",
+            (),
+        )?;
+        Ok(())
+    }).await.unwrap();
+
+    (pool, temp_file)
+}
+
+/// Seed one pending row plus postback journals for gate tests.
+/// `postbacks` holds (event_type, reward, age_secs): age 0 means now.
+#[cfg(test)]
+pub(crate) async fn setup_gate_row(
+    pool: &DatabasePool,
+    id: &str,
+    status: &str,
+    pending_age_secs: i64,
+    postbacks: &[(&str, &str, i64)],
+) {
+    let id_owned = id.to_string();
+    let status_owned = status.to_string();
+    pool.execute_with_timeout(move |conn| {
+        conn.execute(
+            "INSERT INTO pending_downloads (id, user_id, video_url, status, created_at) VALUES (?1, 7, 'http://v', ?2, datetime('now', ?3))",
+            params![id_owned, status_owned, format!("-{} seconds", pending_age_secs)],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    // Own every value before the loop: the async DB closure below must
+    // capture owned data, never borrows into the caller's slice.
+    let rows: Vec<(String, String, i64)> = postbacks
+        .iter()
+        .map(|(e, r, a)| (e.to_string(), r.to_string(), *a))
+        .collect();
+    for (event_owned, reward_owned, age) in rows {
+        let id_owned = id.to_string();
+        pool.execute_with_timeout(move |conn| {
+            conn.execute(
+                "INSERT INTO monetag_postbacks (ymid, event_type, reward_event_type, created_at) VALUES (?1, ?2, ?3, datetime('now', ?4))",
+                params![id_owned, event_owned, reward_owned, format!("-{} seconds", age)],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
-
-    async fn setup_test_db() -> (DatabasePool, NamedTempFile) {
-        let temp_file = NamedTempFile::new().unwrap();
-        let db_path = temp_file.path().to_str().unwrap().to_string();
-        let pool = DatabasePool::new(db_path.clone(), 1);
-        
-        // Initialize all necessary tables
-        pool.execute_with_timeout(|conn| {
-            conn.execute(
-                "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME, lang TEXT DEFAULT NULL, ref_code TEXT DEFAULT NULL)",
-                (),
-            )?;
-            conn.execute(
-                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-                (),
-            )?;
-            conn.execute(
-                "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL)",
-                (),
-            )?;
-            conn.execute(
-                "CREATE TABLE monetag_postbacks (id INTEGER PRIMARY KEY, ymid TEXT NOT NULL, event_type TEXT DEFAULT NULL, reward_event_type TEXT NOT NULL, estimated_price REAL DEFAULT NULL, request_var TEXT DEFAULT NULL, sub_zone_id TEXT DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
-                (),
-            )?;
-            conn.execute(
-                "CREATE TABLE blocks (id INTEGER PRIMARY KEY, telegram_id BIGINT NOT NULL, blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
-                (),
-            )?;
-            conn.execute(
-                "CREATE TABLE funnel_events (id INTEGER PRIMARY KEY, user_telegram_id BIGINT NOT NULL, event TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
-                (),
-            )?;
-            conn.execute(
-                "CREATE TABLE downloads (id INTEGER PRIMARY KEY, user_telegram_id BIGINT, video_url TEXT NOT NULL, download_date DATETIME DEFAULT CURRENT_TIMESTAMP)",
-                (),
-            )?;
-            Ok(())
-        }).await.unwrap();
-        
-        (pool, temp_file)
-    }
 
     #[tokio::test]
     async fn test_settings_get_set() {
@@ -1160,64 +1140,49 @@ mod tests {
         assert_eq!(premium_users[0].0, 1);
     }
 
-    /// Seed one pending row plus postback journals for claim_if_ready tests.
-    /// `postbacks` holds (event_type, reward, age_secs): age 0 means now.
-    async fn setup_gate_row(
-        pool: &DatabasePool,
-        id: &str,
-        status: &str,
-        pending_age_secs: i64,
-        postbacks: &[(&str, &str, i64)],
-    ) {
-        let id_owned = id.to_string();
-        let status_owned = status.to_string();
-        pool.execute_with_timeout(move |conn| {
-            conn.execute(
-                "INSERT INTO pending_downloads (id, user_id, video_url, status, created_at) VALUES (?1, 7, 'http://v', ?2, datetime('now', ?3))",
-                params![id_owned, status_owned, format!("-{} seconds", pending_age_secs)],
-            )?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-        // Own every value before the loop: the async DB closure below must
-        // capture owned data, never borrows into the caller's slice.
-        let rows: Vec<(String, String, i64)> = postbacks
-            .iter()
-            .map(|(e, r, a)| (e.to_string(), r.to_string(), *a))
-            .collect();
-        for (event_owned, reward_owned, age) in rows {
-            let id_owned = id.to_string();
-            pool.execute_with_timeout(move |conn| {
-                conn.execute(
-                    "INSERT INTO monetag_postbacks (ymid, event_type, reward_event_type, created_at) VALUES (?1, ?2, ?3, datetime('now', ?4))",
-                    params![id_owned, event_owned, reward_owned, format!("-{} seconds", age)],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        }
-    }
-
     #[tokio::test]
-    async fn test_claim_if_ready_valued_click_ok() {
+    async fn test_claim_if_valued_valued_impression_delivers() {
         let (pool, _file) = setup_test_db().await;
-        // Valued impression 20s old (watch floor passed) plus an unpaid click.
         setup_gate_row(
             &pool,
-            "gate-click",
+            "gate-valued",
             "verified",
             30,
             &[("impression", "valued", 20), ("click", "non_valued", 5)],
         )
         .await;
-        let (user_id, url, via) = pool.claim_if_ready("gate-click").await.unwrap();
+        let (user_id, url, via) = pool.claim_if_valued("gate-valued").await.unwrap();
         assert_eq!(user_id, 7);
         assert_eq!(url, "http://v");
         assert_eq!(via, ClaimVia::Verified);
         assert_eq!(
-            pool.get_pending_download_status("gate-click")
+            pool.get_pending_download_status("gate-valued")
+                .await
+                .unwrap(),
+            Some("completed".to_string())
+        );
+    }
+
+    /// The deleted rules in one test: a valued impression that landed now,
+    /// with no click and no age to spare, still delivers. Monetag already
+    /// priced this impression, so our own timers must not refuse it.
+    #[tokio::test]
+    async fn test_claim_if_valued_delivers_without_click_or_age() {
+        let (pool, _file) = setup_test_db().await;
+        setup_gate_row(
+            &pool,
+            "gate-fresh",
+            "verified",
+            1,
+            &[("impression", "valued", 0)],
+        )
+        .await;
+        let (user_id, url, via) = pool.claim_if_valued("gate-fresh").await.unwrap();
+        assert_eq!(user_id, 7);
+        assert_eq!(url, "http://v");
+        assert_eq!(via, ClaimVia::Verified);
+        assert_eq!(
+            pool.get_pending_download_status("gate-fresh")
                 .await
                 .unwrap(),
             Some("completed".to_string())
@@ -1225,20 +1190,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_claim_if_ready_valued_young_no_click_err() {
+    async fn test_claim_if_valued_no_postback_err() {
         let (pool, _file) = setup_test_db().await;
-        // Valued impression just landed: the 15s watch floor still holds.
-        setup_gate_row(
-            &pool,
-            "gate-young",
-            "verified",
-            5,
-            &[("impression", "valued", 0)],
-        )
-        .await;
-        assert!(pool.claim_if_ready("gate-young").await.is_err());
+        setup_gate_row(&pool, "gate-silent", "verified", 600, &[]).await;
+        assert!(pool.claim_if_valued("gate-silent").await.is_err());
         assert_eq!(
-            pool.get_pending_download_status("gate-young")
+            pool.get_pending_download_status("gate-silent")
                 .await
                 .unwrap(),
             Some("verified".to_string())
@@ -1246,44 +1203,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_claim_if_ready_valued_old_no_click_ok() {
+    async fn test_claim_if_valued_non_valued_impression_does_not_unlock() {
         let (pool, _file) = setup_test_db().await;
-        // Valued impression 95s old: the 90s click wait elapsed, so click-less
-        // formats (popup) deliver without any click postback.
-        setup_gate_row(
-            &pool,
-            "gate-old",
-            "verified",
-            100,
-            &[("impression", "valued", 95)],
-        )
-        .await;
-        let (_, _, via) = pool.claim_if_ready("gate-old").await.unwrap();
-        assert_eq!(via, ClaimVia::Verified);
-    }
-
-    #[tokio::test]
-    async fn test_claim_if_ready_no_valued_err() {
-        let (pool, _file) = setup_test_db().await;
-        // Only a non-valued impression: no payment proof, stays locked.
+        // Monetag priced nothing here, so nothing is owed.
         setup_gate_row(
             &pool,
             "gate-free",
             "verified",
-            100,
-            &[("impression", "non_valued", 95)],
+            600,
+            &[("impression", "non_valued", 595)],
         )
         .await;
-        assert!(pool.claim_if_ready("gate-free").await.is_err());
+        assert!(pool.claim_if_valued("gate-free").await.is_err());
+        assert_eq!(
+            pool.get_pending_download_status("gate-free").await.unwrap(),
+            Some("verified".to_string())
+        );
     }
 
     #[tokio::test]
-    async fn test_claim_if_ready_backstop_gone() {
+    async fn test_claim_if_valued_backstop_gone() {
         let (pool, _file) = setup_test_db().await;
         // 20s-old pending row with zero postbacks: the deleted timer backstop
-        // would have delivered this, the strict gate must not.
+        // would have delivered this, the valued gate must not.
         setup_gate_row(&pool, "gate-stale", "pending", 20, &[]).await;
-        assert!(pool.claim_if_ready("gate-stale").await.is_err());
+        assert!(pool.claim_if_valued("gate-stale").await.is_err());
         assert_eq!(
             pool.get_pending_download_status("gate-stale")
                 .await
@@ -1292,77 +1236,110 @@ mod tests {
         );
     }
 
+    /// The postback path marks the row verified before it claims, so a row
+    /// still sitting in `pending` is not deliverable yet.
     #[tokio::test]
-    async fn test_claim_if_ready_watched_full_ok_without_click() {
+    async fn test_claim_if_valued_requires_verified_status() {
         let (pool, _file) = setup_test_db().await;
-        // Valued impression 20s old (watch floor passed), no click: the
-        // attested full watch stands in for the click.
         setup_gate_row(
             &pool,
-            "gate-watched",
-            "verified",
-            30,
-            &[("impression", "valued", 20)],
-        )
-        .await;
-        // Without the attestation the same row stays locked (no click, <90s).
-        assert!(pool.claim_if_ready("gate-watched").await.is_err());
-        let (user_id, url, via) = pool
-            .claim_if_ready_watched("gate-watched", true)
-            .await
-            .unwrap();
-        assert_eq!(user_id, 7);
-        assert_eq!(url, "http://v");
-        assert_eq!(via, ClaimVia::Verified);
-        assert_eq!(
-            pool.get_pending_download_status("gate-watched")
-                .await
-                .unwrap(),
-            Some("completed".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn test_claim_if_ready_watched_full_young_err() {
-        let (pool, _file) = setup_test_db().await;
-        // Valued impression just landed: the attestation alone unlocks
-        // nothing before the 15s watch floor.
-        setup_gate_row(
-            &pool,
-            "gate-watched-young",
-            "verified",
+            "gate-pending",
+            "pending",
             5,
             &[("impression", "valued", 0)],
         )
         .await;
-        assert!(
-            pool.claim_if_ready_watched("gate-watched-young", true)
-                .await
-                .is_err()
-        );
+        assert!(pool.claim_if_valued("gate-pending").await.is_err());
         assert_eq!(
-            pool.get_pending_download_status("gate-watched-young")
+            pool.get_pending_download_status("gate-pending")
                 .await
                 .unwrap(),
-            Some("verified".to_string())
+            Some("pending".to_string())
         );
     }
 
+    /// Replay probe: the atomic claim is single-use, so a valued postback that
+    /// lands on an already-delivered row can neither redeliver nor resurrect
+    /// the row.
     #[tokio::test]
-    async fn test_claim_if_ready_watched_full_no_valued_err() {
+    async fn test_claim_if_valued_completed_row_never_delivers_twice() {
         let (pool, _file) = setup_test_db().await;
-        // Only a non-valued impression: no payment proof, the attestation
-        // cannot substitute for it.
         setup_gate_row(
             &pool,
-            "gate-watched-free",
+            "gate-once",
             "verified",
-            100,
-            &[("impression", "non_valued", 95)],
+            10,
+            &[("impression", "valued", 5)],
         )
         .await;
+        assert!(pool.claim_if_valued("gate-once").await.is_ok());
+
+        // Duplicate postbacks and a second client POST both arrive here.
+        assert!(pool.claim_if_valued("gate-once").await.is_err());
+        assert!(pool.claim_if_valued("gate-once").await.is_err());
+        assert_eq!(
+            pool.get_pending_download_status("gate-once").await.unwrap(),
+            Some("completed".to_string())
+        );
+    }
+
+    /// Race probe: two claims at once, exactly one wins.
+    #[tokio::test]
+    async fn test_claim_if_valued_two_concurrent_claims_have_one_winner() {
+        let (pool, _file) = setup_test_db().await;
+        setup_gate_row(
+            &pool,
+            "gate-race",
+            "verified",
+            10,
+            &[("impression", "valued", 5)],
+        )
+        .await;
+        let pool = Arc::new(pool);
+        let first_pool = pool.clone();
+        let second_pool = pool.clone();
+
+        let (first, second) = tokio::join!(
+            first_pool.claim_if_valued("gate-race"),
+            second_pool.claim_if_valued("gate-race")
+        );
+
+        let winners = [first, second].iter().filter(|r| r.is_ok()).count();
+        assert_eq!(winners, 1, "exactly one of two concurrent claims must win");
+        assert_eq!(
+            pool.get_pending_download_status("gate-race").await.unwrap(),
+            Some("completed".to_string())
+        );
+    }
+
+    /// Honesty probe: the affected-row count is what tells the postback
+    /// handler "this moved the row" from "this changed nothing".
+    #[tokio::test]
+    async fn test_mark_as_verified_reports_row_changes_only() {
+        let (pool, _file) = setup_test_db().await;
+        setup_gate_row(&pool, "verify-me", "pending", 5, &[]).await;
+        setup_gate_row(&pool, "verify-terminal", "completed", 5, &[]).await;
+
+        assert_eq!(
+            pool.mark_as_verified_with_logging("verify-me")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            pool.mark_as_verified_with_logging("verify-me")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            pool.mark_as_verified_with_logging("verify-terminal")
+                .await
+                .unwrap(),
+            0
+        );
         assert!(
-            pool.claim_if_ready_watched("gate-watched-free", true)
+            pool.mark_as_verified_with_logging("no-such-ymid")
                 .await
                 .is_err()
         );
