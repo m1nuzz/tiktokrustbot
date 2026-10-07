@@ -475,6 +475,12 @@ async fn spawn_download_job(
 const AUTO_DELIVERY_ATTEMPTS: u32 = 3;
 const AUTO_DELIVERY_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Head start for the close-claim over the server safety net below: the ad
+/// itself runs ~15s, so by the time this elapses a user who closed the ad has
+/// already claimed, and the delayed task finds a completed row and does
+/// nothing. Only a client that never came back still needs delivering.
+const VALUED_AUTODELIVERY_DELAY_SECS: u64 = 30;
+
 /// One client POST races Monetag's postback: the ad settles before the backend
 /// confirmation is journaled, so the first attempt can lose by a second or
 /// two. Three attempts 1.5s apart cover that window; `success:false` is only
@@ -687,26 +693,32 @@ async fn monetag_postback(
         );
         return axum::http::StatusCode::OK;
     }
+    // A display Monetag did not value unlocks nothing: it stays journaled
+    // above for the revenue stats, and the client offers its one retry from
+    // the verdict it reads itself. Verifying here would let the very next
+    // claim take the video while the ad is still playing.
     if reward != "valued" {
         log::info!(
-            "Ad display for ymid {} was not valued - the client offers one retry",
+            "Ad display for ymid {} was not valued - journaled only, the client offers one retry",
             query.ymid
         );
+        return axum::http::StatusCode::OK;
     }
 
-    // No delivery from here: Monetag's verdict arrives ~4s after the ad STARTS,
-    // so delivering at this point put the video on screen while the ad was still
-    // playing and made the user's close meaningless. The row is verified so the
-    // client's claim on close succeeds.
+    // Valued: verify now so the client's claim on ad close succeeds at once.
     if let Err(e) = state.db.mark_as_verified_with_logging(&query.ymid).await {
         log::warn!("Could not verify row for ymid {}: {}", query.ymid, e);
     }
 
     let task_state = state.clone();
     let task_ymid = query.ymid.clone();
-    // Safety net for the case the client never comes back: a valued postback
-    // that arrives long after the ad, with nobody left to press anything.
+    // Safety net for the case the client never comes back (the user left for
+    // the advertiser page): it waits past the ad first, so the close-claim
+    // always wins the race and this task only delivers when nobody claimed.
+    // Delivering immediately put the video in the chat ~4s after the ad
+    // STARTED, while it was still playing.
     tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(VALUED_AUTODELIVERY_DELAY_SECS)).await;
         match deliver_after_ad_display(&task_state.db, &task_ymid).await {
             ValuedPostbackResult::Delivered { user_id, url, via } => {
                 log::info!(
