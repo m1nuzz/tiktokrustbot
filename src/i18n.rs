@@ -127,7 +127,7 @@ pub const ALL_KEYS: &[MsgKey] = &[
 /// Language codes with full translations, as returned by [`resolve_lang`].
 pub const SUPPORTED_LANGS: &[&str] = &[
     "en", "ru", "es", "ar", "zh-hans", "zh-hant", "pt-br", "tr", "uk", "id", "vi", "th", "my",
-    "km", "fr", "de", "it", "nl", "ko", "ms", "hi", "bn", "fa", "pl",
+    "km", "fr", "de", "it", "nl", "ko", "ms", "hi", "bn", "fa", "pl", "ta",
 ];
 
 /// (language code, button label in its own language) for the /language keyboard.
@@ -156,6 +156,7 @@ pub const LANG_BUTTONS: &[(&str, &str)] = &[
     ("fa", "🇮🇷 فارسی"),
     ("pl", "🇵🇱 Polski"),
     ("zh-hant", "🇹🇼 繁體中文"),
+    ("ta", "🇸🇬 தமிழ்"),
 ];
 
 /// True when the message text is one of the /language keyboard buttons.
@@ -209,6 +210,7 @@ fn lookup_lang(tag: &str) -> Option<&'static str> {
         "bn" => "bn",
         "fa" => "fa",
         "pl" => "pl",
+        "ta" => "ta",
         _ => return None,
     })
 }
@@ -240,6 +242,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::Welcome, "bn") => "স্বাগতম! আমাকে একটি TikTok লিঙ্ক পাঠান।",
         (MsgKey::Welcome, "fa") => "خوش آمدید! یک لینک تیک‌تاک برایم بفرستید.",
         (MsgKey::Welcome, "pl") => "Witaj! Wyślij mi link do TikToka.",
+        (MsgKey::Welcome, "ta") => "வணக்கம்! எனக்கு ஒரு TikTok இணைப்பை அனுப்புங்கள்.",
         (MsgKey::Welcome, _) => "Welcome! Send me a TikTok link.",
         // ---- ChoiceText ----
         (MsgKey::ChoiceText, "ru") => {
@@ -283,6 +286,10 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
             "📥 ویدیوی شما آماده دانلود است!\nیک گزینه دانلود انتخاب کنید:"
         }
         (MsgKey::ChoiceText, "pl") => "📥 Twój film jest gotowy do pobrania!\nWybierz opcję:",
+        (MsgKey::ChoiceText, "ta") => {
+            "📥 உங்கள் வீடியோ பதிவிறக்கத் தயார்!
+பதிவிறக்க விருப்பத்தைத் தேர்ந்தெடுங்கள்:"
+        }
         (MsgKey::ChoiceText, _) => {
             "📥 Your video is ready for download!\nChoose a download option:"
         }
@@ -310,6 +317,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::AdButton, "bn") => "🚀 ভিডিও ডাউনলোড করুন (ফ্রি)",
         (MsgKey::AdButton, "fa") => "🚀 دانلود ویدیو (رایگان)",
         (MsgKey::AdButton, "pl") => "🚀 Pobierz film (Za darmo)",
+        (MsgKey::AdButton, "ta") => "🚀 வீடியோவைப் பதிவிறக்குக (இலவசம்)",
         (MsgKey::AdButton, _) => "🚀 Download video (Free)",
         // ---- PremiumButton ----
         (MsgKey::PremiumButton, "ru") => "⭐️ Убрать рекламу (Premium)",
@@ -335,6 +343,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::PremiumButton, "bn") => "⭐️ বিজ্ঞাপন সরান (Premium)",
         (MsgKey::PremiumButton, "fa") => "⭐️ حذف تبلیغات (Premium)",
         (MsgKey::PremiumButton, "pl") => "⭐️ Usuń reklamy (Premium)",
+        (MsgKey::PremiumButton, "ta") => "⭐️ விளம்பரங்களை நீக்குக (Premium)",
         (MsgKey::PremiumButton, _) => "⭐️ Remove ads (Premium)",
         // ---- AlreadyProcessing ----
         (MsgKey::AlreadyProcessing, "ru") => "⏳ Это видео уже обрабатывается.",
@@ -360,6 +369,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::AlreadyProcessing, "bn") => "⏳ এই ভিডিওটি ইতিমধ্যে প্রক্রিয়া করা হচ্ছে।",
         (MsgKey::AlreadyProcessing, "fa") => "⏳ این ویدیو در حال پردازش است.",
         (MsgKey::AlreadyProcessing, "pl") => "⏳ Ten film jest już przetwarzany.",
+        (MsgKey::AlreadyProcessing, "ta") => "⏳ இந்த வீடியோ ஏற்கனவே செயலாக்கப்படுகிறது.",
         (MsgKey::AlreadyProcessing, _) => "⏳ This video is already being processed.",
         // ---- SubscribeRequired ----
         (MsgKey::SubscribeRequired, "ru") => {
@@ -391,6 +401,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::SubscribeRequired, "bn") => "বট ব্যবহার করতে, অনুগ্রহ করে আমাদের চ্যানেলগুলো সাবস্ক্রাইব করুন।",
         (MsgKey::SubscribeRequired, "fa") => "برای استفاده از ربات، لطفاً در کانال‌های ما عضو شوید.",
         (MsgKey::SubscribeRequired, "pl") => "Aby korzystać z bota, zasubskrybuj nasze kanały.",
+        (MsgKey::SubscribeRequired, "ta") => "பாட்டைப் பயன்படுத்த, எங்கள் சேனல்களில் சேரவும்.",
         (MsgKey::SubscribeRequired, _) => "To use the bot, please subscribe to our channels.",
         // ---- ErrorInitDownload ----
         (MsgKey::ErrorInitDownload, "ru") => "❌ Ошибка запуска скачивания.",
@@ -416,6 +427,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::ErrorInitDownload, "bn") => "❌ ডাউনলোড শুরু করতে ত্রুটি।",
         (MsgKey::ErrorInitDownload, "fa") => "❌ خطا در شروع دانلود.",
         (MsgKey::ErrorInitDownload, "pl") => "❌ Błąd uruchamiania pobierania.",
+        (MsgKey::ErrorInitDownload, "ta") => "❌ பதிவிறக்கத்தைத் தொடங்குவதில் பிழை.",
         (MsgKey::ErrorInitDownload, _) => "❌ Error initializing download.",
         // ---- DownloadFailed ----
         (MsgKey::DownloadFailed, "ru") => "❌ Не удалось скачать видео. Попробуйте снова.",
@@ -449,6 +461,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::DownloadFailed, "bn") => "❌ ভিডিও ডাউনলোড করা যায়নি। আবার চেষ্টা করুন।",
         (MsgKey::DownloadFailed, "fa") => "❌ دانلود ویدیو انجام نشد. لطفاً دوباره تلاش کنید.",
         (MsgKey::DownloadFailed, "pl") => "❌ Nie udało się pobrać filmu. Spróbuj ponownie.",
+        (MsgKey::DownloadFailed, "ta") => "❌ வீடியோவைப் பதிவிறக்க முடியவில்லை. மீண்டும் முயற்சிக்கவும்.",
         (MsgKey::DownloadFailed, _) => "❌ Couldn't download the video. Please try again.",
         // ---- SessionExpired ----
         // A chat message, not a mini-app string: an ad session that lapsed
@@ -477,6 +490,9 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::SessionExpired, "bn") => "⌛ ভিডিও প্রস্তুত হওয়ার আগেই বিজ্ঞাপন সেশন শেষ হয়েছে। নতুন সেশন শুরু করতে লিঙ্কটি আবার পাঠান।",
         (MsgKey::SessionExpired, "fa") => "⌛ جلسهٔ تبلیغات پیش از آماده‌شدن ویدیو منقضی شد. برای شروع جلسه‌ای تازه، پیوند را دوباره بفرستید.",
         (MsgKey::SessionExpired, "pl") => "⌛ Sesja reklamowa wygasła, zanim wideo było gotowe. Wyślij link ponownie, aby rozpocząć nową.",
+        (MsgKey::SessionExpired, "ta") => {
+            "⌛ உங்கள் வீடியோ தயாராவதற்கு முன் விளம்பர அமர்வு காலாவதியானது. புதிதாகத் தொடங்க இணைப்பை மீண்டும் அனுப்புங்கள்."
+        }
         (MsgKey::SessionExpired, _) => "⌛ The ad session expired before your video was ready. Send the link again to start a new one.",
         // ---- DownloadTimeout ----
         (MsgKey::DownloadTimeout, "ru") => "❌ Время скачивания истекло. Попробуйте снова.",
@@ -508,6 +524,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::DownloadTimeout, "bn") => "❌ ডাউনলোডের সময় শেষ। আবার চেষ্টা করুন।",
         (MsgKey::DownloadTimeout, "fa") => "❌ زمان دانلود به پایان رسید. لطفاً دوباره تلاش کنید.",
         (MsgKey::DownloadTimeout, "pl") => "❌ Przekroczono czas pobierania. Spróbuj ponownie.",
+        (MsgKey::DownloadTimeout, "ta") => "❌ பதிவிறக்கம் காலாவதியானது. மீண்டும் முயற்சிக்கவும்.",
         (MsgKey::DownloadTimeout, _) => "❌ Download timed out. Please try again.",
         // ---- UnsupportedFormat ----
         (MsgKey::UnsupportedFormat, "ru") => "❌ Этот формат ссылки не поддерживается.",
@@ -533,6 +550,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::UnsupportedFormat, "bn") => "❌ এই লিঙ্ক ফরম্যাট সমর্থিত নয়।",
         (MsgKey::UnsupportedFormat, "fa") => "❌ این قالب لینک پشتیبانی نمی‌شود.",
         (MsgKey::UnsupportedFormat, "pl") => "❌ Ten format linku nie jest obsługiwany.",
+        (MsgKey::UnsupportedFormat, "ta") => "❌ இந்த இணைப்பு வடிவம் ஆதரிக்கப்படவில்லை.",
         (MsgKey::UnsupportedFormat, _) => "❌ This link format is not supported.",
         // ---- UploadFailed ----
         (MsgKey::UploadFailed, "ru") => "❌ Не удалось отправить файл. Попробуйте снова.",
@@ -558,6 +576,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::UploadFailed, "bn") => "❌ আপলোড ব্যর্থ। আবার চেষ্টা করুন।",
         (MsgKey::UploadFailed, "fa") => "❌ آپلود ناموفق بود. لطفاً دوباره تلاش کنید.",
         (MsgKey::UploadFailed, "pl") => "❌ Wysyłanie nie powiodło się. Spróbuj ponownie.",
+        (MsgKey::UploadFailed, "ta") => "❌ பதிவேற்றம் தோல்வியடைந்தது. மீண்டும் முயற்சிக்கவும்.",
         (MsgKey::UploadFailed, _) => "❌ Upload failed. Please try again.",
         // ---- LanguageChoose ----
         (MsgKey::LanguageChoose, "ru") => "🌐 Выберите язык:",
@@ -583,6 +602,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::LanguageChoose, "bn") => "🌐 আপনার ভাষা বেছে নিন:",
         (MsgKey::LanguageChoose, "fa") => "🌐 زبان خود را انتخاب کنید:",
         (MsgKey::LanguageChoose, "pl") => "🌐 Wybierz język:",
+        (MsgKey::LanguageChoose, "ta") => "🌐 உங்கள் மொழியைத் தேர்ந்தெடுங்கள்:",
         (MsgKey::LanguageChoose, _) => "🌐 Choose your language:",
         // ---- LanguageSet ----
         (MsgKey::LanguageSet, "ru") => "✅ Язык обновлён.",
@@ -608,6 +628,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::LanguageSet, "bn") => "✅ ভাষা আপডেট হয়েছে।",
         (MsgKey::LanguageSet, "fa") => "✅ زبان به‌روزرسانی شد.",
         (MsgKey::LanguageSet, "pl") => "✅ Zaktualizowano język.",
+        (MsgKey::LanguageSet, "ta") => "✅ மொழி புதுப்பிக்கப்பட்டது.",
         (MsgKey::LanguageSet, _) => "✅ Language updated.",
         // ---- SendLinkGuide ----
         (MsgKey::SendLinkGuide, "ru") => "🎬 Пришлите ссылку на TikTok, чтобы скачать видео, фото или музыку.",
@@ -633,6 +654,9 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::SendLinkGuide, "bn") => "🎬 ভিডিও, ছবি বা গান ডাউনলোড করতে আমাকে TikTok লিঙ্ক পাঠান।",
         (MsgKey::SendLinkGuide, "fa") => "🎬 برای دانلود ویدیو، عکس یا موسیقی یک لینک تیک‌تاک برایم بفرستید.",
         (MsgKey::SendLinkGuide, "pl") => "🎬 Wyślij mi link do TikToka, aby pobrać film, zdjęcia lub muzykę.",
+        (MsgKey::SendLinkGuide, "ta") => {
+            "🎬 வீடியோ, புகைப்படம் அல்லது இசையைப் பதிவிறக்க TikTok இணைப்பை அனுப்புங்கள்."
+        }
         (MsgKey::SendLinkGuide, _) => "🎬 Send me a TikTok link to download video, photo or music.",
         // ---- MiniLoadingTitle ----
         (MsgKey::MiniLoadingTitle, "ru") => "Загрузка...",
@@ -658,6 +682,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniLoadingTitle, "bn") => "লোড হচ্ছে...",
         (MsgKey::MiniLoadingTitle, "fa") => "در حال بارگذاری...",
         (MsgKey::MiniLoadingTitle, "pl") => "Ładowanie...",
+        (MsgKey::MiniLoadingTitle, "ta") => "ஏற்றுகிறது...",
         (MsgKey::MiniLoadingTitle, _) => "Loading...",
         // ---- MiniLoadingSub ----
         (MsgKey::MiniLoadingSub, "ru") => "Подключение к серверам",
@@ -683,6 +708,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniLoadingSub, "bn") => "সার্ভারের সাথে সংযোগ হচ্ছে...",
         (MsgKey::MiniLoadingSub, "fa") => "در حال اتصال به سرورها...",
         (MsgKey::MiniLoadingSub, "pl") => "Łączenie z serwerami...",
+        (MsgKey::MiniLoadingSub, "ta") => "சேவையகங்களுடன் இணைக்கிறது",
         (MsgKey::MiniLoadingSub, _) => "Connecting to servers",
         // ---- MiniWaitVerifyTitle ----
         (MsgKey::MiniWaitVerifyTitle, "ru") => "Ожидание проверки...",
@@ -708,6 +734,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniWaitVerifyTitle, "bn") => "যাচাইকরণের জন্য অপেক্ষা...",
         (MsgKey::MiniWaitVerifyTitle, "fa") => "در انتظار تأیید...",
         (MsgKey::MiniWaitVerifyTitle, "pl") => "Oczekiwanie na weryfikację...",
+        (MsgKey::MiniWaitVerifyTitle, "ta") => "சரிபார்ப்புக்காகக் காத்திருக்கிறது...",
         (MsgKey::MiniWaitVerifyTitle, _) => "Waiting for verification...",
         // ---- MiniWaitVerifySub ----
         (MsgKey::MiniWaitVerifySub, "ru") => "Пожалуйста, не закрывайте приложение",
@@ -733,6 +760,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniWaitVerifySub, "bn") => "অনুগ্রহ করে অ্যাপটি খোলা রাখুন",
         (MsgKey::MiniWaitVerifySub, "fa") => "لطفاً برنامه را باز نگه دارید",
         (MsgKey::MiniWaitVerifySub, "pl") => "Nie zamykaj aplikacji.",
+        (MsgKey::MiniWaitVerifySub, "ta") => "செயலியைத் திறந்தே வைத்திருங்கள்",
         (MsgKey::MiniWaitVerifySub, _) => "Please keep the app open",
         // ---- MiniStartingAdTitle ----
         (MsgKey::MiniStartingAdTitle, "ru") => "Запуск рекламы",
@@ -758,6 +786,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniStartingAdTitle, "bn") => "বিজ্ঞাপন শুরু হচ্ছে...",
         (MsgKey::MiniStartingAdTitle, "fa") => "در حال شروع تبلیغ...",
         (MsgKey::MiniStartingAdTitle, "pl") => "Uruchamianie reklamy...",
+        (MsgKey::MiniStartingAdTitle, "ta") => "விளம்பரம் தொடங்குகிறது",
         (MsgKey::MiniStartingAdTitle, _) => "Starting Ad",
         // ---- MiniStartingAdSub ----
         (MsgKey::MiniStartingAdSub, "ru") => "Смотри, чтобы поддержать бота!",
@@ -783,6 +812,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniStartingAdSub, "bn") => "বটকে সমর্থন করতে দেখুন!",
         (MsgKey::MiniStartingAdSub, "fa") => "برای حمایت از ربات تماشا کنید!",
         (MsgKey::MiniStartingAdSub, "pl") => "Oglądaj, aby wesprzeć bota!",
+        (MsgKey::MiniStartingAdSub, "ta") => "பாட்டை ஆதரிக்கப் பாருங்கள்!",
         (MsgKey::MiniStartingAdSub, _) => "Watch to support the bot!",
         // ---- MiniCheckingNetTitle ----
         (MsgKey::MiniCheckingNetTitle, "ru") => "Проверка рекламной сети",
@@ -808,6 +838,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniCheckingNetTitle, "bn") => "বিজ্ঞাপন নেটওয়ার্ক পরীক্ষা করা হচ্ছে...",
         (MsgKey::MiniCheckingNetTitle, "fa") => "در حال بررسی شبکه تبلیغات...",
         (MsgKey::MiniCheckingNetTitle, "pl") => "Sprawdzanie sieci reklamowej...",
+        (MsgKey::MiniCheckingNetTitle, "ta") => "விளம்பர வலையமைப்பைச் சரிபார்க்கிறது",
         (MsgKey::MiniCheckingNetTitle, _) => "Checking for ad network",
         // ---- MiniCheckingNetSub ----
         (MsgKey::MiniCheckingNetSub, "ru") => "Подождите немного...",
@@ -833,6 +864,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniCheckingNetSub, "bn") => "অনুগ্রহ করে একটু অপেক্ষা করুন...",
         (MsgKey::MiniCheckingNetSub, "fa") => "لطفاً کمی صبر کنید...",
         (MsgKey::MiniCheckingNetSub, "pl") => "Chwileczkę...",
+        (MsgKey::MiniCheckingNetSub, "ta") => "சற்று காத்திருங்கள்...",
         (MsgKey::MiniCheckingNetSub, _) => "Please wait a moment...",
         // ---- MiniOpeningOfferTitle ----
         (MsgKey::MiniOpeningOfferTitle, "ru") => "Открываем быстрое предложение...",
@@ -858,6 +890,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniOpeningOfferTitle, "bn") => "দ্রুত অফার খোলা হচ্ছে...",
         (MsgKey::MiniOpeningOfferTitle, "fa") => "در حال باز کردن پیشنهاد سریع...",
         (MsgKey::MiniOpeningOfferTitle, "pl") => "Otwieranie szybkiej oferty...",
+        (MsgKey::MiniOpeningOfferTitle, "ta") => "விரைவுச் சலுகை திறக்கிறது...",
         (MsgKey::MiniOpeningOfferTitle, _) => "Opening quick offer...",
         // ---- MiniOpeningOfferSub ----
         (MsgKey::MiniOpeningOfferSub, "ru") => "Посмотри предложение и вернись сюда",
@@ -883,6 +916,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniOpeningOfferSub, "bn") => "অফারটি দেখুন, তারপর এখানে ফিরে আসুন",
         (MsgKey::MiniOpeningOfferSub, "fa") => "پیشنهاد را ببینید و به اینجا برگردید",
         (MsgKey::MiniOpeningOfferSub, "pl") => "Zobacz ofertę i wróć tutaj.",
+        (MsgKey::MiniOpeningOfferSub, "ta") => "சலுகையைப் பார்த்துவிட்டு இங்கே திரும்புங்கள்",
         (MsgKey::MiniOpeningOfferSub, _) => "Look at the offer, then return here",
         // ---- MiniNoAdsTitle ----
         (MsgKey::MiniNoAdsTitle, "ru") => "Сейчас нет рекламы 😕",
@@ -908,6 +942,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniNoAdsTitle, "bn") => "এই মুহূর্তে কোনো বিজ্ঞাপন নেই 😕",
         (MsgKey::MiniNoAdsTitle, "fa") => "در حال حاضر تبلیغی نیست 😕",
         (MsgKey::MiniNoAdsTitle, "pl") => "Brak reklam w tej chwili 😕",
+        (MsgKey::MiniNoAdsTitle, "ta") => "இப்போது விளம்பரங்கள் இல்லை 😕",
         (MsgKey::MiniNoAdsTitle, _) => "No ads right now 😕",
         // ---- MiniNoAdsDesc ----
         (MsgKey::MiniNoAdsDesc, "ru") => "Сейчас нет доступной рекламы. Забери видео, попробуй быстрое предложение или повтори рекламу.",
@@ -933,6 +968,9 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniNoAdsDesc, "bn") => "এই মুহূর্তে কোনো বিজ্ঞাপন উপলব্ধ নেই। ভিডিওটি নিন, দ্রুত অফার চেষ্টা করুন বা আবার চেষ্টা করুন।",
         (MsgKey::MiniNoAdsDesc, "fa") => "در حال حاضر تبلیغی در دسترس نیست. ویدیو را بگیرید، پیشنهاد سریع را امتحان کنید یا دوباره تلاش کنید.",
         (MsgKey::MiniNoAdsDesc, "pl") => "Brak dostępnych reklam. Weź film, wypróbuj szybką ofertę albo spróbuj ponownie.",
+        (MsgKey::MiniNoAdsDesc, "ta") => {
+            "தற்போது விளம்பரம் எதுவும் இல்லை. வீடியோவை எடுங்கள், விரைவுச் சலுகையை முயற்சிக்கவும் அல்லது விளம்பரத்தை மீண்டும் முயற்சிக்கவும்."
+        }
         (MsgKey::MiniNoAdsDesc, _) => "No ad is available at the moment. Take the video, try the quick offer, or retry the ad.",
         // ---- MiniAdblockTitle ----
         (MsgKey::MiniAdblockTitle, "ru") => "🛡 Обнаружен блокировщик рекламы",
@@ -958,6 +996,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniAdblockTitle, "bn") => "🛡 অ্যাড-ব্লক শনাক্ত হয়েছে",
         (MsgKey::MiniAdblockTitle, "fa") => "🛡 مسدودکننده تبلیغ شناسایی شد",
         (MsgKey::MiniAdblockTitle, "pl") => "🛡 Wykryto adblocka",
+        (MsgKey::MiniAdblockTitle, "ta") => "🛡 விளம்பரத் தடுப்பு கண்டறியப்பட்டது",
         (MsgKey::MiniAdblockTitle, _) => "🛡 Ad-block detected",
         // ---- MiniAdblockDesc ----
         (MsgKey::MiniAdblockDesc, "ru") => "Реклама не загружается при включённой блокировке, смотреть нечего. Выключи блокировку рекламы для Telegram (приложение-блокировщик или настройка DNS / Private DNS) и вернись — реклама стартует сама. Если нет, закрой окно и нажми кнопку в боте заново.",
@@ -983,6 +1022,9 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniAdblockDesc, "bn") => "অ্যাড-ব্লক চালু থাকলে বিজ্ঞাপন লোড হবে না। Telegram-এর জন্য অ্যাড-ব্লক বন্ধ করুন (ব্লকার অ্যাপ বা DNS / প্রাইভেট DNS সেটিং) এবং ফিরে আসুন — বিজ্ঞাপন নিজে নিজেই শুরু হবে। না হলে উইন্ডো বন্ধ করে বটের বোতাম আবার চাপুন।",
         (MsgKey::MiniAdblockDesc, "fa") => "وقتی مسدودکننده روشن است تبلیغات بارگذاری نمی‌شوند. مسدودکننده را برای تلگرام خاموش کنید (برنامه مسدودکننده یا تنظیم DNS / DNS خصوصی) و برگردید — تبلیغ خودکار شروع می‌شود. اگر نشد، پنجره را ببندید و دوباره دکمه ربات را بزنید.",
         (MsgKey::MiniAdblockDesc, "pl") => "Reklamy nie ładują się przy włączonym adblocku. Wyłącz blokowanie dla Telegrama (aplikacja blokująca lub ustawienie DNS / Private DNS) i wróć — reklama wystartuje sama. Jeśli nie, zamknij okno i naciśnij przycisk bota ponownie.",
+        (MsgKey::MiniAdblockDesc, "ta") => {
+            "விளம்பரத் தடுப்பு இயக்கத்தில் இருக்கும்போது விளம்பரங்கள் ஏற்றப்படாது, எனவே பார்க்க எதுவும் இல்லை. Telegram-க்கான விளம்பரத் தடுப்பை அணைத்துவிட்டு திரும்ப வாருங்கள் — விளம்பரம் தானாகத் தொடங்கும். தொடங்கவில்லை என்றால், இந்தச் சாளரத்தை மூடி பாட்டின் பொத்தானை மீண்டும் அழுத்துங்கள்."
+        }
         (MsgKey::MiniAdblockDesc, _) => "Ads cannot load while ad-blocking is on, so there is nothing to watch. Turn off ad-blocking for Telegram (your ad-blocker app, or the DNS / Private DNS setting) and come back — the ad will start on its own. If it does not, close this window and press the bot's button again.",
         // ---- MiniAdblockMiss ----
         (MsgKey::MiniAdblockMiss, "ru") => " Все попытки загрузить рекламу не удались — выключи блокировку рекламы и попробуй снова.",
@@ -1008,6 +1050,9 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniAdblockMiss, "bn") => " বিজ্ঞাপন লোডের সব প্রচেষ্টা ব্যর্থ — অ্যাড-ব্লক বন্ধ করে আবার চেষ্টা করুন।",
         (MsgKey::MiniAdblockMiss, "fa") => " همه تلاش‌ها برای بارگذاری تبلیغ ناموفق بود — مسدودکننده را خاموش کنید و دوباره تلاش کنید.",
         (MsgKey::MiniAdblockMiss, "pl") => " Wszystkie próby wczytania reklamy zawiodły — wyłącz adblocka i spróbuj ponownie.",
+        (MsgKey::MiniAdblockMiss, "ta") => {
+            " விளம்பரத்தை ஏற்றும் அனைத்து முயற்சிகளும் தோல்வியடைந்தன — விளம்பரத் தடுப்பை அணைத்து மீண்டும் முயற்சிக்கவும்."
+        }
         (MsgKey::MiniAdblockMiss, _) => " All attempts to load an ad have failed — please turn off ad-blocking and try again.",
         // ---- MiniVideoReadyTitle ----
         (MsgKey::MiniVideoReadyTitle, "ru") => "Твоё видео готово!",
@@ -1033,6 +1078,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniVideoReadyTitle, "bn") => "আপনার ভিডিও প্রস্তুত!",
         (MsgKey::MiniVideoReadyTitle, "fa") => "ویدیوی شما آماده است!",
         (MsgKey::MiniVideoReadyTitle, "pl") => "Twój film jest gotowy!",
+        (MsgKey::MiniVideoReadyTitle, "ta") => "உங்கள் வீடியோ தயார்!",
         (MsgKey::MiniVideoReadyTitle, _) => "Your video is ready!",
         // ---- MiniVideoReadyDesc ----
         (MsgKey::MiniVideoReadyDesc, "ru") => "Забираю его для тебя.",
@@ -1058,6 +1104,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniVideoReadyDesc, "bn") => "এটি আপনার জন্য আনা হচ্ছে।",
         (MsgKey::MiniVideoReadyDesc, "fa") => "دارم برایت می‌آورم.",
         (MsgKey::MiniVideoReadyDesc, "pl") => "Pobieram go dla Ciebie.",
+        (MsgKey::MiniVideoReadyDesc, "ta") => "உங்களுக்காக இப்போது எடுக்கிறது.",
         (MsgKey::MiniVideoReadyDesc, _) => "Taking it for you now.",
         // ---- MiniSuccessTitle ----
         (MsgKey::MiniSuccessTitle, "ru") => "Успешно!",
@@ -1083,6 +1130,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniSuccessTitle, "bn") => "সফল!",
         (MsgKey::MiniSuccessTitle, "fa") => "موفقیت!",
         (MsgKey::MiniSuccessTitle, "pl") => "Sukces!",
+        (MsgKey::MiniSuccessTitle, "ta") => "வெற்றி!",
         (MsgKey::MiniSuccessTitle, _) => "Success!",
         // ---- MiniSuccessDesc ----
         (MsgKey::MiniSuccessDesc, "ru") => "Твой просмотр засчитан. Отправляем тебе видео.",
@@ -1108,6 +1156,9 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniSuccessDesc, "bn") => "আপনার ভিউ যাচাই হয়েছে। ভিডিও পাঠানো হচ্ছে।",
         (MsgKey::MiniSuccessDesc, "fa") => "بازدید شما تأیید شد. ویدیو در حال ارسال است.",
         (MsgKey::MiniSuccessDesc, "pl") => "Wyświetlenie zweryfikowane. Wysyłamy film.",
+        (MsgKey::MiniSuccessDesc, "ta") => {
+            "உங்கள் விளம்பரப் பார்வை சரிபார்க்கப்பட்டது. உங்கள் வீடியோவை இப்போது அனுப்புகிறோம்."
+        }
         (MsgKey::MiniSuccessDesc, _) => "Your ad view has been verified. We are sending your video now.",
         // ---- MiniThanksWatching ----
         (MsgKey::MiniThanksWatching, "ru") => "Спасибо за просмотр! Видео уже летит к тебе.",
@@ -1133,6 +1184,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniThanksWatching, "bn") => "দেখার জন্য ধন্যবাদ! আপনার ভিডিও আসছে।",
         (MsgKey::MiniThanksWatching, "fa") => "ممنون که تماشا کردید! ویدیوی شما در راه است.",
         (MsgKey::MiniThanksWatching, "pl") => "Dzięki za obejrzenie! Film już leci do Ciebie.",
+        (MsgKey::MiniThanksWatching, "ta") => "பார்த்ததற்கு நன்றி! உங்கள் வீடியோ வந்து கொண்டிருக்கிறது.",
         (MsgKey::MiniThanksWatching, _) => "Thanks for watching! Your video is on its way.",
         // ---- MiniBtnStartAd ----
         (MsgKey::MiniBtnStartAd, "ru") => "🎬 Запустить рекламу вручную",
@@ -1158,6 +1210,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniBtnStartAd, "bn") => "🎬 ম্যানুয়ালি বিজ্ঞাপন শুরু করুন",
         (MsgKey::MiniBtnStartAd, "fa") => "🎬 شروع دستی تبلیغ",
         (MsgKey::MiniBtnStartAd, "pl") => "🎬 Uruchom reklamę ręcznie",
+        (MsgKey::MiniBtnStartAd, "ta") => "🎬 விளம்பரத்தை கைமுறையாகத் தொடங்குக",
         (MsgKey::MiniBtnStartAd, _) => "🎬 Start Ad Manually",
         // ---- MiniBtnGetVideo ----
         (MsgKey::MiniBtnGetVideo, "ru") => "🎬 Забрать видео",
@@ -1183,6 +1236,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniBtnGetVideo, "bn") => "🎬 আমার ভিডিও নিন",
         (MsgKey::MiniBtnGetVideo, "fa") => "🎬 ویدیوی من را بگیر",
         (MsgKey::MiniBtnGetVideo, "pl") => "🎬 Odbierz film",
+        (MsgKey::MiniBtnGetVideo, "ta") => "🎬 என் வீடியோவைப் பெறுக",
         (MsgKey::MiniBtnGetVideo, _) => "🎬 Get my video",
         // ---- MiniBtnContinueBot ----
         (MsgKey::MiniBtnContinueBot, "ru") => "🚀 Продолжить в боте",
@@ -1208,6 +1262,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniBtnContinueBot, "bn") => "🚀 বটে চালিয়ে যান",
         (MsgKey::MiniBtnContinueBot, "fa") => "🚀 ادامه به ربات",
         (MsgKey::MiniBtnContinueBot, "pl") => "🚀 Kontynuuj do bota",
+        (MsgKey::MiniBtnContinueBot, "ta") => "🚀 பாட்டுக்குச் செல்க",
         (MsgKey::MiniBtnContinueBot, _) => "🚀 Continue to Bot",
         // ---- MiniBtnQuickOffer ----
         (MsgKey::MiniBtnQuickOffer, "ru") => "🎁 Быстрый оффер",
@@ -1233,6 +1288,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniBtnQuickOffer, "bn") => "🎁 দ্রুত অফার",
         (MsgKey::MiniBtnQuickOffer, "fa") => "🎁 پیشنهاد سریع",
         (MsgKey::MiniBtnQuickOffer, "pl") => "🎁 Szybka oferta",
+        (MsgKey::MiniBtnQuickOffer, "ta") => "🎁 விரைவுச் சலுகை",
         (MsgKey::MiniBtnQuickOffer, _) => "🎁 Quick offer",
         // ---- MiniBtnRetryAd ----
         (MsgKey::MiniBtnRetryAd, "ru") => "🔄 Повторить рекламу",
@@ -1258,6 +1314,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniBtnRetryAd, "bn") => "🔄 আবার বিজ্ঞাপন চেষ্টা করুন",
         (MsgKey::MiniBtnRetryAd, "fa") => "🔄 تبلیغ را دوباره امتحان کنید",
         (MsgKey::MiniBtnRetryAd, "pl") => "🔄 Spróbuj reklamy ponownie",
+        (MsgKey::MiniBtnRetryAd, "ta") => "🔄 விளம்பரத்தை மீண்டும் முயற்சிக்கவும்",
         (MsgKey::MiniBtnRetryAd, _) => "🔄 Try ad again",
         // ---- MiniBtnContinue ----
         (MsgKey::MiniBtnContinue, "ru") => "🎁 Продолжить",
@@ -1283,6 +1340,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniBtnContinue, "bn") => "🎁 চালিয়ে যান",
         (MsgKey::MiniBtnContinue, "fa") => "🎁 ادامه",
         (MsgKey::MiniBtnContinue, "pl") => "🎁 Kontynuuj",
+        (MsgKey::MiniBtnContinue, "ta") => "🎁 தொடர்க",
         (MsgKey::MiniBtnContinue, _) => "🎁 Continue",
         // ---- MiniBtnReloadOffer ----
         (MsgKey::MiniBtnReloadOffer, "ru") => "🔄 Обновить и открыть оффер",
@@ -1308,6 +1366,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniBtnReloadOffer, "bn") => "🔄 রিলোড করে অফার খুলুন",
         (MsgKey::MiniBtnReloadOffer, "fa") => "🔄 بازخوانی و باز کردن پیشنهاد",
         (MsgKey::MiniBtnReloadOffer, "pl") => "🔄 Odśwież i otwórz ofertę",
+        (MsgKey::MiniBtnReloadOffer, "ta") => "🔄 மீண்டும் ஏற்றி சலுகையைத் திற",
         (MsgKey::MiniBtnReloadOffer, _) => "🔄 Reload & open offer",
         // ---- MiniClaimBusy ----
         (MsgKey::MiniClaimBusy, "ru") => "⏳ Готовлю видео...",
@@ -1333,6 +1392,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniClaimBusy, "bn") => "⏳ ভিডিও তৈরি হচ্ছে...",
         (MsgKey::MiniClaimBusy, "fa") => "⏳ در حال آماده‌سازی ویدیو...",
         (MsgKey::MiniClaimBusy, "pl") => "⏳ Przygotowuję film...",
+        (MsgKey::MiniClaimBusy, "ta") => "⏳ வீடியோ தயாராகிறது...",
         (MsgKey::MiniClaimBusy, _) => "⏳ Preparing video...",
         // ---- MiniClaimProgress ----
         (MsgKey::MiniClaimProgress, "ru") => "⏳ Готовлю видео... ({n}/{m})",
@@ -1358,6 +1418,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniClaimProgress, "bn") => "⏳ ভিডিও তৈরি হচ্ছে... ({n}/{m})",
         (MsgKey::MiniClaimProgress, "fa") => "⏳ در حال آماده‌سازی ویدیو... ({n}/{m})",
         (MsgKey::MiniClaimProgress, "pl") => "⏳ Przygotowuję film... ({n}/{m})",
+        (MsgKey::MiniClaimProgress, "ta") => "⏳ வீடியோ தயாராகிறது... ({n}/{m})",
         (MsgKey::MiniClaimProgress, _) => "⏳ Preparing video... ({n}/{m})",
         // ---- MiniReadyTitle ----
         (MsgKey::MiniReadyTitle, "ru") => "Готово!",
@@ -1383,6 +1444,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniReadyTitle, "bn") => "প্রস্তুত!",
         (MsgKey::MiniReadyTitle, "fa") => "آماده!",
         (MsgKey::MiniReadyTitle, "pl") => "Gotowe!",
+        (MsgKey::MiniReadyTitle, "ta") => "தயார்!",
         (MsgKey::MiniReadyTitle, _) => "Ready!",
         // ---- MiniReadyDesc ----
         (MsgKey::MiniReadyDesc, "ru") => "Реклама сейчас отключена. Можешь идти прямо в бот.",
@@ -1408,6 +1470,9 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniReadyDesc, "bn") => "বিজ্ঞাপন বর্তমানে বন্ধ। সরাসরি বটে যান।",
         (MsgKey::MiniReadyDesc, "fa") => "تبلیغات فعلاً خاموش است. می‌توانید مستقیم به ربات بروید.",
         (MsgKey::MiniReadyDesc, "pl") => "Reklamy są wyłączone. Idź prosto do bota.",
+        (MsgKey::MiniReadyDesc, "ta") => {
+            "விளம்பரங்கள் தற்போது முடக்கப்பட்டுள்ளன. நீங்கள் நேரடியாக பாட்டுக்குச் செல்லலாம்."
+        }
         (MsgKey::MiniReadyDesc, _) => "Ads are currently disabled. You can go straight to the bot.",
         // ---- MiniErrTitle ----
         (MsgKey::MiniErrTitle, "ru") => "Ошибка",
@@ -1433,6 +1498,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniErrTitle, "bn") => "ত্রুটি",
         (MsgKey::MiniErrTitle, "fa") => "خطا",
         (MsgKey::MiniErrTitle, "pl") => "Błąd",
+        (MsgKey::MiniErrTitle, "ta") => "பிழை",
         (MsgKey::MiniErrTitle, _) => "Error",
         // ---- MiniErrExpired ----
         (MsgKey::MiniErrExpired, "ru") => "Сессия истекла. Попробуй снова.",
@@ -1458,6 +1524,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniErrExpired, "bn") => "সেশন মেয়াদোত্তীর্ণ। আবার চেষ্টা করুন।",
         (MsgKey::MiniErrExpired, "fa") => "نشست منقضی شد. دوباره تلاش کنید.",
         (MsgKey::MiniErrExpired, "pl") => "Sesja wygasła. Spróbuj ponownie.",
+        (MsgKey::MiniErrExpired, "ta") => "அமர்வு காலாவதியானது. மீண்டும் முயற்சிக்கவும்.",
         (MsgKey::MiniErrExpired, _) => "Session expired. Please try again.",
         // ---- MiniErrTooLong ----
         (MsgKey::MiniErrTooLong, "ru") => "Слишком долго. Попробуй снова.",
@@ -1483,6 +1550,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniErrTooLong, "bn") => "বেশি সময় নিচ্ছে। আবার চেষ্টা করুন।",
         (MsgKey::MiniErrTooLong, "fa") => "خیلی طول کشید. دوباره تلاش کنید.",
         (MsgKey::MiniErrTooLong, "pl") => "Trwa zbyt długo. Spróbuj ponownie.",
+        (MsgKey::MiniErrTooLong, "ta") => "அதிக நேரம் எடுக்கிறது. மீண்டும் முயற்சிக்கவும்.",
         (MsgKey::MiniErrTooLong, _) => "Taking too long. Please try again.",
         // ---- MiniErrNoServer ----
         (MsgKey::MiniErrNoServer, "ru") => "Не удалось связаться с сервером.",
@@ -1508,6 +1576,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniErrNoServer, "bn") => "সার্ভারের সাথে যোগাযোগ করা যায়নি।",
         (MsgKey::MiniErrNoServer, "fa") => "نمی‌توان به سرور متصل شد.",
         (MsgKey::MiniErrNoServer, "pl") => "Nie można połączyć z serwerem.",
+        (MsgKey::MiniErrNoServer, "ta") => "சேவையகத்தை அடைய முடியவில்லை.",
         (MsgKey::MiniErrNoServer, _) => "Could not reach the server.",
         // ---- MiniErrClaim ----
         (MsgKey::MiniErrClaim, "ru") => "Пока не удалось подтвердить загрузку. Открой бота и отправь ссылку снова.",
@@ -1533,6 +1602,9 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniErrClaim, "bn") => "ডাউনলোড এখনও নিশ্চিত করা যায়নি। বট খুলে আবার লিঙ্ক পাঠান।",
         (MsgKey::MiniErrClaim, "fa") => "هنوز دانلود تأیید نشد. ربات را باز کنید و دوباره لینک را بفرستید.",
         (MsgKey::MiniErrClaim, "pl") => "Nie udało się potwierdzić pobrania. Otwórz bota i wyślij link ponownie.",
+        (MsgKey::MiniErrClaim, "ta") => {
+            "பதிவிறக்கத்தை இன்னும் உறுதிப்படுத்த முடியவில்லை. பாட்டைத் திறந்து இணைப்பை மீண்டும் அனுப்புங்கள்."
+        }
         (MsgKey::MiniErrClaim, _) => "Couldn't confirm the download yet. Please open the bot and send the link again.",
         // ---- PremiumInvoiceTitle ----
         (MsgKey::PremiumInvoiceTitle, "ru") => "Premium",
@@ -1558,6 +1630,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::PremiumInvoiceTitle, "bn") => "Premium",
         (MsgKey::PremiumInvoiceTitle, "fa") => "Premium",
         (MsgKey::PremiumInvoiceTitle, "pl") => "Premium",
+        (MsgKey::PremiumInvoiceTitle, "ta") => "Premium",
         (MsgKey::PremiumInvoiceTitle, _) => "Premium",
         // ---- PremiumInvoiceDesc ----
         (MsgKey::PremiumInvoiceDesc, "ru") => "✨ Убрать рекламу (Premium) на 1 месяц!",
@@ -1583,6 +1656,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::PremiumInvoiceDesc, "bn") => "✨ বিজ্ঞাপন সরান (Premium), ১ মাসের জন্য!",
         (MsgKey::PremiumInvoiceDesc, "fa") => "✨ حذف تبلیغات (Premium) برای ۱ ماه!",
         (MsgKey::PremiumInvoiceDesc, "pl") => "✨ Usuń reklamy (Premium) na 1 miesiąc!",
+        (MsgKey::PremiumInvoiceDesc, "ta") => "✨ விளம்பரத்தை நீக்குக (Buy Premium), 1 மாதத்திற்கு!",
         (MsgKey::PremiumInvoiceDesc, _) => "✨ Remove ad (Buy Premium) for 1 month!",
         // ---- PremiumPayButton ----
         (MsgKey::PremiumPayButton, "ru") => "💳 Оплатить {price} Stars",
@@ -1608,6 +1682,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::PremiumPayButton, "bn") => "💳 {price} Stars প্রদান করুন",
         (MsgKey::PremiumPayButton, "fa") => "💳 پرداخت {price} Stars",
         (MsgKey::PremiumPayButton, "pl") => "💳 Zapłać {price} Stars",
+        (MsgKey::PremiumPayButton, "ta") => "💳 {price} Stars செலுத்துக",
         (MsgKey::PremiumPayButton, _) => "💳 Pay {price} Stars",
         // ---- PremiumPriceLabel ----
         (MsgKey::PremiumPriceLabel, "ru") => "Premium-статус",
@@ -1633,6 +1708,7 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::PremiumPriceLabel, "bn") => "Premium অবস্থা",
         (MsgKey::PremiumPriceLabel, "fa") => "وضعیت Premium",
         (MsgKey::PremiumPriceLabel, "pl") => "Status Premium",
+        (MsgKey::PremiumPriceLabel, "ta") => "Premium நிலை",
         (MsgKey::PremiumPriceLabel, _) => "Premium Status",
     }
 }
