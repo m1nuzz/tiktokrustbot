@@ -260,6 +260,15 @@ impl DatabasePool {
             Ok(())
         }).await.map_err(|e| anyhow::anyhow!("Failed to set language for user {}: {}", user_id, e))
     }
+    /// Drop the manual override so the device tag wins again (auto-detect).
+    /// Missing rows are fine: clearing what was never set changes nothing.
+    pub async fn clear_user_lang(&self, user_id: i64) -> Result<(), anyhow::Error> {
+        self.execute_with_timeout(move |conn| {
+            conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?1)", params![user_id])?;
+            conn.execute("UPDATE users SET lang = NULL WHERE telegram_id = ?1", params![user_id])?;
+            Ok(())
+        }).await.map_err(|e| anyhow::anyhow!("Failed to clear language for user {}: {}", user_id, e))
+    }
 
     /// Effective locale: the stored /language override wins, else the Telegram
     /// device tag, else English. Never fails.
@@ -1244,6 +1253,12 @@ mod tests {
         pool.set_user_lang(user_id, "uk").await.unwrap();
         assert_eq!(pool.get_user_lang(user_id).await.unwrap(), Some("uk".to_string()));
         assert_eq!(pool.get_effective_lang(user_id, Some("ru")).await, "uk");
+
+        // Clearing restores device detection, even for a user that never set one.
+        pool.clear_user_lang(user_id).await.unwrap();
+        assert_eq!(pool.get_user_lang(user_id).await.unwrap(), None);
+        assert_eq!(pool.get_effective_lang(user_id, Some("ru")).await, "ru");
+        pool.clear_user_lang(999888777).await.unwrap();
     }
 
     #[tokio::test]

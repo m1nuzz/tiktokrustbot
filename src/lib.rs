@@ -20,10 +20,10 @@ use handlers::{
     settings_text_handler, format_text_handler, subscription_text_handler,
     back_text_handler, link_handler, BTN_BROADCAST,
     all_users_text_handler, stats_text_handler, top10_text_handler, premium_users_text_handler,
-    daily_stats_text_handler, admin_ads_text_handler, language_button_handler,
+    daily_stats_text_handler, admin_ads_text_handler, language_button_handler, language_menu_handler,
     weekly_stats_text_handler, start_with_payload_handler, funnel_text_handler,
 };
-use handlers::ui::{BTN_ADMIN_PANEL, BTN_BACK, BTN_FORMAT, BTN_SETTINGS, BTN_SUBSCRIPTION};
+use handlers::ui::{BTN_ADMIN_PANEL, BTN_BACK, BTN_FORMAT, BTN_SETTINGS, BTN_SUBSCRIPTION, BTN_LANGUAGE, BTN_AUTO_DETECT};
 use database::DatabasePool;
 use mtproto_uploader::MTProtoUploader;
 use yt_dlp_interface::YoutubeFetcher;
@@ -282,6 +282,9 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                 }))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_SUBSCRIPTION)).endpoint(subscription_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_BACK)).endpoint(back_text_handler))
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_LANGUAGE)).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+                    language_menu_handler(bot, msg, db_pool).await
+                }))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("h265")).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
                     let id = msg.chat.id.0;
                     let _ = db_pool.execute_with_timeout(move |c| c.execute("UPDATE users SET quality_preference = 'h265' WHERE telegram_id = ?1", [&id])).await;
@@ -305,6 +308,9 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                     db_pool.log_funnel_event(id, "quality_change").await;
                     bot.send_message(msg.chat.id, "Quality: audio").reply_markup(handlers::command::get_main_reply_keyboard()).await?;
                     Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+                }))
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_AUTO_DETECT)).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+                    language_button_handler(bot, msg, db_pool).await
                 }))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text().map(|t| crate::i18n::is_language_button(t)).unwrap_or(false)).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
                     language_button_handler(bot, msg, db_pool).await

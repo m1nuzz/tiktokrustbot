@@ -6,6 +6,8 @@ pub const BTN_TOGGLE_ADS: &str = "Ads: ";
 pub const BTN_TOGGLE_SUCCESS_NOTIFS: &str = "Notify Success: ";
 pub const BTN_TOGGLE_FAIL_NOTIFS: &str = "Notify Fail: ";
 pub const BTN_BACK: &str = "Back";
+pub const BTN_LANGUAGE: &str = "🌐 Language";
+pub const BTN_AUTO_DETECT: &str = "🌐 Auto-detect";
 
 pub fn is_menu_button(text: &str) -> bool {
     matches!(text,
@@ -13,7 +15,8 @@ pub fn is_menu_button(text: &str) -> bool {
         BTN_SETTINGS |
         BTN_FORMAT |
         BTN_SUBSCRIPTION |
-        BTN_BACK
+        BTN_BACK |
+        BTN_LANGUAGE
     )
 }
 
@@ -21,6 +24,7 @@ pub fn is_system_button(text: &str) -> bool {
     matches!(
         text,
         BTN_ADMIN_PANEL | BTN_SETTINGS | BTN_FORMAT | BTN_SUBSCRIPTION | BTN_BACK |
+        BTN_LANGUAGE | BTN_AUTO_DETECT |
         "📢 Broadcast" | "📊 Stats" | "🏆 Top 10" | "👥 All users" | "💎 Premium Users" | "➕ Add Premium User" |
         "📈 Daily Stats" | "📅 Week" | "🔻 Funnel" |
         "h265" | "h264" | "audio"
@@ -41,6 +45,14 @@ mod tests {
         assert!(is_menu_button(BTN_FORMAT));
         assert!(is_menu_button(BTN_SUBSCRIPTION));
         assert!(is_menu_button(BTN_BACK));
+        assert!(is_menu_button(BTN_LANGUAGE));
+        assert!(!is_menu_button(BTN_AUTO_DETECT));
         assert!(!is_menu_button("some other text"));
+    }
+
+    #[test]
+    fn auto_detect_is_system_but_not_menu() {
+        assert!(is_system_button(BTN_AUTO_DETECT));
+        assert!(is_system_button(BTN_LANGUAGE));
     }
 }

@@ -1,7 +1,7 @@
 use teloxide::prelude::*;
 use teloxide::types::{KeyboardMarkup, KeyboardButton};
 use crate::handlers::admin::is_admin;
-use crate::handlers::ui::{BTN_ADMIN_PANEL, BTN_FORMAT, BTN_SETTINGS, BTN_BACK};
+use crate::handlers::ui::{BTN_ADMIN_PANEL, BTN_FORMAT, BTN_SETTINGS, BTN_BACK, BTN_LANGUAGE};
 use std::sync::Arc;
 use crate::database::DatabasePool;
 
@@ -11,6 +11,7 @@ pub async fn settings_text_handler(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut rows = vec![
         vec![KeyboardButton::new(BTN_FORMAT)],
+        vec![KeyboardButton::new(BTN_LANGUAGE)],
     ];
 
     if is_admin(&msg).await {
