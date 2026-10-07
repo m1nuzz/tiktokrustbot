@@ -42,11 +42,11 @@ pub const SESSION_LEASE_SECS: i64 = 1800;
 /// client keeps pinging. `completed` and `expired` remain the only exits and
 /// both are terminal.
 ///
-/// Tradeoff: 24 hours is far longer than any real funnel step, and the whole
+/// Tradeoff: 3 days is far longer than any real funnel step, and the whole
 /// point of the ceiling is that a valued postback Monetag sends minutes after
 /// the user left for the advertiser's page is still honoured while they are
 /// away. A session that is genuinely never finished therefore keeps its row
-/// (and its ad) alive for up to a day - the cost is a small amount of dead
+/// (and its ad) alive for up to 3 days - the cost is a small amount of dead
 /// rows in the funnel, paid for so no earned reward is thrown away.
 pub const SESSION_LEASE_CEILING_SECS: i64 = 3 * 24 * 60 * 60;
 
@@ -1391,20 +1391,21 @@ mod tests {
     }
 
     /// The ceiling holds: no amount of pinging can push a row's lease past
-    /// 24 hours from its creation.
+    /// the ceiling from its creation.
     #[tokio::test]
     async fn heartbeat_cannot_push_the_lease_past_the_ceiling() {
         let (pool, _file) = setup_test_db().await;
         pool.execute_with_timeout(|conn| {
-            // 85500s = 23h45m, so a fresh 30-minute lease overshoots the 24h ceiling
-            // and the `min()` clamp is what sets this row's deadline. Two traps:
-            // a 23h age leaves the ceiling an hour away, so the lease is the
-            // earlier of the two and the clamp is unobservable; and SQLite
-            // rejects a multi-unit modifier ("-23 hours 45 minutes" returns
-            // NULL), which silently gives the row a NULL created_at, hence a
-            // NULL ceiling and a NULL lease - so the age must stay single-unit.
+            // 258300s = 2d23h45m, so a fresh 30-minute lease overshoots the 3-day
+            // ceiling and the `min()` clamp is what sets this row's deadline. Two
+            // traps: an age just under the ceiling leaves it less than the lease
+            // away, so the lease is the earlier of the two and the clamp is
+            // unobservable; and SQLite rejects a multi-unit modifier ("-2 days 23
+            // hours 45 minutes" returns NULL), which silently gives the row a
+            // NULL created_at, hence a NULL ceiling and a NULL lease - so the age
+            // must stay single-unit.
             conn.execute(
-                "INSERT INTO pending_downloads (id, user_id, video_url, created_at) VALUES ('almost-a-day-old', 8, 'http://v', datetime('now', '-85500 seconds'))",
+                "INSERT INTO pending_downloads (id, user_id, video_url, created_at) VALUES ('almost-at-ceiling', 8, 'http://v', datetime('now', '-258300 seconds'))",
                 (),
             )?;
             conn.execute(
@@ -1414,7 +1415,7 @@ mod tests {
             Ok(())
         }).await.unwrap();
 
-        for ymid in ["brand-new", "almost-a-day-old"] {
+        for ymid in ["brand-new", "almost-at-ceiling"] {
             assert!(
                 pool.refresh_session_lease(ymid, SESSION_LEASE_SECS)
                     .await
@@ -1426,12 +1427,12 @@ mod tests {
         }
         assert!(lease_span_secs(&pool, "brand-new").await >= SESSION_LEASE_SECS);
         assert_eq!(
-            lease_span_secs(&pool, "almost-a-day-old").await,
+            lease_span_secs(&pool, "almost-at-ceiling").await,
             SESSION_LEASE_CEILING_SECS,
-            "a session 23h45m old is clamped to the ceiling, not extended by 30 min"
+            "a session 2d23h45m old is clamped to the ceiling, not extended by 30 min"
         );
         // The invariant itself, checked for a clamped and an unclamped row alike.
-        for ymid in ["brand-new", "almost-a-day-old"] {
+        for ymid in ["brand-new", "almost-at-ceiling"] {
             assert!(
                 lease_span_secs(&pool, ymid).await <= SESSION_LEASE_CEILING_SECS,
                 "{} must never be pushed past the ceiling",
