@@ -242,12 +242,15 @@ impl DatabasePool {
     /// Manual /language override for a user, if set.
     pub async fn get_user_lang(&self, user_id: i64) -> Result<Option<String>, anyhow::Error> {
         self.execute_with_timeout(move |conn| {
-            let lang: Option<String> = conn.query_row(
+            // Double Option: missing row -> None via `.optional()`, NULL cell
+            // (a cleared override) -> None via `FromSql for Option`. Both mean
+            // "no manual override", so flatten to one.
+            let lang: Option<Option<String>> = conn.query_row(
                 "SELECT lang FROM users WHERE telegram_id = ?1",
                 params![user_id],
                 |row| row.get(0)
             ).optional()?;
-            Ok(lang)
+            Ok(lang.flatten())
         }).await.map_err(|e| anyhow::anyhow!("Failed to get language for user {}: {}", user_id, e))
     }
 
