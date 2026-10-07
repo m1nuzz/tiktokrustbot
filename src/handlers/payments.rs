@@ -5,6 +5,7 @@ use teloxide::types::{
 };
 use std::sync::Arc;
 use crate::database::DatabasePool;
+use crate::i18n;
 use std::env;
 
 pub const PREMIUM_PAYLOAD: &str = "premium_30_days_xtr";
@@ -38,10 +39,16 @@ pub async fn send_premium_invoice(
     // Log the invoice being sent
     let _ = db_pool.log_invoice(chat_id.0, price_val as i64, PREMIUM_PAYLOAD).await;
 
+    // Invoice speaks the buyer's language: the title, description, Pay button
+    // and price label all come from the same locale table as the bot replies.
+    let lang = db_pool.get_effective_lang(chat_id.0, None).await;
+    let lang = Some(lang.as_str());
+
     // Telegram API Rule: If a custom reply_markup is provided for an invoice, 
     // the first button in the first row MUST be a Pay button.
     let pay_button = InlineKeyboardButton::new(
-        format!("💳 Pay {} Stars", price_val),
+        crate::i18n::t(crate::i18n::MsgKey::PremiumPayButton, lang)
+            .replace("{price}", &price_val.to_string()),
         InlineKeyboardButtonKind::Pay(True)
     );
 
@@ -56,11 +63,14 @@ pub async fn send_premium_invoice(
 
     match bot.send_invoice(
         chat_id,
-        "Premium", // Header
-        "✨ Remove ad (Buy Premium) for 1 month!", // Ordinary text (description)
+        crate::i18n::t(crate::i18n::MsgKey::PremiumInvoiceTitle, lang),
+        crate::i18n::t(crate::i18n::MsgKey::PremiumInvoiceDesc, lang),
         PREMIUM_PAYLOAD,
         CURRENCY_XTR,
-        vec![LabeledPrice::new("Premium Status", price_val)],
+        vec![LabeledPrice::new(
+            crate::i18n::t(crate::i18n::MsgKey::PremiumPriceLabel, lang),
+            price_val,
+        )],
     )
     .reply_markup(markup)
     .await {

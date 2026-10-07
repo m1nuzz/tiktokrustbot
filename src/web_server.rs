@@ -334,6 +334,28 @@ fn inject_bot_username(html: &str, username: Option<&str>) -> String {
     html.replace("/*BOT_USERNAME_INJECT*/null", &literal)
 }
 
+/// Localises the static loader fallback baked into the template. The inline
+/// script replaces both lines on init, so they only ever show when JS is dead
+/// — but then they are the only thing the user sees, and English-only markup
+/// would be wrong for everyone else. Same STRINGS source as the dict, no new
+/// keys; anchors include the closing tags so nothing else can match.
+fn inject_loading_fallback(html: &str, lang: &str) -> String {
+    let html = html.replace(
+        ">Loading...</h2>",
+        &format!(
+            ">{}</h2>",
+            crate::i18n::t(crate::i18n::MsgKey::MiniLoadingTitle, Some(lang))
+        ),
+    );
+    html.replace(
+        ">Connecting to servers</span>",
+        &format!(
+            ">{}</span>",
+            crate::i18n::t(crate::i18n::MsgKey::MiniLoadingSub, Some(lang))
+        ),
+    )
+}
+
 async fn serve_mini_app(
     State(state): State<AppState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
@@ -371,6 +393,7 @@ async fn serve_mini_app(
     // the client source. Unset in the environment means no premium button.
     let bot_username = std::env::var("BOT_USERNAME").ok();
     let html = inject_bot_username(&html, bot_username.as_deref());
+    let html = inject_loading_fallback(&html, &lang);
     // Never cache the document: Telegram WebViews keep serving a stale copy
     // otherwise, and users get stuck on old funnel screens (e.g. a blue,
     // always-visible Continue from a build before btn-success/watch-gate).
@@ -970,6 +993,16 @@ mod tests {
         assert!(!out.contains("}null"), "leftover null after the dict");
         assert!(out.contains("<html lang=\"ru\">"));
         assert!(out.contains("\"MiniNoAdsTitle\":\"x\""));
+    }
+
+    #[test]
+    fn loading_fallback_is_localised() {
+        let template = "<h2 id=\"loader-text\">Loading...</h2><span id=\"loader-subtext\">Connecting to servers</span>";
+        let out = inject_loading_fallback(template, "ru");
+        assert!(!out.contains("Loading..."));
+        assert!(!out.contains("Connecting to servers"));
+        assert!(out.contains("Загрузка..."));
+        assert!(out.contains("Подключение к серверам"));
     }
 
     /// The username injection must never break the inline script: a second
