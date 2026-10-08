@@ -77,6 +77,30 @@ pub fn init_database() -> Result<()> {
     ensure_column(&conn, "users", "lang", "lang TEXT DEFAULT NULL")?;
     ensure_column(&conn, "users", "ref_code", "ref_code TEXT DEFAULT NULL")?;
 
+    // Multi-bot identity: one human can use several bots with isolated
+    // premium, language and quality, so identity is (bot_id, telegram_id).
+    // SQLite cannot add a UNIQUE constraint with ALTER, hence the rebuild.
+    // Guard is the column itself: after the rebuild it exists, re-runs skip.
+    // Rollback-safe by construction: every column survives with its data, new
+    // column has a DEFAULT so old INSERTs keep working, and the composite
+    // unique holds trivially for pre-existing single-bot rows.
+    if !column_exists(&conn, "users", "bot_id")? {
+        log::info!("Migrating users.bot_id (composite identity) ...");
+        conn.execute(
+            "CREATE TABLE users_new (id INTEGER PRIMARY KEY, telegram_id BIGINT NOT NULL, bot_id TEXT NOT NULL DEFAULT 'primary', last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME, lang TEXT DEFAULT NULL, ref_code TEXT DEFAULT NULL, UNIQUE(bot_id, telegram_id))",
+            (),
+        )?;
+        conn.execute(
+            "INSERT INTO users_new (id, telegram_id, last_active, created_at, quality_preference, premium_until, lang, ref_code) SELECT id, telegram_id, last_active, created_at, quality_preference, premium_until, lang, ref_code FROM users",
+            (),
+        )?;
+        let new_rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM users_new", [], |row| row.get(0))?;
+        conn.execute("DROP TABLE users", ())?;
+        conn.execute("ALTER TABLE users_new RENAME TO users", ())?;
+        log::info!("Migrated users.bot_id ({new_rows} rows kept)");
+    }
+
     // Backfill created_at for rows that predate the column (NULL after the
     // ADD COLUMN above) or carry a naive ALTER timestamp (always *after*
     // last_active). Genuine registrations always satisfy
@@ -141,6 +165,7 @@ pub fn init_database() -> Result<()> {
             )?;
         }
     }
+    ensure_column(&conn, "downloads", "bot_id", "bot_id TEXT NOT NULL DEFAULT 'primary'")?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY, admin_telegram_id BIGINT UNIQUE NOT NULL)",
         (),
@@ -175,6 +200,10 @@ pub fn init_database() -> Result<()> {
     // joined to the session that served it.
     ensure_column(&conn, "pending_downloads", "entry_ymid", "entry_ymid TEXT DEFAULT NULL")?;
     ensure_column(&conn, "pending_downloads", "ad_requested_at", "ad_requested_at DATETIME DEFAULT NULL")?;
+    // Owning bot for delivery routing, sweeper notifications and per-bot
+    // stats. DEFAULT keeps old INSERTs (which predate multi-bot) working and
+    // attributes legacy rows to 'primary'.
+    ensure_column(&conn, "pending_downloads", "bot_id", "bot_id TEXT NOT NULL DEFAULT 'primary'")?;
     // Silently retire download requests abandoned before this startup (the
     // user never finished watching the ad). They are marked notified so the
     // expiry sweeper never messages them; only new rows get notified. The
@@ -196,10 +225,12 @@ pub fn init_database() -> Result<()> {
         "CREATE TABLE IF NOT EXISTS blocks (id INTEGER PRIMARY KEY, telegram_id BIGINT NOT NULL, blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
     )?;
+    ensure_column(&conn, "blocks", "bot_id", "bot_id TEXT NOT NULL DEFAULT 'primary'")?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS funnel_events (id INTEGER PRIMARY KEY, user_telegram_id BIGINT NOT NULL, event TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
     )?;
+    ensure_column(&conn, "funnel_events", "bot_id", "bot_id TEXT NOT NULL DEFAULT 'primary'")?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS monetag_postbacks (id INTEGER PRIMARY KEY, ymid TEXT NOT NULL, event_type TEXT DEFAULT NULL, reward_event_type TEXT NOT NULL, estimated_price REAL DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
@@ -230,10 +261,12 @@ pub fn init_database() -> Result<()> {
         "CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY, user_id BIGINT NOT NULL, amount INTEGER NOT NULL, payload TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
     )?;
+    ensure_column(&conn, "payments", "bot_id", "bot_id TEXT NOT NULL DEFAULT 'primary'")?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS invoices (id INTEGER PRIMARY KEY, user_id BIGINT NOT NULL, amount INTEGER NOT NULL, payload TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
     )?;
+    ensure_column(&conn, "invoices", "bot_id", "bot_id TEXT NOT NULL DEFAULT 'primary'")?;
     
     // Add indexes for performance
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)", ());
@@ -241,6 +274,12 @@ pub fn init_database() -> Result<()> {
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_date ON pending_downloads(created_at)", ());
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_downloads(status)", ());
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_user_id ON pending_downloads(user_id)", ());
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_bot ON pending_downloads(bot_id, created_at)", ());
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_funnel_bot ON funnel_events(bot_id, created_at)", ());
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_bot ON payments(bot_id, timestamp)", ());
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_bot ON invoices(bot_id, timestamp)", ());
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_bot ON downloads(bot_id, download_date)", ());
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_bot ON blocks(bot_id, blocked_at)", ());
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(timestamp)", ());
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(timestamp)", ());
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_date ON blocks(blocked_at)", ());
@@ -260,6 +299,22 @@ pub fn init_database() -> Result<()> {
     )?;
     conn.execute(
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('admin_ads_enabled', 'false')",
+        (),
+    )?;
+    // Multi-bot registry and per-bot settings. Tokens live in env only and
+    // never reach the database; rows carry bot_id, this table maps it back to
+    // a username for readable reports. The 'primary' row attributes legacy
+    // rows created before any bot registered; the runtime upserts real ones.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bots (bot_id TEXT PRIMARY KEY, username TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        (),
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bot_settings (bot_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (bot_id, key))",
+        (),
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO bots (bot_id, username) VALUES ('primary', '(legacy)')",
         (),
     )?;
     Ok(())
@@ -410,6 +465,56 @@ mod tests {
             |row| row.get(0)
         ).unwrap();
         assert_eq!(blocks, 1);
+        unsafe {
+            env::remove_var("DATABASE_PATH");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_users_rebuild_preserves_data_and_enforces_composite() {
+        // Exact production scenario: a NON-EMPTY single-bot users table.
+        // The rebuild must keep every row and column, attribute legacy rows
+        // to 'primary', and enforce UNIQUE(bot_id, telegram_id) afterwards.
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        unsafe {
+            env::set_var("DATABASE_PATH", db_path.to_str().unwrap());
+        }
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME, lang TEXT DEFAULT NULL, ref_code TEXT DEFAULT NULL)",
+                (),
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO users (telegram_id, premium_until, lang) VALUES (11, datetime('now', '+30 days'), 'uk'), (22, NULL, NULL)",
+                (),
+            ).unwrap();
+        }
+
+        init_database().unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        // Data survived with columns intact.
+        let kept: i32 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, 2);
+        let lang: String = conn.query_row(
+            "SELECT lang FROM users WHERE telegram_id = 11", [], |r| r.get(0)).unwrap();
+        assert_eq!(lang, "uk");
+        // Legacy rows attribute to 'primary'.
+        let primary: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM users WHERE bot_id = 'primary'", [], |r| r.get(0)).unwrap();
+        assert_eq!(primary, 2);
+        // Same human on a second bot coexists; twice on one bot is rejected.
+        conn.execute("INSERT INTO users (telegram_id, bot_id) VALUES (11, 'second')", []).unwrap();
+        let dup = conn.execute("INSERT INTO users (telegram_id, bot_id) VALUES (11, 'primary')", []);
+        assert!(dup.is_err(), "same (bot, user) twice must be rejected");
+        // Registry + per-bot settings tables exist with the legacy seed.
+        let seeded: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM bots WHERE bot_id = 'primary'", [], |r| r.get(0)).unwrap();
+        assert_eq!(seeded, 1);
         unsafe {
             env::remove_var("DATABASE_PATH");
         }

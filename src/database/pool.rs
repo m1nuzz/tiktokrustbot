@@ -305,6 +305,66 @@ impl DatabasePool {
         }).await.map_err(|e| anyhow::anyhow!("Failed to set setting {}: {}", key, e))
     }
 
+    /// Register a bot by its stable numeric id (token prefix). Idempotent:
+    /// re-registering refreshes the username. Tokens never reach the database.
+    pub async fn register_bot(&self, bot_id: &str, username: &str) -> Result<(), anyhow::Error> {
+        let bot_owned = bot_id.to_string();
+        let name_owned = username.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "INSERT INTO bots (bot_id, username) VALUES (?1, ?2) ON CONFLICT(bot_id) DO UPDATE SET username = excluded.username",
+                params![bot_owned, name_owned],
+            )?;
+            Ok(())
+        }).await.map_err(|e| anyhow::anyhow!("Failed to register bot {}: {}", bot_id, e))
+    }
+
+    /// All known bots, oldest first. The aggregate admin view iterates this.
+    pub async fn list_bots(&self) -> Result<Vec<(String, String)>, anyhow::Error> {
+        self.execute_with_timeout(|conn| {
+            let mut stmt = conn.prepare("SELECT bot_id, username FROM bots ORDER BY created_at, bot_id")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        }).await.map_err(|e| anyhow::anyhow!("Failed to list bots: {}", e))
+    }
+
+    /// Per-bot setting override. Missing rows fall back to the global
+    /// `settings` table, then to the caller default (see resolve below).
+    pub async fn set_bot_setting(&self, bot_id: &str, key: &str, value: &str) -> Result<(), anyhow::Error> {
+        let bot_owned = bot_id.to_string();
+        let key_owned = key.to_string();
+        let value_owned = value.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO bot_settings (bot_id, key, value) VALUES (?1, ?2, ?3)",
+                params![bot_owned, key_owned, value_owned],
+            )?;
+            Ok(())
+        }).await.map_err(|e| anyhow::anyhow!("Failed to set setting {} for bot {}: {}", key, bot_id, e))
+    }
+
+    /// Effective setting value: per-bot override wins, else the global
+    /// setting, else `default`. Never fails: every layer degrades gracefully.
+    pub async fn resolve_bot_setting(&self, bot_id: &str, key: &str, default: &str) -> String {
+        let bot_owned = bot_id.to_string();
+        let key_owned = key.to_string();
+        let per_bot: Option<String> = self.execute_with_timeout(move |conn| {
+            conn.query_row(
+                "SELECT value FROM bot_settings WHERE bot_id = ?1 AND key = ?2",
+                params![bot_owned, key_owned],
+                |row| row.get(0),
+            ).optional()
+        }).await.ok().flatten();
+        if let Some(value) = per_bot {
+            return value;
+        }
+        self.get_setting(key).await.unwrap_or_else(|_| default.to_string())
+    }
+
     /// Create a pending download record and return its unique ID (ymid).
     /// The row starts with a live lease so it is claimable from the first
     /// second, before the client sends its first heartbeat.
@@ -1117,10 +1177,19 @@ pub(crate) async fn setup_test_db() -> (DatabasePool, tempfile::NamedTempFile) {
     let db_path = temp_file.path().to_str().unwrap().to_string();
     let pool = DatabasePool::new(db_path.clone(), 1);
 
-    // Initialize all necessary tables
+    // Initialize all necessary tables (mirrors production schema in old.rs,
+    // including the multi-bot identity: composite (bot_id, telegram_id)).
     pool.execute_with_timeout(|conn| {
         conn.execute(
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME, lang TEXT DEFAULT NULL, ref_code TEXT DEFAULT NULL)",
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT NOT NULL, bot_id TEXT NOT NULL DEFAULT 'primary', last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME, lang TEXT DEFAULT NULL, ref_code TEXT DEFAULT NULL, UNIQUE(bot_id, telegram_id))",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE bots (bot_id TEXT PRIMARY KEY, username TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE bot_settings (bot_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (bot_id, key))",
             (),
         )?;
         conn.execute(
@@ -1128,7 +1197,7 @@ pub(crate) async fn setup_test_db() -> (DatabasePool, tempfile::NamedTempFile) {
             (),
         )?;
         conn.execute(
-            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL, job_started_at DATETIME DEFAULT NULL, entry_ymid TEXT DEFAULT NULL, ad_requested_at DATETIME DEFAULT NULL)",
+            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL, job_started_at DATETIME DEFAULT NULL, entry_ymid TEXT DEFAULT NULL, ad_requested_at DATETIME DEFAULT NULL, bot_id TEXT NOT NULL DEFAULT 'primary')",
             (),
         )?;
         conn.execute(
@@ -1140,15 +1209,15 @@ pub(crate) async fn setup_test_db() -> (DatabasePool, tempfile::NamedTempFile) {
             (),
         )?;
         conn.execute(
-            "CREATE TABLE blocks (id INTEGER PRIMARY KEY, telegram_id BIGINT NOT NULL, blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE blocks (id INTEGER PRIMARY KEY, telegram_id BIGINT NOT NULL, blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP, bot_id TEXT NOT NULL DEFAULT 'primary')",
             (),
         )?;
         conn.execute(
-            "CREATE TABLE funnel_events (id INTEGER PRIMARY KEY, user_telegram_id BIGINT NOT NULL, event TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE funnel_events (id INTEGER PRIMARY KEY, user_telegram_id BIGINT NOT NULL, event TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, bot_id TEXT NOT NULL DEFAULT 'primary')",
             (),
         )?;
         conn.execute(
-            "CREATE TABLE downloads (id INTEGER PRIMARY KEY, user_telegram_id BIGINT, video_url TEXT NOT NULL, download_date DATETIME DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE downloads (id INTEGER PRIMARY KEY, user_telegram_id BIGINT, video_url TEXT NOT NULL, download_date DATETIME DEFAULT CURRENT_TIMESTAMP, bot_id TEXT NOT NULL DEFAULT 'primary')",
             (),
         )?;
         Ok(())
@@ -1262,6 +1331,76 @@ mod tests {
         assert_eq!(pool.get_user_lang(user_id).await.unwrap(), None);
         assert_eq!(pool.get_effective_lang(user_id, Some("ru")).await, "ru");
         pool.clear_user_lang(999888777).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bots_register_list_and_refresh_username() {
+        let (pool, _file) = setup_test_db().await;
+        pool.register_bot("111", "alpha_bot").await.unwrap();
+        pool.register_bot("222", "beta_bot").await.unwrap();
+        let bots = pool.list_bots().await.unwrap();
+        assert_eq!(bots.len(), 2);
+        pool.register_bot("111", "alpha_renamed").await.unwrap();
+        let bots = pool.list_bots().await.unwrap();
+        assert_eq!(bots.len(), 2);
+        assert!(bots.contains(&("111".to_string(), "alpha_renamed".to_string())));
+    }
+
+    #[tokio::test]
+    async fn legacy_writes_default_to_primary_bot() {
+        let (pool, _file) = setup_test_db().await;
+        pool.execute_with_timeout(|conn| {
+            conn.execute("INSERT INTO users (telegram_id) VALUES (42)", ())?;
+            conn.execute("INSERT INTO pending_downloads (id, user_id, video_url) VALUES ('y1', 42, 'http://v')", ())?;
+            conn.execute("INSERT INTO funnel_events (user_telegram_id, event) VALUES (42, 'start')", ())?;
+            conn.execute("INSERT INTO blocks (telegram_id) VALUES (42)", ())?;
+            conn.execute("INSERT INTO downloads (user_telegram_id, video_url) VALUES (42, 'http://v')", ())?;
+            Ok(())
+        }).await.unwrap();
+        let bots: Vec<String> = pool.execute_with_timeout(|conn| {
+            let mut out = Vec::new();
+            for (table, cond) in [
+                ("users", "telegram_id = 42"),
+                ("pending_downloads", "id = 'y1'"),
+                ("funnel_events", "user_telegram_id = 42"),
+                ("blocks", "telegram_id = 42"),
+                ("downloads", "user_telegram_id = 42"),
+            ] {
+                let b: String = conn.query_row(
+                    &format!("SELECT bot_id FROM {table} WHERE {cond}"),
+                    [],
+                    |row| row.get(0),
+                )?;
+                out.push(b);
+            }
+            Ok(out)
+        }).await.unwrap();
+        assert!(bots.iter().all(|b| b == "primary"), "every legacy write lands on primary: {bots:?}");
+    }
+
+    #[tokio::test]
+    async fn same_user_coexists_on_two_bots_but_not_twice_on_one() {
+        let (pool, _file) = setup_test_db().await;
+        pool.execute_with_timeout(|conn| {
+            conn.execute("INSERT INTO users (telegram_id, bot_id) VALUES (42, 'aaa')", ())?;
+            conn.execute("INSERT INTO users (telegram_id, bot_id) VALUES (42, 'bbb')", ())?;
+            Ok(())
+        }).await.unwrap();
+        let dup = pool.execute_with_timeout(|conn| {
+            conn.execute("INSERT INTO users (telegram_id, bot_id) VALUES (42, 'aaa')", ())
+        }).await;
+        assert!(dup.is_err(), "same (bot, user) twice must be rejected");
+    }
+
+    #[tokio::test]
+    async fn bot_setting_falls_back_to_global_then_default() {
+        let (pool, _file) = setup_test_db().await;
+        assert_eq!(pool.resolve_bot_setting("aaa", "price", "50").await, "50");
+        pool.set_setting("price", "75").await.unwrap();
+        assert_eq!(pool.resolve_bot_setting("aaa", "price", "50").await, "75");
+        pool.set_bot_setting("aaa", "price", "99").await.unwrap();
+        assert_eq!(pool.resolve_bot_setting("aaa", "price", "50").await, "99");
+        assert_eq!(pool.resolve_bot_setting("bbb", "price", "50").await, "75");
     }
 
     #[tokio::test]
