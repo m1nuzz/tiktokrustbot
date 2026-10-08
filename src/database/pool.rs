@@ -1898,8 +1898,14 @@ mod tests {
             conn.execute("INSERT INTO pending_downloads (id, user_id, video_url) VALUES ('legacy', 7, 'http://v')", ())?;
             Ok(())
         }).await.unwrap();
-        assert_eq!(pool.get_bot_id_by_ymid("known").await.unwrap(), Some("zzz".to_string()));
-        assert_eq!(pool.get_bot_id_by_ymid("legacy").await.unwrap(), Some("primary".to_string()));
+        assert_eq!(
+            pool.get_bot_id_by_ymid("known").await.unwrap(),
+            Some("zzz".to_string())
+        );
+        assert_eq!(
+            pool.get_bot_id_by_ymid("legacy").await.unwrap(),
+            Some("primary".to_string())
+        );
         assert_eq!(pool.get_bot_id_by_ymid("nope").await.unwrap(), None);
     }
 
