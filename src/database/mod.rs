@@ -7,4 +7,5 @@ pub use pool::{
 };
 #[cfg(test)]
 pub(crate) use pool::{setup_gate_row, setup_test_db};
+pub use pool::PRIMARY_BOT_ID;
 pub use old::{get_database_path, init_database};

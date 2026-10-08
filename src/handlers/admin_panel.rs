@@ -79,7 +79,7 @@ pub async fn add_premium_user_handler(
 
         match text.parse::<i64>() {
             Ok(user_id) => {
-                match db_pool.set_user_premium(user_id, 30).await {
+                match db_pool.set_user_premium(crate::database::PRIMARY_BOT_ID, user_id, 30).await {
                     Ok(_) => {
                         bot.send_message(msg.chat.id, format!("✅ User {} granted 30 days of Premium!", user_id))
                             .reply_markup(crate::handlers::command::get_main_reply_keyboard())

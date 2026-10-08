@@ -418,7 +418,7 @@ async fn get_ads_status(
             Ok(user_id) => {
                 let is_user_admin = crate::handlers::admin::is_admin_id(user_id);
                 let enabled =
-                    crate::handlers::link::ads_enabled_for(&state.db, user_id, is_user_admin).await;
+                    crate::handlers::link::ads_enabled_for(&state.db, crate::database::PRIMARY_BOT_ID, user_id, is_user_admin).await;
                 return Json(json!({ "enabled": enabled }));
             }
             Err(e) => {

@@ -215,7 +215,7 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                                 }
                                 AdminCommand::FakePayment => {
                                     if let Some(user) = msg.from {
-                                        let _ = db_pool.set_user_premium(user.id.0 as i64, 30).await;
+                                        let _ = db_pool.set_user_premium(crate::database::PRIMARY_BOT_ID, user.id.0 as i64, 30).await;
                                         bot.send_message(msg.chat.id, "✅ [TEST] Premium activated!").await?;
                                     }
                                 }

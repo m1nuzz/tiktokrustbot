@@ -133,7 +133,7 @@ pub async fn process_successful_payment_logic(
     }
 
     log::info!("[PAYMENT_CHAIN] 6. Granting premium in DB for user {}", user_id);
-    db_pool.set_user_premium(user_id, 30).await?;
+    db_pool.set_user_premium(crate::database::PRIMARY_BOT_ID, user_id, 30).await?;
     
     // Log the successful payment
     let _ = db_pool.log_payment(user_id, amount as i64, payload).await;

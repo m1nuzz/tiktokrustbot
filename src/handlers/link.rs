@@ -162,7 +162,7 @@ async fn get_subscription_required(
 /// `admin_ads_enabled` (or TEST_MODE) forces ads for admins to test.
 /// Used by both the bot handler and the mini-app status endpoint so they
 /// can never disagree with each other.
-pub async fn ads_enabled_for(db_pool: &DatabasePool, user_id: i64, is_user_admin: bool) -> bool {
+pub async fn ads_enabled_for(db_pool: &DatabasePool, bot_id: &str, user_id: i64, is_user_admin: bool) -> bool {
     let module_enabled = std::env::var("MONETAG_MODULE_ENABLED").map(|v| v.to_lowercase() == "true").unwrap_or(true);
     let global_ads = db_pool.get_setting("ads_enabled").await.map(|val| val == "true").unwrap_or(true);
     let is_test_mode = std::env::var("TEST_MODE").map(|v| v.to_lowercase() == "true").unwrap_or(false);
@@ -177,7 +177,7 @@ pub async fn ads_enabled_for(db_pool: &DatabasePool, user_id: i64, is_user_admin
     } else if is_user_admin {
         // Admin but has personal ads OFF and not in test mode
         false
-    } else if db_pool.is_user_premium(user_id).await {
+    } else if db_pool.is_user_premium(bot_id, user_id).await {
         log::info!("Ads disabled: User {} has Premium", user_id);
         false
     } else {
@@ -544,22 +544,24 @@ mod tests {
         pool.set_setting("admin_ads_enabled", "false").await.unwrap();
 
         // Regular user, ads globally on -> sees ads.
-        assert!(ads_enabled_for(&pool, 111, false).await);
+        assert!(ads_enabled_for(&pool, crate::database::PRIMARY_BOT_ID, 111, false).await);
         // Admin, global on, no override -> skips ads.
-        assert!(!ads_enabled_for(&pool, 999, true).await);
+        assert!(!ads_enabled_for(&pool, crate::database::PRIMARY_BOT_ID, 999, true).await);
         // Premium user, global on -> skips ads.
-        pool.set_user_premium(222, 30).await.unwrap();
-        assert!(!ads_enabled_for(&pool, 222, false).await);
+        pool.set_user_premium(crate::database::PRIMARY_BOT_ID, 222, 30).await.unwrap();
+        assert!(!ads_enabled_for(&pool, crate::database::PRIMARY_BOT_ID, 222, false).await);
+        // Same human on another bot has no premium there -> still sees ads.
+        assert!(ads_enabled_for(&pool, "bbb", 222, false).await);
 
         // Global OFF: regular users see nothing...
         pool.set_setting("ads_enabled", "false").await.unwrap();
-        assert!(!ads_enabled_for(&pool, 111, false).await);
+        assert!(!ads_enabled_for(&pool, crate::database::PRIMARY_BOT_ID, 111, false).await);
         // ...but an admin with Admin Ads ON gets the test flow (reported scenario).
         pool.set_setting("admin_ads_enabled", "true").await.unwrap();
-        assert!(ads_enabled_for(&pool, 999, true).await);
+        assert!(ads_enabled_for(&pool, crate::database::PRIMARY_BOT_ID, 999, true).await);
         // Admin without the override still skips.
         pool.set_setting("admin_ads_enabled", "false").await.unwrap();
-        assert!(!ads_enabled_for(&pool, 999, true).await);
+        assert!(!ads_enabled_for(&pool, crate::database::PRIMARY_BOT_ID, 999, true).await);
 
         // ymid resolves to the requesting user (what /api/ads-status uses).
         let ymid = pool

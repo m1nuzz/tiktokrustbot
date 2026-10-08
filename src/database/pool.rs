@@ -35,6 +35,11 @@ pub enum ClaimVia {
 /// open. The sweeper expires a row only once this window has lapsed, so an
 /// open webapp keeps its session claimable for as long as the user stays on it
 /// instead of being cut off at a fixed 30 minutes.
+/// Bot identity for pre-multi-bot rows and single-bot call sites: every
+/// `bot_id` column defaults to this, and Phase-2 runtime replaces these
+/// uses with the dispatching bot's id (grep PRIMARY_BOT_ID for the list).
+pub const PRIMARY_BOT_ID: &str = "primary";
+
 pub const SESSION_LEASE_SECS: i64 = 1800;
 
 /// Hard ceiling for one session, measured from the row's creation: every
@@ -1001,12 +1006,13 @@ impl DatabasePool {
         .map_err(|e| anyhow::anyhow!("Failed to expire stale pending downloads: {}", e))
     }
 
-    /// Check if user has active premium status
-    pub async fn is_user_premium(&self, user_id: i64) -> bool {
+    /// Check if user has active premium status **on one bot**.
+    pub async fn is_user_premium(&self, bot_id: &str, user_id: i64) -> bool {
+        let bot_owned = bot_id.to_string();
         let result = self.execute_with_timeout(move |conn| {
             let is_premium: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM users WHERE telegram_id = ?1 AND premium_until > datetime('now'))",
-                params![user_id],
+                "SELECT EXISTS(SELECT 1 FROM users WHERE bot_id = ?1 AND telegram_id = ?2 AND premium_until > datetime('now'))",
+                params![bot_owned, user_id],
                 |row| row.get(0)
             )?;
             Ok(is_premium)
@@ -1015,18 +1021,19 @@ impl DatabasePool {
         result.unwrap_or(false)
     }
 
-    /// Set or extend premium status for user
-    pub async fn set_user_premium(&self, user_id: i64, days: i64) -> Result<(), anyhow::Error> {
+    /// Set or extend premium status for user **on one bot**.
+    pub async fn set_user_premium(&self, bot_id: &str, user_id: i64, days: i64) -> Result<(), anyhow::Error> {
+        let bot_owned = bot_id.to_string();
         self.execute_with_timeout(move |conn| {
             conn.execute(
-                "INSERT INTO users (telegram_id, premium_until) 
-                 VALUES (?1, datetime('now', '+' || ?2 || ' days'))
-                 ON CONFLICT(telegram_id) DO UPDATE SET 
-                 premium_until = datetime(MAX(COALESCE(premium_until, datetime('now')), datetime('now')), '+' || ?2 || ' days')",
-                params![user_id, days],
+                "INSERT INTO users (bot_id, telegram_id, premium_until) 
+                 VALUES (?1, ?2, datetime('now', '+' || ?3 || ' days'))
+                 ON CONFLICT(bot_id, telegram_id) DO UPDATE SET 
+                 premium_until = datetime(MAX(COALESCE(premium_until, datetime('now')), datetime('now')), '+' || ?3 || ' days')",
+                params![bot_owned, user_id, days],
             )?;
             Ok(())
-        }).await.map_err(|e| anyhow::anyhow!("Failed to set premium for user {}: {}", user_id, e))
+        }).await.map_err(|e| anyhow::anyhow!("Failed to set premium for user {} on bot {}: {}", user_id, bot_id, e))
     }
 
     /// Get list of users with active premium status
@@ -1809,13 +1816,13 @@ mod tests {
         let user_id = 123456789i64;
 
         // Initially not premium
-        assert!(!pool.is_user_premium(user_id).await);
+        assert!(!pool.is_user_premium("aaa", user_id).await);
 
         // Activate premium
-        pool.set_user_premium(user_id, 30).await.unwrap();
+        pool.set_user_premium("aaa", user_id, 30).await.unwrap();
 
         // Now is premium
-        assert!(pool.is_user_premium(user_id).await);
+        assert!(pool.is_user_premium("aaa", user_id).await);
 
         // Check premium users list
         let premium_users = pool.get_premium_users().await.unwrap();
@@ -1824,16 +1831,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_premium_is_invisible_to_another_bot() {
+        let (pool, _file) = setup_test_db().await;
+        let user_id = 777i64;
+        pool.set_user_premium("aaa", user_id, 30).await.unwrap();
+        assert!(pool.is_user_premium("aaa", user_id).await);
+        assert!(!pool.is_user_premium("bbb", user_id).await);
+    }
+
+    #[tokio::test]
     async fn test_premium_extension() {
         let (pool, _file) = setup_test_db().await;
         let user_id = 987654321i64;
 
         // Set initial premium
-        pool.set_user_premium(user_id, 30).await.unwrap();
+        pool.set_user_premium("aaa", user_id, 30).await.unwrap();
         let first_expiry = pool.get_premium_users().await.unwrap()[0].1.clone();
 
         // Extend premium
-        pool.set_user_premium(user_id, 30).await.unwrap();
+        pool.set_user_premium("aaa", user_id, 30).await.unwrap();
         let second_expiry = pool.get_premium_users().await.unwrap()[0].1.clone();
 
         // Second expiry should be later than first
@@ -1845,7 +1861,7 @@ mod tests {
         let (pool, _file) = setup_test_db().await;
         
         // Add active premium user
-        pool.set_user_premium(1, 30).await.unwrap();
+        pool.set_user_premium("aaa", 1, 30).await.unwrap();
         
         // Add expired premium user
         pool.execute_with_timeout(|conn| {
