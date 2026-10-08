@@ -1383,10 +1383,10 @@ mod tests {
         assert_eq!(pool.get_user_lang("aaa", user_id).await.unwrap(), Some("uk".to_string()));
 
         // Quality reads are per-bot too (cache key includes the bot).
-        // The lang write above created only the "aaa" row (DB default h264);
-        // "bbb" has no row at all.
+        // Both rows exist by now (the lang writes above created them)
+        // with the DB default h264.
         assert_eq!(pool.get_user_quality("aaa", user_id).await.unwrap(), "h264");
-        assert_eq!(pool.get_user_quality("bbb", user_id).await.unwrap(), "best");
+        assert_eq!(pool.get_user_quality("bbb", user_id).await.unwrap(), "h264");
         // A quality change on one bot never crosses to the other.
         pool.execute_with_timeout(move |conn| {
             conn.execute(
@@ -1397,7 +1397,7 @@ mod tests {
         }).await.unwrap();
         pool.invalidate_user_quality_cache("aaa", user_id).await;
         assert_eq!(pool.get_user_quality("aaa", user_id).await.unwrap(), "h265");
-        assert_eq!(pool.get_user_quality("bbb", user_id).await.unwrap(), "best");
+        assert_eq!(pool.get_user_quality("bbb", user_id).await.unwrap(), "h264");
     }
 
     #[tokio::test]
