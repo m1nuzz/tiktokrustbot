@@ -388,7 +388,7 @@ async fn main() -> Result<(), Error> {
                 cfg.uploader,
                 db_pool.clone(),
                 task_manager.clone(),
-                upload_semaphore.clone(),
+                upload_semaphore.clone()
             ])
             .enable_ctrlc_handler()
             .build();
