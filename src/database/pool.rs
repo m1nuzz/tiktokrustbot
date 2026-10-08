@@ -1383,9 +1383,20 @@ mod tests {
         assert_eq!(pool.get_user_lang("aaa", user_id).await.unwrap(), Some("uk".to_string()));
 
         // Quality reads are per-bot too (cache key includes the bot).
-        assert_eq!(pool.get_user_quality("aaa", user_id).await.unwrap(), "best");
+        // The lang write above created only the "aaa" row (DB default h264);
+        // "bbb" has no row at all.
+        assert_eq!(pool.get_user_quality("aaa", user_id).await.unwrap(), "h264");
         assert_eq!(pool.get_user_quality("bbb", user_id).await.unwrap(), "best");
+        // A quality change on one bot never crosses to the other.
+        pool.execute_with_timeout(move |conn| {
+            conn.execute(
+                "UPDATE users SET quality_preference = 'h265' WHERE bot_id = 'aaa' AND telegram_id = ?1",
+                params![user_id],
+            )?;
+            Ok(())
+        }).await.unwrap();
         pool.invalidate_user_quality_cache("aaa", user_id).await;
+        assert_eq!(pool.get_user_quality("aaa", user_id).await.unwrap(), "h265");
         assert_eq!(pool.get_user_quality("bbb", user_id).await.unwrap(), "best");
     }
 
@@ -1874,7 +1885,7 @@ mod tests {
         assert!(pool.is_user_premium("aaa", user_id).await);
 
         // Check premium users list
-        let premium_users = pool.get_premium_users("primary").await.unwrap();
+        let premium_users = pool.get_premium_users("aaa").await.unwrap();
         assert_eq!(premium_users.len(), 1);
         assert_eq!(premium_users[0].0, user_id);
     }
@@ -1895,11 +1906,11 @@ mod tests {
 
         // Set initial premium
         pool.set_user_premium("aaa", user_id, 30).await.unwrap();
-        let first_expiry = pool.get_premium_users("primary").await.unwrap()[0].1.clone();
+        let first_expiry = pool.get_premium_users("aaa").await.unwrap()[0].1.clone();
 
         // Extend premium
         pool.set_user_premium("aaa", user_id, 30).await.unwrap();
-        let second_expiry = pool.get_premium_users("primary").await.unwrap()[0].1.clone();
+        let second_expiry = pool.get_premium_users("aaa").await.unwrap()[0].1.clone();
 
         // Second expiry should be later than first
         assert!(second_expiry > first_expiry);
@@ -1921,7 +1932,7 @@ mod tests {
             Ok(())
         }).await.unwrap();
 
-        let premium_users = pool.get_premium_users("primary").await.unwrap();
+        let premium_users = pool.get_premium_users("aaa").await.unwrap();
         assert_eq!(premium_users.len(), 1);
         assert_eq!(premium_users[0].0, 1);
     }
