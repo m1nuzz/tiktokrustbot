@@ -514,7 +514,7 @@ mod tests {
         let pool = DatabasePool::new(db_path, 1);
         pool.execute_with_timeout(|conn| {
             conn.execute(
-                "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME, lang TEXT DEFAULT NULL, ref_code TEXT DEFAULT NULL)",
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT NOT NULL, bot_id TEXT NOT NULL DEFAULT 'primary', last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME, lang TEXT DEFAULT NULL, ref_code TEXT DEFAULT NULL, UNIQUE(bot_id, telegram_id))",
                 (),
             )?;
             conn.execute(
