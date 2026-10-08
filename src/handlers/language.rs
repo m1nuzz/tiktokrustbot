@@ -3,7 +3,7 @@ use teloxide::prelude::*;
 use teloxide::types::{KeyboardButton, KeyboardMarkup};
 
 use crate::database::DatabasePool;
-use crate::handlers::ui::BTN_AUTO_DETECT;
+use crate::handlers::ui::{BTN_AUTO_DETECT, BTN_BACK};
 use crate::i18n::{self, MsgKey};
 
 /// Reply keyboard: auto-detect first, then one button per supported language
@@ -20,6 +20,7 @@ pub fn language_keyboard() -> KeyboardMarkup {
     if !row.is_empty() {
         rows.push(row);
     }
+    rows.push(vec![KeyboardButton::new(BTN_BACK)]);
     KeyboardMarkup::new(rows).resize_keyboard()
 }
 
