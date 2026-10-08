@@ -1,4 +1,4 @@
-use tiktokdownloader::database::DatabasePool;
+use tiktokdownloader::database::{DatabasePool, PRIMARY_BOT_ID};
 use tiktokdownloader::handlers::payments::{
     process_successful_payment_logic, PREMIUM_PAYLOAD, CURRENCY_XTR,
     validate_pre_checkout,
@@ -12,7 +12,7 @@ async fn setup_test_db() -> (DatabasePool, NamedTempFile) {
     
     pool.execute_with_timeout(|conn| {
         conn.execute(
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME)",
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT NOT NULL, bot_id TEXT NOT NULL DEFAULT 'primary', last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME, UNIQUE(bot_id, telegram_id))",
             (),
         )?;
         conn.execute(
@@ -51,7 +51,7 @@ async fn test_successful_payment_logic_activates_premium() {
     let (pool, _file) = setup_test_db().await;
     let user_id = 123456789i64;
 
-    assert!(!pool.is_user_premium(user_id).await);
+    assert!(!pool.is_user_premium(PRIMARY_BOT_ID, user_id).await);
 
     let success = process_successful_payment_logic(
         user_id,
@@ -62,7 +62,7 @@ async fn test_successful_payment_logic_activates_premium() {
     ).await.unwrap();
 
     assert!(success);
-    assert!(pool.is_user_premium(user_id).await);
+    assert!(pool.is_user_premium(PRIMARY_BOT_ID, user_id).await);
 }
 
 #[tokio::test]
@@ -95,7 +95,7 @@ async fn test_invalid_payload_rejection() {
     ).await.unwrap();
 
     assert!(!success, "Logic should reject invalid payload");
-    assert!(!pool.is_user_premium(user_id).await, "DB should not be updated on invalid payload");
+    assert!(!pool.is_user_premium(PRIMARY_BOT_ID, user_id).await, "DB should not be updated on invalid payload");
 }
 
 #[tokio::test]
