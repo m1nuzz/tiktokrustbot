@@ -17,10 +17,28 @@ pub struct MTProtoUploader {
     pub client: Arc<Mutex<Client>>,
     pub ffprobe_path: PathBuf,
     pub ffmpeg_path: PathBuf,
+    pub bot_token: String,
+    pub session_file: PathBuf,
 }
 
 impl MTProtoUploader {
-    pub async fn new(bot_token: &str, ffprobe_path: PathBuf, ffmpeg_path: PathBuf) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn new(
+        bot_token: &str,
+        ffprobe_path: PathBuf,
+        ffmpeg_path: PathBuf,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::new_with_session(bot_token, PathBuf::from(SESSION_FILE), ffprobe_path, ffmpeg_path).await
+    }
+
+    /// Per-bot constructor: each bot keeps its own session file so two
+    /// uploaders never fight over one file (auth keys and saved state are
+    /// per session). `new` above is the single-bot case with the historic name.
+    pub async fn new_with_session(
+        bot_token: &str,
+        session_file: PathBuf,
+        ffprobe_path: PathBuf,
+        ffmpeg_path: PathBuf,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let api_id: i32 = env::var("TELEGRAM_API_ID")?.parse()?;
         let api_hash = env::var("TELEGRAM_API_HASH")?;
 
@@ -28,11 +46,14 @@ impl MTProtoUploader {
             .unwrap_or_else(|_| "false".to_string())
             .to_lowercase() == "true";
 
-        if is_test_mode && std::path::Path::new(SESSION_FILE).exists() {
-            log::warn!("⚠️  TEST MODE detected. Using session file: {}", SESSION_FILE);
+        if is_test_mode && session_file.exists() {
+            log::warn!(
+                "⚠️  TEST MODE detected. Using session file: {}",
+                session_file.display()
+            );
         }
 
-        let session = Session::load_file_or_create(SESSION_FILE)?;
+        let session = Session::load_file_or_create(session_file.clone())?;
         
         // Configure initialization parameters
         let params = InitParams {
@@ -63,7 +84,7 @@ impl MTProtoUploader {
         if !client.is_authorized().await? {
             client.bot_sign_in(bot_token).await?;
         }
-        client.session().save_to_file(SESSION_FILE)?;
+        client.session().save_to_file(session_file.clone())?;
 
         // Wrap the client in Arc<Mutex<>> for reconnection capability
         let client = Arc::new(Mutex::new(client));
@@ -74,6 +95,8 @@ impl MTProtoUploader {
         // client and kills in-flight uploads, so it only happens after
         // several consecutive ping failures, not on a single blip.
         let client_keepalive = client.clone();
+        let keepalive_token = bot_token.to_string();
+        let keepalive_session = session_file.clone();
         tokio::spawn(async move {
             // Frequent enough to keep idle connections alive through NAT.
             let mut interval = tokio::time::interval(Duration::from_secs(120));
@@ -107,7 +130,13 @@ impl MTProtoUploader {
                         // Reconnection attempt. Note: replacing the client
                         // drops the old one (grammers disconnects on drop),
                         // so in-flight uploads fail over via with_reconnect_retry.
-                        if let Err(reconnect_err) = MTProtoUploader::reconnect_client(&client_keepalive).await {
+                        if let Err(reconnect_err) = MTProtoUploader::reconnect_client(
+                            &client_keepalive,
+                            &keepalive_token,
+                            &keepalive_session,
+                        )
+                        .await
+                        {
                             log::error!("Reconnection failed: {:?}", reconnect_err);
                         } else {
                             log::info!("Client reconnected successfully");
@@ -117,11 +146,20 @@ impl MTProtoUploader {
             }
         });
 
-        Ok(Self { client, ffprobe_path, ffmpeg_path })
+        Ok(Self {
+            client,
+            ffprobe_path,
+            ffmpeg_path,
+            bot_token: bot_token.to_string(),
+            session_file,
+        })
     }
 
-    async fn reconnect_client(client: &Arc<Mutex<Client>>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let bot_token = std::env::var("TELOXIDE_TOKEN")?;
+    async fn reconnect_client(
+        client: &Arc<Mutex<Client>>,
+        bot_token: &str,
+        session_file: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let api_id: i32 = env::var("TELEGRAM_API_ID")?.parse()?;
         let api_hash = env::var("TELEGRAM_API_HASH")?;
         
@@ -129,7 +167,7 @@ impl MTProtoUploader {
             .unwrap_or_else(|_| "false".to_string())
             .to_lowercase() == "true";
         
-        let session = Session::load_file_or_create(SESSION_FILE)?;
+        let session = Session::load_file_or_create(session_file)?;
         
         let params = InitParams {
             device_model: "Desktop".to_string(),
@@ -157,9 +195,9 @@ impl MTProtoUploader {
 
         // Check authorization and reconnect as a bot if necessary
         if !new_client.is_authorized().await? {
-            new_client.bot_sign_in(&bot_token).await?;
+            new_client.bot_sign_in(bot_token).await?;
         }
-        new_client.session().save_to_file(SESSION_FILE)?;
+        new_client.session().save_to_file(session_file)?;
         
         // Replace the old client with a new one
         {
@@ -186,7 +224,10 @@ impl MTProtoUploader {
                           e.to_string().contains("Connection lost") => {
                     log::warn!("Connection lost, reconnecting... (attempt {}/{})", attempt + 1, max_retries);
                     
-                    if let Err(reconnect_err) = Self::reconnect_client(&self.client).await {
+                    if let Err(reconnect_err) =
+                        Self::reconnect_client(&self.client, &self.bot_token, &self.session_file)
+                            .await
+                    {
                         log::error!("Reconnection failed: {:?}", reconnect_err);
                         if attempt == max_retries - 1 {
                             return Err(e);
