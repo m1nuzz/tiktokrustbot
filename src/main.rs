@@ -146,9 +146,28 @@ async fn main() -> Result<(), Error> {
     let upload_semaphore = Arc::new(tokio::sync::Semaphore::new(2));
 
     // --- Web Server Configuration ---
+    // Single-bot map for now: Phase 2б fans this out to one entry per token.
+    // The id is the numeric Telegram bot id (token prefix): stable, and it
+    // needs no API call. Falls back to PRIMARY_BOT_ID for malformed tokens.
+    let bot_id = raw_token
+        .split(':')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(tiktokdownloader::database::PRIMARY_BOT_ID)
+        .to_string();
+    let bot_username = env::var("BOT_USERNAME").unwrap_or_default();
+    let mut bots = std::collections::HashMap::new();
+    bots.insert(
+        bot_id.clone(),
+        tiktokdownloader::web_server::BotInfo {
+            id: std::sync::Arc::new(bot_id),
+            username: std::sync::Arc::new(bot_username),
+            bot: bot.clone(),
+        },
+    );
     let web_server_state = tiktokdownloader::web_server::AppState {
         db: db_pool.clone(),
-        bot: bot.clone(),
+        bots,
         fetcher: fetcher.clone(),
         mtproto_uploader: mtproto_uploader.clone(),
         task_manager: task_manager.clone(),

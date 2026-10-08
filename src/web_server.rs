@@ -7,8 +7,9 @@ use axum::{
 use axum::http::{header, HeaderMap, HeaderValue};
 use tower_http::cors::CorsLayer;
 use std::sync::Arc;
+use std::collections::HashMap;
 use std::time::Duration;
-use crate::database::{ClaimVia, DatabasePool, SessionYmid};
+use crate::database::{ClaimVia, DatabasePool, PRIMARY_BOT_ID, SessionYmid};
 use crate::yt_dlp_interface::YoutubeFetcher;
 use crate::mtproto_uploader::MTProtoUploader;
 use crate::utils::task_manager::TaskManager;
@@ -19,14 +20,40 @@ use teloxide::prelude::*;
 /// Mini-app HTML embedded at compile time — no need to deploy the folder separately
 const MINI_APP_HTML: &str = include_str!("../mini-app/index.html");
 
+/// One bot behind the shared web server: stable numeric id (token prefix),
+/// username for deep links and injection, and its own API handle.
+#[derive(Clone, Debug)]
+pub struct BotInfo {
+    pub id: Arc<String>,
+    pub username: Arc<String>,
+    pub bot: Bot,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<DatabasePool>,
-    pub bot: Bot,
+    pub bots: HashMap<String, BotInfo>,
     pub fetcher: Arc<YoutubeFetcher>,
     pub mtproto_uploader: Arc<MTProtoUploader>,
     pub task_manager: Arc<tokio::sync::Mutex<TaskManager>>,
     pub upload_semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+impl AppState {
+    /// Bot handle for a row, falling back to the single configured bot.
+    /// Keeps single-bot behavior identical while per-ymid routing lands.
+    pub fn bot_for(&self, bot_id: &str) -> Bot {
+        self.bots
+            .get(bot_id)
+            .map(|info| info.bot.clone())
+            .unwrap_or_else(|| {
+                self.bots
+                    .values()
+                    .next()
+                    .map(|info| info.bot.clone())
+                    .expect("AppState built with no bots")
+            })
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -417,8 +444,13 @@ async fn get_ads_status(
         match state.db.get_user_id_by_ymid(ymid).await {
             Ok(user_id) => {
                 let is_user_admin = crate::handlers::admin::is_admin_id(user_id);
-                let enabled =
-                    crate::handlers::link::ads_enabled_for(&state.db, crate::database::PRIMARY_BOT_ID, user_id, is_user_admin).await;
+                let enabled = crate::handlers::link::ads_enabled_for(
+                    &state.db,
+                    crate::database::PRIMARY_BOT_ID,
+                    user_id,
+                    is_user_admin,
+                )
+                .await;
                 return Json(json!({ "enabled": enabled }));
             }
             Err(e) => {
@@ -474,7 +506,7 @@ async fn spawn_download_job(
     let lang = state.db.get_effective_lang(user_id, None).await;
     tokio::spawn(async move {
         if let Err(e) = crate::handlers::link::process_video_request(
-            state.bot,
+            state.bot_for(PRIMARY_BOT_ID),
             user_id,
             url,
             state.fetcher,
