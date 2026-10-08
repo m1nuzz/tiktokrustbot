@@ -241,7 +241,7 @@ pub async fn link_handler(
 
     // Mini App Ad invitation logic (single source of truth, shared with /api/ads-status)
     let is_user_admin = is_admin(&msg).await;
-    let ads_enabled = ads_enabled_for(&db_pool, user_id as i64, is_user_admin).await;
+    let ads_enabled = ads_enabled_for(&db_pool, crate::database::PRIMARY_BOT_ID, user_id as i64, is_user_admin).await;
 
     if ads_enabled {
         let webapp_url = std::env::var("WEBAPP_URL").unwrap_or_default();
