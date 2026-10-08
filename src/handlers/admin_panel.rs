@@ -8,6 +8,7 @@ use crate::handlers::ui::{
 };
 use crate::database::DatabasePool;
 use crate::handlers::broadcast::BroadcastState;
+use crate::BotCtx;
 use std::sync::Arc;
 
 pub const BTN_BROADCAST: &str = "📢 Broadcast";
@@ -62,6 +63,7 @@ pub async fn add_premium_user_handler(
     bot: Bot,
     dialogue: MyDialogue,
     msg: Message,
+    ctx: BotCtx,
     db_pool: Arc<DatabasePool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
@@ -79,7 +81,7 @@ pub async fn add_premium_user_handler(
 
         match text.parse::<i64>() {
             Ok(user_id) => {
-                match db_pool.set_user_premium(crate::database::PRIMARY_BOT_ID, user_id, 30).await {
+                match db_pool.set_user_premium(ctx.bot_id.as_str(), user_id, 30).await {
                     Ok(_) => {
                         bot.send_message(msg.chat.id, format!("✅ User {} granted 30 days of Premium!", user_id))
                             .reply_markup(crate::handlers::command::get_main_reply_keyboard())
@@ -388,6 +390,7 @@ pub async fn admin_ads_text_handler(
 pub async fn premium_users_text_handler(
     bot: Bot,
     msg: Message,
+    ctx: BotCtx,
     db_pool: Arc<DatabasePool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
@@ -396,8 +399,7 @@ pub async fn premium_users_text_handler(
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         return Ok(());
     }
-
-    let result = db_pool.get_premium_users().await;
+    let result = db_pool.get_premium_users(ctx.bot_id.as_str()).await;
 
     match result {
         Ok(users) => {

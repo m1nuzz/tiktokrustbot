@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::database::DatabasePool;
 use crate::handlers::admin::is_admin;
 use crate::handlers::subscription::check_subscription;
+use crate::BotCtx;
 use crate::handlers::ui::is_menu_button;
 use crate::i18n::{self, MsgKey};
 use crate::mtproto_uploader::MTProtoUploader;
@@ -188,6 +189,7 @@ pub async fn ads_enabled_for(db_pool: &DatabasePool, bot_id: &str, user_id: i64,
 pub async fn link_handler(
     bot: Bot,
     msg: Message,
+    ctx: BotCtx,
     fetcher: Arc<YoutubeFetcher>,
     mtproto_uploader: Arc<MTProtoUploader>,
     db_pool: Arc<DatabasePool>,
@@ -195,11 +197,13 @@ pub async fn link_handler(
     upload_semaphore: Arc<tokio::sync::Semaphore>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let user_id = msg.chat.id.0;
+    let bot_id = ctx.bot_id.as_str();
 
-    // Update user activity
+    // Update user activity (per-bot row: identity is (bot_id, telegram_id)).
+    let bot_id_owned = ctx.bot_id.clone();
     let _ = db_pool.execute_with_timeout(move |conn| {
-        conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?1)", [user_id])?;
-        conn.execute("UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE telegram_id = ?1", [user_id])?;
+        conn.execute("INSERT OR IGNORE INTO users (bot_id, telegram_id) VALUES (?1, ?2)", rusqlite::params![bot_id_owned, user_id])?;
+        conn.execute("UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE bot_id = ?1 AND telegram_id = ?2", rusqlite::params![bot_id_owned, user_id])?;
         Ok(())
     }).await;
 
@@ -215,16 +219,16 @@ pub async fn link_handler(
     // Effective locale: manual /language override wins, else Telegram tag.
     // Computed before URL parsing: the guide reply below needs it too.
     let tg_lang = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
-    let lang = db_pool.get_effective_lang(user_id as i64, tg_lang).await;
+    let lang = db_pool.get_effective_lang(bot_id, user_id as i64, tg_lang).await;
 
     let url = match extract_url_from_text(text) {
         Some(url) => {
-            db_pool.log_funnel_event(user_id as i64, "link_received").await;
+            db_pool.log_funnel_event(bot_id, user_id as i64, "link_received").await;
             url
         }
         None => {
             // Not a link: guide the user instead of staying silent.
-            db_pool.log_funnel_event(user_id as i64, "text_no_link").await;
+            db_pool.log_funnel_event(bot_id, user_id as i64, "text_no_link").await;
             bot.send_message(msg.chat.id, i18n::t(MsgKey::SendLinkGuide, Some(lang.as_str()))).await?;
             return Ok(());
         }
@@ -241,13 +245,13 @@ pub async fn link_handler(
 
     // Mini App Ad invitation logic (single source of truth, shared with /api/ads-status)
     let is_user_admin = is_admin(&msg).await;
-    let ads_enabled = ads_enabled_for(&db_pool, crate::database::PRIMARY_BOT_ID, user_id as i64, is_user_admin).await;
+    let ads_enabled = ads_enabled_for(&db_pool, bot_id, user_id as i64, is_user_admin).await;
 
     if ads_enabled {
         let webapp_url = std::env::var("WEBAPP_URL").unwrap_or_default();
         if !webapp_url.is_empty() {
             if let Ok(url_obj) = webapp_url.parse::<reqwest::Url>() {
-                let ymid = match db_pool.create_pending_download(user_id as i64, &url).await {
+                let ymid = match db_pool.create_pending_download(bot_id, user_id as i64, &url).await {
                     Ok(id) => id,
                     Err(e) => {
                         log::error!("Failed to create pending download: {}", e);
@@ -284,6 +288,7 @@ pub async fn link_handler(
     // Proceed to download
     process_video_request(
         bot,
+        bot_id,
         user_id as i64,
         url,
         fetcher,
@@ -300,6 +305,7 @@ pub async fn link_handler(
 
 pub async fn process_video_request(
     bot: Bot,
+    bot_id: &str,
     user_id: i64,
     url: String,
     fetcher: Arc<YoutubeFetcher>,
@@ -313,7 +319,7 @@ pub async fn process_video_request(
     ymid: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Get user quality preference
-    let quality_preference = db_pool.get_user_quality(user_id).await.unwrap_or_else(|_| "best".to_string());
+    let quality_preference = db_pool.get_user_quality(bot_id, user_id).await.unwrap_or_else(|_| "best".to_string());
     let fingerprint = crate::handlers::fingerprint::get_current_fingerprint(db_pool.clone()).await;
     let is_audio = quality_preference == "audio";
 
@@ -449,9 +455,10 @@ pub async fn process_video_request(
         Ok(Ok(())) => {
             // Final logging (success only: failed uploads no longer count).
             let video_url = url.clone();
+            let bot_id_owned = bot_id.to_string();
             let _ = db_pool.execute_with_timeout(move |conn| {
-                conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?1)", [user_id])?;
-                conn.execute("INSERT INTO downloads (user_telegram_id, video_url) VALUES (?1, ?2)", (user_id, video_url))?;
+                conn.execute("INSERT OR IGNORE INTO users (bot_id, telegram_id) VALUES (?1, ?2)", rusqlite::params![bot_id_owned, user_id])?;
+                conn.execute("INSERT INTO downloads (bot_id, user_telegram_id, video_url) VALUES (?1, ?2, ?3)", rusqlite::params![bot_id_owned, user_id, video_url])?;
                 Ok(())
             }).await;
 
@@ -565,7 +572,7 @@ mod tests {
 
         // ymid resolves to the requesting user (what /api/ads-status uses).
         let ymid = pool
-            .create_pending_download(111, "https://vt.tiktok.com/x")
+            .create_pending_download(crate::database::PRIMARY_BOT_ID, 111, "https://vt.tiktok.com/x")
             .await
             .unwrap();
         assert_eq!(pool.get_user_id_by_ymid(&ymid).await.unwrap(), 111);

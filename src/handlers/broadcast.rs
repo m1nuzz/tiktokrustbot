@@ -96,6 +96,7 @@ pub async fn handle_broadcast_confirmation(
     bot: Bot,
     dialogue: MyDialogue,
     q: CallbackQuery,
+    ctx: crate::BotCtx,
     db_pool: Arc<DatabasePool>,
     message: String,
 ) -> HandlerResult {
@@ -128,10 +129,12 @@ pub async fn handle_broadcast_confirmation(
                     .await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-                // Get users
-                let users = db_pool.execute_with_timeout(|conn| {
-                    let mut stmt = conn.prepare("SELECT telegram_id FROM users")?;
-                    let users_iter = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+                // Get users of THIS bot only: a broadcast from one bot must
+                // never reach another bot's audience.
+                let bot_owned = ctx.bot_id.clone();
+                let users = db_pool.execute_with_timeout(move |conn| {
+                    let mut stmt = conn.prepare("SELECT telegram_id FROM users WHERE bot_id = ?1")?;
+                    let users_iter = stmt.query_map(rusqlite::params![bot_owned], |row| row.get::<_, i64>(0))?;
                     let mut users = Vec::new();
                     for user_result in users_iter {
                         users.push(user_result?);

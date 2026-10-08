@@ -8,8 +8,10 @@ use std::num::NonZeroUsize;
 pub struct DatabasePool {
     db_path: String,
     connection_semaphore: Arc<Semaphore>,
-    // LRU cache with limit of 1000 users
-    user_cache: Arc<Mutex<LruCache<i64, UserInfo>>>,
+    // LRU cache with limit of 1000 users, keyed by (bot_id, telegram_id):
+    // quality is per-bot, so a bare telegram_id key would leak one bot's
+    // preference into another bot's downloads.
+    user_cache: Arc<Mutex<LruCache<(String, i64), UserInfo>>>,
 }
 
 #[derive(Clone)]
@@ -182,11 +184,13 @@ impl DatabasePool {
     }
 
     /// Get user quality preference with caching
-    pub async fn get_user_quality(&self, user_id: i64) -> Result<String, anyhow::Error> {
+     pub async fn get_user_quality(&self, bot_id: &str, user_id: i64) -> Result<String, anyhow::Error> {
+        let bot_owned = bot_id.to_string();
+        let cache_key = (bot_owned.clone(), user_id);
         // Check LRU cache
         {
             let mut cache = self.user_cache.lock().await;
-            if let Some(user_info) = cache.get(&user_id) {
+            if let Some(user_info) = cache.get(&cache_key) {
                 // Cache is valid for 5 minutes
                 if user_info.last_updated.elapsed() < Duration::from_secs(300) {
                     log::info!("Using cached quality preference for user {}: {}", user_id, user_info.quality_preference);
@@ -195,15 +199,15 @@ impl DatabasePool {
                 log::info!("Cache expired for user {}, removing from cache", user_id);
                 // LRU automatically moves the element to the front when accessed with get,
                 // so we need to remove and re-add if it's expired
-                cache.pop(&user_id);
+                cache.pop(&cache_key);
             }
         }
 
         // Load from DB
         let quality = self.execute_with_timeout(move |conn| {
             match conn.query_row(
-                "SELECT quality_preference FROM users WHERE telegram_id = ?1",
-                params![user_id],
+                "SELECT quality_preference FROM users WHERE bot_id = ?1 AND telegram_id = ?2",
+                params![bot_owned, user_id],
                 |row| Ok(row.get::<_, String>(0)?)
             ) {
                 Ok(quality) => {
@@ -226,7 +230,7 @@ impl DatabasePool {
             let mut cache = self.user_cache.lock().await;
             log::info!("Caching quality preference for user {}: {}", user_id, quality);
             cache.put(
-                user_id,
+                (bot_id.to_string(), user_id),
                 UserInfo {
                     quality_preference: quality.clone(),
                     last_updated: tokio::time::Instant::now(),
@@ -238,21 +242,22 @@ impl DatabasePool {
     }
 
     /// Invalidate user quality cache
-    pub async fn invalidate_user_quality_cache(&self, user_id: i64) {
+    pub async fn invalidate_user_quality_cache(&self, bot_id: &str, user_id: i64) {
         let mut cache = self.user_cache.lock().await;
-        cache.pop(&user_id);
+        cache.pop(&(bot_id.to_string(), user_id));
         log::info!("Invalidated cached quality preference for user {}", user_id);
     }
 
     /// Manual /language override for a user, if set.
-    pub async fn get_user_lang(&self, user_id: i64) -> Result<Option<String>, anyhow::Error> {
+    pub async fn get_user_lang(&self, bot_id: &str, user_id: i64) -> Result<Option<String>, anyhow::Error> {
+        let bot_owned = bot_id.to_string();
         self.execute_with_timeout(move |conn| {
             // Double Option: missing row -> None via `.optional()`, NULL cell
             // (a cleared override) -> None via `FromSql for Option`. Both mean
             // "no manual override", so flatten to one.
             let lang: Option<Option<String>> = conn.query_row(
-                "SELECT lang FROM users WHERE telegram_id = ?1",
-                params![user_id],
+                "SELECT lang FROM users WHERE bot_id = ?1 AND telegram_id = ?2",
+                params![bot_owned, user_id],
                 |row| row.get(0)
             ).optional()?;
             Ok(lang.flatten())
@@ -260,28 +265,30 @@ impl DatabasePool {
     }
 
     /// Persist the manual /language override for a user.
-    pub async fn set_user_lang(&self, user_id: i64, lang: &str) -> Result<(), anyhow::Error> {
+    pub async fn set_user_lang(&self, bot_id: &str, user_id: i64, lang: &str) -> Result<(), anyhow::Error> {
+        let bot_owned = bot_id.to_string();
         let lang_owned = lang.to_string();
         self.execute_with_timeout(move |conn| {
-            conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?1)", params![user_id])?;
-            conn.execute("UPDATE users SET lang = ?1 WHERE telegram_id = ?2", params![lang_owned, user_id])?;
+            conn.execute("INSERT OR IGNORE INTO users (bot_id, telegram_id) VALUES (?1, ?2)", params![bot_owned, user_id])?;
+            conn.execute("UPDATE users SET lang = ?1 WHERE bot_id = ?2 AND telegram_id = ?3", params![lang_owned, bot_owned, user_id])?;
             Ok(())
         }).await.map_err(|e| anyhow::anyhow!("Failed to set language for user {}: {}", user_id, e))
     }
     /// Drop the manual override so the device tag wins again (auto-detect).
     /// Missing rows are fine: clearing what was never set changes nothing.
-    pub async fn clear_user_lang(&self, user_id: i64) -> Result<(), anyhow::Error> {
+    pub async fn clear_user_lang(&self, bot_id: &str, user_id: i64) -> Result<(), anyhow::Error> {
+        let bot_owned = bot_id.to_string();
         self.execute_with_timeout(move |conn| {
-            conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?1)", params![user_id])?;
-            conn.execute("UPDATE users SET lang = NULL WHERE telegram_id = ?1", params![user_id])?;
+            conn.execute("INSERT OR IGNORE INTO users (bot_id, telegram_id) VALUES (?1, ?2)", params![bot_owned, user_id])?;
+            conn.execute("UPDATE users SET lang = NULL WHERE bot_id = ?1 AND telegram_id = ?2", params![bot_owned, user_id])?;
             Ok(())
         }).await.map_err(|e| anyhow::anyhow!("Failed to clear language for user {}: {}", user_id, e))
     }
 
     /// Effective locale: the stored /language override wins, else the Telegram
     /// device tag, else English. Never fails.
-    pub async fn get_effective_lang(&self, user_id: i64, tg_lang: Option<&str>) -> String {
-        let stored = self.get_user_lang(user_id).await.ok().flatten();
+    pub async fn get_effective_lang(&self, bot_id: &str, user_id: i64, tg_lang: Option<&str>) -> String {
+        let stored = self.get_user_lang(bot_id, user_id).await.ok().flatten();
         crate::i18n::resolve_lang(stored.as_deref().or(tg_lang)).to_string()
     }
 
@@ -373,19 +380,20 @@ impl DatabasePool {
     /// Create a pending download record and return its unique ID (ymid).
     /// The row starts with a live lease so it is claimable from the first
     /// second, before the client sends its first heartbeat.
-    pub async fn create_pending_download(&self, user_id: i64, video_url: &str) -> Result<String, anyhow::Error> {
+     pub async fn create_pending_download(&self, bot_id: &str, user_id: i64, video_url: &str) -> Result<String, anyhow::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let id_owned = id.clone();
         let video_url_owned = video_url.to_string();
+        let bot_owned = bot_id.to_string();
         let lease_secs = SESSION_LEASE_SECS;
         
         self.execute_with_timeout(move |conn| {
             conn.execute(
                 &format!(
-                    "INSERT INTO pending_downloads (id, user_id, video_url, lease_expires_at) VALUES (?1, ?2, ?3, datetime('now', '+{} seconds'))",
+                    "INSERT INTO pending_downloads (id, bot_id, user_id, video_url, lease_expires_at) VALUES (?1, ?2, ?3, ?4, datetime('now', '+{} seconds'))",
                     lease_secs
                 ),
-                params![id_owned, user_id, video_url_owned],
+                params![id_owned, bot_owned, user_id, video_url_owned],
             )?;
             Ok(())
         }).await.map(|_| id).map_err(|e| anyhow::anyhow!("Failed to create pending download: {}", e))
@@ -842,11 +850,12 @@ impl DatabasePool {
     }
 
     /// Record that a user blocked the bot (MyChatMember -> Banned).
-    pub async fn record_block(&self, user_id: i64) -> Result<(), anyhow::Error> {
+     pub async fn record_block(&self, bot_id: &str, user_id: i64) -> Result<(), anyhow::Error> {
+        let bot_owned = bot_id.to_string();
         self.execute_with_timeout(move |conn| {
             conn.execute(
-                "INSERT INTO blocks (telegram_id) VALUES (?1)",
-                params![user_id],
+                "INSERT INTO blocks (bot_id, telegram_id) VALUES (?1, ?2)",
+                params![bot_owned, user_id],
             )?;
             Ok(())
         }).await.map_err(|e| anyhow::anyhow!("Failed to record block for user {}: {}", user_id, e))
@@ -941,12 +950,13 @@ impl DatabasePool {
 
     /// Fire-and-forget funnel event (button presses, non-link texts, ...).
     /// Never fails the caller: errors are logged and swallowed.
-    pub async fn log_funnel_event(&self, user_id: i64, event: &str) {
+     pub async fn log_funnel_event(&self, bot_id: &str, user_id: i64, event: &str) {
+        let bot_owned = bot_id.to_string();
         let event_owned = event.to_string();
         let result: Result<(), anyhow::Error> = self.execute_with_timeout(move |conn| {
             conn.execute(
-                "INSERT INTO funnel_events (user_telegram_id, event) VALUES (?1, ?2)",
-                params![user_id, event_owned],
+                "INSERT INTO funnel_events (bot_id, user_telegram_id, event) VALUES (?1, ?2, ?3)",
+                params![bot_owned, user_id, event_owned],
             )?;
             Ok(())
         }).await.map_err(|e| anyhow::anyhow!("Failed to log funnel event: {}", e));
@@ -1049,16 +1059,17 @@ impl DatabasePool {
         }).await.map_err(|e| anyhow::anyhow!("Failed to set premium for user {} on bot {}: {}", user_id, bot_id, e))
     }
 
-    /// Get list of users with active premium status
-    pub async fn get_premium_users(&self) -> Result<Vec<(i64, String, String)>, anyhow::Error> {
-        self.execute_with_timeout(|conn| {
+    /// Get list of users with active premium status **on one bot**.
+    pub async fn get_premium_users(&self, bot_id: &str) -> Result<Vec<(i64, String, String)>, anyhow::Error> {
+        let bot_owned = bot_id.to_string();
+        self.execute_with_timeout(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT telegram_id, premium_until, COALESCE(last_active, 'N/A')
                  FROM users 
-                 WHERE premium_until > datetime('now')
+                 WHERE bot_id = ?1 AND premium_until > datetime('now')
                  ORDER BY premium_until DESC"
             )?;
-            let users_iter = stmt.query_map([], |row| {
+            let users_iter = stmt.query_map(params![bot_owned], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -1074,24 +1085,26 @@ impl DatabasePool {
     }
 
     /// Log a successful payment
-    pub async fn log_payment(&self, user_id: i64, amount: i64, payload: &str) -> Result<(), anyhow::Error> {
+    pub async fn log_payment(&self, bot_id: &str, user_id: i64, amount: i64, payload: &str) -> Result<(), anyhow::Error> {
+        let bot_owned = bot_id.to_string();
         let payload = payload.to_string();
         self.execute_with_timeout(move |conn| {
             conn.execute(
-                "INSERT INTO payments (user_id, amount, payload) VALUES (?1, ?2, ?3)",
-                params![user_id, amount, payload],
+                "INSERT INTO payments (bot_id, user_id, amount, payload) VALUES (?1, ?2, ?3, ?4)",
+                params![bot_owned, user_id, amount, payload],
             )?;
             Ok(())
         }).await.map_err(|e| anyhow::anyhow!("Failed to log payment: {}", e))
     }
 
     /// Log an invoice sent
-    pub async fn log_invoice(&self, user_id: i64, amount: i64, payload: &str) -> Result<(), anyhow::Error> {
+    pub async fn log_invoice(&self, bot_id: &str, user_id: i64, amount: i64, payload: &str) -> Result<(), anyhow::Error> {
+        let bot_owned = bot_id.to_string();
         let payload = payload.to_string();
         self.execute_with_timeout(move |conn| {
             conn.execute(
-                "INSERT INTO invoices (user_id, amount, payload) VALUES (?1, ?2, ?3)",
-                params![user_id, amount, payload],
+                "INSERT INTO invoices (bot_id, user_id, amount, payload) VALUES (?1, ?2, ?3, ?4)",
+                params![bot_owned, user_id, amount, payload],
             )?;
             Ok(())
         }).await.map_err(|e| anyhow::anyhow!("Failed to log invoice: {}", e))
@@ -1338,19 +1351,42 @@ mod tests {
         let user_id = 555123456i64;
 
         // No override yet: device tag wins, missing tag means English.
-        assert_eq!(pool.get_effective_lang(user_id, Some("ru")).await, "ru");
-        assert_eq!(pool.get_effective_lang(user_id, None).await, "en");
+        assert_eq!(pool.get_effective_lang("primary", user_id, Some("ru")).await, "ru");
+        assert_eq!(pool.get_effective_lang("primary", user_id, None).await, "en");
 
         // Persist override: it wins over the device tag.
-        pool.set_user_lang(user_id, "uk").await.unwrap();
-        assert_eq!(pool.get_user_lang(user_id).await.unwrap(), Some("uk".to_string()));
-        assert_eq!(pool.get_effective_lang(user_id, Some("ru")).await, "uk");
+        pool.set_user_lang("primary", user_id, "uk").await.unwrap();
+        assert_eq!(pool.get_user_lang("primary", user_id).await.unwrap(), Some("uk".to_string()));
+        assert_eq!(pool.get_effective_lang("primary", user_id, Some("ru")).await, "uk");
 
         // Clearing restores device detection, even for a user that never set one.
-        pool.clear_user_lang(user_id).await.unwrap();
-        assert_eq!(pool.get_user_lang(user_id).await.unwrap(), None);
-        assert_eq!(pool.get_effective_lang(user_id, Some("ru")).await, "ru");
-        pool.clear_user_lang(999888777).await.unwrap();
+        pool.clear_user_lang("primary", user_id).await.unwrap();
+        assert_eq!(pool.get_user_lang("primary", user_id).await.unwrap(), None);
+        assert_eq!(pool.get_effective_lang("primary", user_id, Some("ru")).await, "ru");
+        pool.clear_user_lang("primary", 999888777).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_lang_and_quality_are_per_bot() {
+        let (pool, _file) = setup_test_db().await;
+        let user_id = 777888999i64;
+
+        // Same human, two bots: overrides and quality never cross.
+        pool.set_user_lang("aaa", user_id, "uk").await.unwrap();
+        assert_eq!(pool.get_user_lang("aaa", user_id).await.unwrap(), Some("uk".to_string()));
+        assert_eq!(pool.get_user_lang("bbb", user_id).await.unwrap(), None);
+        assert_eq!(pool.get_effective_lang("bbb", user_id, Some("ru")).await, "ru");
+        assert_eq!(pool.get_effective_lang("aaa", user_id, Some("ru")).await, "uk");
+
+        // Clearing on one bot leaves the other bot's override alone.
+        pool.clear_user_lang("bbb", user_id).await.unwrap();
+        assert_eq!(pool.get_user_lang("aaa", user_id).await.unwrap(), Some("uk".to_string()));
+
+        // Quality reads are per-bot too (cache key includes the bot).
+        assert_eq!(pool.get_user_quality("aaa", user_id).await.unwrap(), "best");
+        assert_eq!(pool.get_user_quality("bbb", user_id).await.unwrap(), "best");
+        pool.invalidate_user_quality_cache("aaa", user_id).await;
+        assert_eq!(pool.get_user_quality("bbb", user_id).await.unwrap(), "best");
     }
 
     #[tokio::test]
@@ -1426,8 +1462,8 @@ mod tests {
     #[tokio::test]
     async fn test_record_block_and_weekly_stats() {
         let (pool, _file) = setup_test_db().await;
-        pool.record_block(111).await.unwrap();
-        pool.record_block(222).await.unwrap();
+        pool.record_block("primary", 111).await.unwrap();
+        pool.record_block("primary", 222).await.unwrap();
 
         let week = pool.get_weekly_stats(7, &[]).await.unwrap();
         assert_eq!(week.len(), 7);
@@ -1474,7 +1510,7 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_extends_the_lease_and_the_sweeper_leaves_the_row_alone() {
         let (pool, _file) = setup_test_db().await;
-        let ymid = pool.create_pending_download(42, "http://v").await.unwrap();
+        let ymid = pool.create_pending_download("primary", 42, "http://v").await.unwrap();
         assert_eq!(lease_span_secs(&pool, &ymid).await, SESSION_LEASE_SECS);
 
         // Pretend the last heartbeat was a while ago, so the deadline is close.
@@ -1749,8 +1785,8 @@ mod tests {
             .await
             .unwrap();
         }
-        pool.log_funnel_event(1, "start").await;
-        pool.log_funnel_event(2, "text_no_link").await;
+        pool.log_funnel_event("primary", 1, "start").await;
+        pool.log_funnel_event("primary", 2, "text_no_link").await;
         pool.execute_with_timeout(|conn| {
             conn.execute(
                 "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('a', 1, 'http://x', 'completed')",
@@ -1809,8 +1845,8 @@ mod tests {
         assert_eq!(clean.delivered_free, 0);
 
         // Delivery reasons split paid vs free giveaways.
-        pool.log_funnel_event(1, "delivered_valued").await;
-        pool.log_funnel_event(2, "delivered_timer").await;
+        pool.log_funnel_event("primary", 1, "delivered_valued").await;
+        pool.log_funnel_event("primary", 2, "delivered_timer").await;
         let split = &pool.get_funnel_stats(7, &[999]).await.unwrap()[6];
         assert_eq!(split.delivered_paid, 1);
         assert_eq!(split.delivered_free, 1);
@@ -1838,7 +1874,7 @@ mod tests {
         assert!(pool.is_user_premium("aaa", user_id).await);
 
         // Check premium users list
-        let premium_users = pool.get_premium_users().await.unwrap();
+        let premium_users = pool.get_premium_users("primary").await.unwrap();
         assert_eq!(premium_users.len(), 1);
         assert_eq!(premium_users[0].0, user_id);
     }
@@ -1859,11 +1895,11 @@ mod tests {
 
         // Set initial premium
         pool.set_user_premium("aaa", user_id, 30).await.unwrap();
-        let first_expiry = pool.get_premium_users().await.unwrap()[0].1.clone();
+        let first_expiry = pool.get_premium_users("primary").await.unwrap()[0].1.clone();
 
         // Extend premium
         pool.set_user_premium("aaa", user_id, 30).await.unwrap();
-        let second_expiry = pool.get_premium_users().await.unwrap()[0].1.clone();
+        let second_expiry = pool.get_premium_users("primary").await.unwrap()[0].1.clone();
 
         // Second expiry should be later than first
         assert!(second_expiry > first_expiry);
@@ -1885,7 +1921,7 @@ mod tests {
             Ok(())
         }).await.unwrap();
 
-        let premium_users = pool.get_premium_users().await.unwrap();
+        let premium_users = pool.get_premium_users("primary").await.unwrap();
         assert_eq!(premium_users.len(), 1);
         assert_eq!(premium_users[0].0, 1);
     }
@@ -2156,7 +2192,7 @@ mod tests {
     #[tokio::test]
     async fn session_state_reports_status_and_deadline_in_one_read() {
         let (pool, _file) = setup_test_db().await;
-        let live = pool.create_pending_download(11, "http://v").await.unwrap();
+        let live = pool.create_pending_download("primary", 11, "http://v").await.unwrap();
         pool.execute_with_timeout(|conn| {
             // A row from before the lease column existed: the status is real,
             // the deadline simply does not exist yet.
@@ -2215,7 +2251,7 @@ mod tests {
     #[tokio::test]
     async fn job_start_marker_is_written_once_and_is_row_scoped() {
         let (pool, _file) = setup_test_db().await;
-        let ymid = pool.create_pending_download(21, "http://v").await.unwrap();
+        let ymid = pool.create_pending_download("primary", 21, "http://v").await.unwrap();
 
         assert_eq!(pool.mark_job_started("no-such-ymid").await.unwrap(), 0);
         assert_eq!(
@@ -2296,7 +2332,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_press_inside_the_postback_lag_window_mints_a_new_ymid() {
         let (pool, _file) = setup_test_db().await;
-        let entry = pool.create_pending_download(31, "http://v").await.unwrap();
+        let entry = pool.create_pending_download("primary", 31, "http://v").await.unwrap();
 
         // The ad was requested, but no impression postback has landed yet - the
         // exact window in which an impression-based check would wrongly reuse.
@@ -2327,7 +2363,7 @@ mod tests {
     #[tokio::test]
     async fn rotating_a_live_unused_session_is_a_no_op() {
         let (pool, _file) = setup_test_db().await;
-        let entry = pool.create_pending_download(32, "http://v").await.unwrap();
+        let entry = pool.create_pending_download("primary", 32, "http://v").await.unwrap();
         let before = user_rows(&pool, 32).await;
 
         let resolved = pool.resolve_session_ymid(&entry).await.unwrap().unwrap();
@@ -2344,8 +2380,8 @@ mod tests {
     #[tokio::test]
     async fn a_spent_entry_ymid_mints_a_row_for_the_same_user_and_video() {
         let (pool, _file) = setup_test_db().await;
-        pool.set_user_lang(33, "uk").await.unwrap();
-        let entry = pool.create_pending_download(33, "http://the-video").await.unwrap();
+        pool.set_user_lang("primary", 33, "uk").await.unwrap();
+        let entry = pool.create_pending_download("primary", 33, "http://the-video").await.unwrap();
         pool.mark_ad_requested(&entry).await.unwrap();
 
         let rotated = pool.resolve_session_ymid(&entry).await.unwrap().unwrap();
@@ -2369,7 +2405,7 @@ mod tests {
         assert_eq!(minted_user, 33);
         assert_eq!(minted_url, "http://the-video");
         assert_eq!(
-            pool.get_effective_lang(minted_user, None).await,
+            pool.get_effective_lang("primary", minted_user, None).await,
             "uk",
             "the copied user carries the language"
         );
@@ -2447,7 +2483,7 @@ mod tests {
     #[tokio::test]
     async fn the_ad_requested_beacon_stamps_the_marker_once() {
         let (pool, _file) = setup_test_db().await;
-        let ymid = pool.create_pending_download(35, "http://v").await.unwrap();
+        let ymid = pool.create_pending_download("primary", 35, "http://v").await.unwrap();
 
         // Nothing is stamped before the client asks for an ad.
         assert!(ad_requested_at(&pool, &ymid).await.is_none());

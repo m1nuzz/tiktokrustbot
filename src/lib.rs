@@ -43,6 +43,15 @@ pub type MyDialogue = dialogue::Dialogue<
     dialogue::InMemStorage<BroadcastState>,
 >;
 
+/// Identity of the bot whose dispatcher owns this update. One value per
+/// dispatcher is injected into `dptree::deps`, so every handler that touches
+/// per-bot rows (users, premium, lang, funnel, payments) reads `ctx.bot_id`
+/// instead of assuming the single primary bot.
+#[derive(Debug, Clone)]
+pub struct BotCtx {
+    pub bot_id: String,
+}
+
 /// Which `/start` branch owns a message. Exhaustive on purpose: a deep link the
 /// bot issues itself must be routed to its own handler, and every other payload
 /// must keep reaching referral attribution.
@@ -79,28 +88,31 @@ const PREMIUM_START_PAYLOAD: &str = "premium";
 async fn premium_start_handler(
     bot: Bot,
     msg: Message,
+    ctx: BotCtx,
     db_pool: Arc<DatabasePool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let user_id = msg.chat.id.0;
+    let bot_id = ctx.bot_id.as_str();
     // Register and touch last_active, but deliberately NOT ref_code: this token
     // is ours, not a campaign's.
     if let Err(e) =
-        handlers::command::record_start_attribution(&db_pool, user_id, None).await
+        handlers::command::record_start_attribution(&db_pool, bot_id, user_id, None).await
     {
         log::error!("Failed to update user activity: {}", e);
     }
-    db_pool.log_funnel_event(user_id, "premium_deep_link").await;
+    db_pool.log_funnel_event(bot_id, user_id, "premium_deep_link").await;
     log::info!("User {} opened the premium deep link", user_id);
 
     handlers::payments::send_premium_invoice(
         bot.clone(),
         msg.chat.id.into(),
+        bot_id,
         db_pool.clone(),
         None,
     )
     .await?;
 
-    let lang = db_pool.get_effective_lang(user_id, None).await;
+    let lang = db_pool.get_effective_lang(bot_id, user_id, None).await;
     bot.send_message(msg.chat.id, i18n::t(i18n::MsgKey::Welcome, Some(lang.as_str())))
         .reply_markup(handlers::command::get_main_reply_keyboard())
         .await
@@ -119,12 +131,12 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
         // Payment handlers must be outside dialogue::enter because PreCheckoutQuery has no ChatId
         .branch(Update::filter_pre_checkout_query().endpoint(handlers::payments::handle_pre_checkout))
         .branch(Update::filter_message().filter(|msg: Message| msg.successful_payment().is_some()).endpoint(handlers::payments::handle_successful_payment))
-        .branch(Update::filter_my_chat_member().endpoint(|_bot: Bot, upd: ChatMemberUpdated, db_pool: Arc<DatabasePool>| async move {
+        .branch(Update::filter_my_chat_member().endpoint(|_bot: Bot, upd: ChatMemberUpdated, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
             // A user blocked the bot (private chat member -> Banned).
             if matches!(upd.new_chat_member.kind, ChatMemberKind::Banned(_)) {
                 let user_id = upd.from.id.0 as i64;
                 log::warn!("User {} blocked the bot", user_id);
-                if let Err(e) = db_pool.record_block(user_id).await {
+                if let Err(e) = db_pool.record_block(ctx.bot_id.as_str(), user_id).await {
                     log::error!("Failed to record block: {}", e);
                 }
             }
@@ -150,9 +162,9 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                 .branch(
                     Update::filter_callback_query()
                         .filter(|q: CallbackQuery| q.data.as_ref().map_or(false, |data| data == "broadcast_confirm" || data == "broadcast_cancel"))
-                        .endpoint(|bot: Bot, dialogue: MyDialogue, q: CallbackQuery, db_pool: Arc<DatabasePool>| async move {
+                        .endpoint(|bot: Bot, dialogue: MyDialogue, q: CallbackQuery, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                             if let Ok(Some(BroadcastState::WaitingForConfirmation { message })) = dialogue.get().await {
-                                handle_broadcast_confirmation(bot, dialogue, q, db_pool, message).await
+                                handle_broadcast_confirmation(bot, dialogue, q, ctx, db_pool, message).await
                             } else {
                                 Ok(())
                             }
@@ -161,7 +173,7 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                 .branch(
                     Update::filter_message()
                         .filter_command::<AdminCommand>()
-                        .endpoint(|bot: Bot, msg: Message, cmd: AdminCommand, db_pool: Arc<DatabasePool>| async move {
+                        .endpoint(|bot: Bot, msg: Message, cmd: AdminCommand, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                             if !handlers::admin::is_admin(&msg).await {
                                 bot.send_message(msg.chat.id, "This command is for admins only.").await?;
                                 return Ok(());
@@ -215,15 +227,16 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                                 }
                                 AdminCommand::FakePayment => {
                                     if let Some(user) = msg.from {
-                                        let _ = db_pool.set_user_premium(crate::database::PRIMARY_BOT_ID, user.id.0 as i64, 30).await;
+                                        let _ = db_pool.set_user_premium(ctx.bot_id.as_str(), user.id.0 as i64, 30).await;
                                         bot.send_message(msg.chat.id, "✅ [TEST] Premium activated!").await?;
                                     }
                                 }
                                 AdminCommand::ResetPremium => {
                                     if let Some(user) = msg.from {
                                         let user_id = user.id.0 as i64;
+                                        let bot_id_owned = ctx.bot_id.clone();
                                         let _ = db_pool.execute_with_timeout(move |conn| {
-                                            conn.execute("UPDATE users SET premium_until = datetime('now', '-1 day') WHERE telegram_id = ?1", [user_id])
+                                            conn.execute("UPDATE users SET premium_until = datetime('now', '-1 day') WHERE bot_id = ?1 AND telegram_id = ?2", rusqlite::params![bot_id_owned, user_id])
                                         }).await;
                                         bot.send_message(msg.chat.id, "🔄 [TEST] Premium status has been reset (expired).").await?;
                                     }
@@ -238,11 +251,11 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                     let ytdlp = exe_dir.join("lib").join("yt-dlp").to_string_lossy().to_string();
                     handlers::fingerprint::set_fingerprint_handler(bot, msg, db_pool, fp, &ytdlp).await
                 }))
-                .branch(Update::filter_message().filter(|msg: Message| start_route(msg.text()) == Some(StartRoute::Premium)).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
-                    premium_start_handler(bot, msg, db_pool).await
+                .branch(Update::filter_message().filter(|msg: Message| start_route(msg.text()) == Some(StartRoute::Premium)).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
+                    premium_start_handler(bot, msg, ctx, db_pool).await
                 }))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| crate::handlers::command::parse_start_payload(t).is_some())).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
-                    start_with_payload_handler(bot, msg, db_pool).await
+                .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| crate::handlers::command::parse_start_payload(t).is_some())).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
+                    start_with_payload_handler(bot, msg, ctx, db_pool).await
                 }))
                 .branch(Update::filter_message().filter_command::<Command>().endpoint(command_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_SETTINGS)).endpoint(settings_text_handler))
@@ -250,10 +263,10 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_ADMIN_PANEL)).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
                     admin_panel_text_handler(bot, msg, db_pool).await
                 }))
-                .branch(Update::filter_callback_query().filter(|q: CallbackQuery| q.data == Some("buy_premium".to_string())).endpoint(|bot: Bot, q: CallbackQuery, db_pool: Arc<DatabasePool>| async move {
+                .branch(Update::filter_callback_query().filter(|q: CallbackQuery| q.data == Some("buy_premium".to_string())).endpoint(|bot: Bot, q: CallbackQuery, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                     let _ = bot.answer_callback_query(q.id).await;
-                    db_pool.log_funnel_event(q.from.id.0 as i64, "premium_click").await;
-                    handlers::payments::send_premium_invoice(bot, q.from.id.into(), db_pool, None).await
+                    db_pool.log_funnel_event(ctx.bot_id.as_str(), q.from.id.0 as i64, "premium_click").await;
+                    handlers::payments::send_premium_invoice(bot, q.from.id.into(), ctx.bot_id.as_str(), db_pool, None).await
                 }))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(handlers::ui::BTN_TOGGLE_ADS))).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
                     let curr = db_pool.get_setting("ads_enabled").await.map(|v| v == "true").unwrap_or(true);
@@ -277,45 +290,48 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("🔻 Funnel")).endpoint(funnel_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("🏆 Top 10")).endpoint(top10_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("👥 All users")).endpoint(all_users_text_handler))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("💎 Premium Users")).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
-                    premium_users_text_handler(bot, msg, db_pool).await
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("💎 Premium Users")).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
+                    premium_users_text_handler(bot, msg, ctx, db_pool).await
                 }))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_SUBSCRIPTION)).endpoint(subscription_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_BACK)).endpoint(back_text_handler))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_LANGUAGE)).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
-                    language_menu_handler(bot, msg, db_pool).await
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_LANGUAGE)).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
+                    language_menu_handler(bot, msg, ctx, db_pool).await
                 }))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("h265")).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("h265")).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                     let id = msg.chat.id.0;
-                    let _ = db_pool.execute_with_timeout(move |c| c.execute("UPDATE users SET quality_preference = 'h265' WHERE telegram_id = ?1", [&id])).await;
-                    db_pool.invalidate_user_quality_cache(id).await;
-                    db_pool.log_funnel_event(id, "quality_change").await;
+                    let bot_id_owned = ctx.bot_id.clone();
+                    let _ = db_pool.execute_with_timeout(move |c| c.execute("UPDATE users SET quality_preference = 'h265' WHERE bot_id = ?1 AND telegram_id = ?2", rusqlite::params![bot_id_owned, id])).await;
+                    db_pool.invalidate_user_quality_cache(ctx.bot_id.as_str(), id).await;
+                    db_pool.log_funnel_event(ctx.bot_id.as_str(), id, "quality_change").await;
                     bot.send_message(msg.chat.id, "Quality: h265").reply_markup(handlers::command::get_main_reply_keyboard()).await?;
                     Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
                 }))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("h264")).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("h264")).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                     let id = msg.chat.id.0;
-                    let _ = db_pool.execute_with_timeout(move |c| c.execute("UPDATE users SET quality_preference = 'h264' WHERE telegram_id = ?1", [&id])).await;
-                    db_pool.invalidate_user_quality_cache(id).await;
-                    db_pool.log_funnel_event(id, "quality_change").await;
+                    let bot_id_owned = ctx.bot_id.clone();
+                    let _ = db_pool.execute_with_timeout(move |c| c.execute("UPDATE users SET quality_preference = 'h264' WHERE bot_id = ?1 AND telegram_id = ?2", rusqlite::params![bot_id_owned, id])).await;
+                    db_pool.invalidate_user_quality_cache(ctx.bot_id.as_str(), id).await;
+                    db_pool.log_funnel_event(ctx.bot_id.as_str(), id, "quality_change").await;
                     bot.send_message(msg.chat.id, "Quality: h264").reply_markup(handlers::command::get_main_reply_keyboard()).await?;
                     Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
                 }))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("audio")).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("audio")).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                     let id = msg.chat.id.0;
-                    let _ = db_pool.execute_with_timeout(move |c| c.execute("UPDATE users SET quality_preference = 'audio' WHERE telegram_id = ?1", [&id])).await;
-                    db_pool.invalidate_user_quality_cache(id).await;
-                    db_pool.log_funnel_event(id, "quality_change").await;
+                    let bot_id_owned = ctx.bot_id.clone();
+                    let _ = db_pool.execute_with_timeout(move |c| c.execute("UPDATE users SET quality_preference = 'audio' WHERE bot_id = ?1 AND telegram_id = ?2", rusqlite::params![bot_id_owned, id])).await;
+                    db_pool.invalidate_user_quality_cache(ctx.bot_id.as_str(), id).await;
+                    db_pool.log_funnel_event(ctx.bot_id.as_str(), id, "quality_change").await;
                     bot.send_message(msg.chat.id, "Quality: audio").reply_markup(handlers::command::get_main_reply_keyboard()).await?;
                     Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
                 }))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_AUTO_DETECT)).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
-                    language_button_handler(bot, msg, db_pool).await
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_AUTO_DETECT)).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
+                    language_button_handler(bot, msg, ctx, db_pool).await
                 }))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text().map(|t| crate::i18n::is_language_button(t)).unwrap_or(false)).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
-                    language_button_handler(bot, msg, db_pool).await
+                .branch(Update::filter_message().filter(|msg: Message| msg.text().map(|t| crate::i18n::is_language_button(t)).unwrap_or(false)).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
+                    language_button_handler(bot, msg, ctx, db_pool).await
                 }))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text().map(|t| !handlers::ui::is_system_button(t)).unwrap_or(false)).endpoint(|bot: Bot, msg: Message, fetcher: Arc<YoutubeFetcher>, mtproto_uploader: Arc<MTProtoUploader>, db_pool: Arc<DatabasePool>, task_manager: Arc<tokio::sync::Mutex<TaskManager>>, upload_semaphore: Arc<tokio::sync::Semaphore>| async move {
+                .branch(Update::filter_message().filter(|msg: Message| msg.text().map(|t| !handlers::ui::is_system_button(t)).unwrap_or(false)).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, fetcher: Arc<YoutubeFetcher>, mtproto_uploader: Arc<MTProtoUploader>, db_pool: Arc<DatabasePool>, task_manager: Arc<tokio::sync::Mutex<TaskManager>>, upload_semaphore: Arc<tokio::sync::Semaphore>| async move {
                     let key = format!("{}:{}:{}", msg.chat.id.0, msg.id.0, msg.text().unwrap_or(""));
                     {
                         let mut p = PROCESSING.lock().await;
@@ -323,7 +339,7 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                         p.insert(key.clone());
                     }
                     tokio::spawn(async move {
-                        let _ = link_handler(bot.clone(), msg.clone(), fetcher, mtproto_uploader, db_pool, task_manager, upload_semaphore).await;
+                        let _ = link_handler(bot.clone(), msg.clone(), ctx, fetcher, mtproto_uploader, db_pool, task_manager, upload_semaphore).await;
                         PROCESSING.lock().await.remove(&key);
                     });
                     Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())

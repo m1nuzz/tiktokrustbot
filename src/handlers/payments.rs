@@ -26,6 +26,7 @@ pub fn is_xtr_currency(currency: &str) -> bool {
 pub async fn send_premium_invoice(
     bot: Bot, 
     chat_id: ChatId, 
+    bot_id: &str,
     db_pool: Arc<DatabasePool>,
     extra_button: Option<InlineKeyboardButton>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -37,11 +38,11 @@ pub async fn send_premium_invoice(
     log::info!("[PAYMENT_CHAIN] 1. Initiation: User={}, Amount={} Stars", chat_id, price_val);
 
     // Log the invoice being sent
-    let _ = db_pool.log_invoice(chat_id.0, price_val as i64, PREMIUM_PAYLOAD).await;
+    let _ = db_pool.log_invoice(bot_id, chat_id.0, price_val as i64, PREMIUM_PAYLOAD).await;
 
     // Invoice speaks the buyer's language: the title, description, Pay button
     // and price label all come from the same locale table as the bot replies.
-    let lang = db_pool.get_effective_lang(chat_id.0, None).await;
+    let lang = db_pool.get_effective_lang(bot_id, chat_id.0, None).await;
     let lang = Some(lang.as_str());
 
     // Telegram API Rule: If a custom reply_markup is provided for an invoice, 
@@ -122,6 +123,7 @@ pub async fn handle_pre_checkout(bot: Bot, q: PreCheckoutQuery) -> Result<(), Bo
 
 /// Core logic for processing a successful payment without Telegram API dependencies
 pub async fn process_successful_payment_logic(
+    bot_id: &str,
     user_id: i64,
     payload: &str,
     currency: &str,
@@ -133,10 +135,10 @@ pub async fn process_successful_payment_logic(
     }
 
     log::info!("[PAYMENT_CHAIN] 6. Granting premium in DB for user {}", user_id);
-    db_pool.set_user_premium(crate::database::PRIMARY_BOT_ID, user_id, 30).await?;
+    db_pool.set_user_premium(bot_id, user_id, 30).await?;
     
     // Log the successful payment
-    let _ = db_pool.log_payment(user_id, amount as i64, payload).await;
+    let _ = db_pool.log_payment(bot_id, user_id, amount as i64, payload).await;
     
     Ok(true)
 }
@@ -145,6 +147,7 @@ pub async fn process_successful_payment_logic(
 pub async fn handle_successful_payment(
     bot: Bot, 
     msg: Message, 
+    ctx: crate::BotCtx,
     db_pool: Arc<DatabasePool>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let payment = match msg.successful_payment() {
@@ -163,6 +166,7 @@ pub async fn handle_successful_payment(
     );
 
     let success = process_successful_payment_logic(
+        ctx.bot_id.as_str(),
         user_id,
         &payment.invoice_payload,
         &payment.currency,

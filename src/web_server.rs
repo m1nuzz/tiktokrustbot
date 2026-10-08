@@ -401,7 +401,10 @@ async fn serve_mini_app(
         Some(code) if !code.is_empty() => crate::i18n::resolve_lang(Some(code)).to_string(),
         _ => match query.get("ymid") {
             Some(ymid) if !ymid.is_empty() => match state.db.get_user_id_by_ymid(ymid).await {
-                Ok(user_id) => state.db.get_effective_lang(user_id, None).await,
+                Ok(user_id) => {
+                    let row_bot_id: String = state.db.get_bot_id_by_ymid(ymid).await.ok().flatten().unwrap_or_else(|| PRIMARY_BOT_ID.to_string());
+                    state.db.get_effective_lang(&row_bot_id, user_id, None).await
+                }
                 Err(_) => "en".to_string(),
             },
             _ => "en".to_string(),
@@ -454,9 +457,10 @@ async fn get_ads_status(
         match state.db.get_user_id_by_ymid(ymid).await {
             Ok(user_id) => {
                 let is_user_admin = crate::handlers::admin::is_admin_id(user_id);
+                let row_bot_id: String = state.db.get_bot_id_by_ymid(ymid).await.ok().flatten().unwrap_or_else(|| PRIMARY_BOT_ID.to_string());
                 let enabled = crate::handlers::link::ads_enabled_for(
                     &state.db,
-                    crate::database::PRIMARY_BOT_ID,
+                    &row_bot_id,
                     user_id,
                     is_user_admin,
                 )
@@ -502,7 +506,10 @@ async fn spawn_download_job(
         ClaimVia::Timer => "delivered_timer",
         ClaimVia::Admin => "delivered_admin",
     };
-    state.db.log_funnel_event(user_id, reason).await;
+    // The row owns the bot: funnel and locale stay on the bot the user came
+    // from. Unknown ymid keeps the previous primary fallback.
+    let row_bot_id: String = state.db.get_bot_id_by_ymid(&ymid).await.ok().flatten().unwrap_or_else(|| PRIMARY_BOT_ID.to_string());
+    state.db.log_funnel_event(&row_bot_id, user_id, reason).await;
     // A download really begins here, so record it: this is what lets the
     // expiry sweeper tell a failed download from a session that never earned
     // its ad, and therefore which of the two messages the user gets.
@@ -513,17 +520,15 @@ async fn spawn_download_job(
     }
     // Resolve locale from the stored /language override (no Telegram
     // User object in this flow, so no device language available).
-    let lang = state.db.get_effective_lang(user_id, None).await;
+    let lang = state.db.get_effective_lang(&row_bot_id, user_id, None).await;
     // The row's owning bot sends its own sessions. Unknown ymid resolves
     // through the same primary fallback as before (bot_for falls back to the
     // first configured bot for unmapped ids).
-    let bot = match state.db.get_bot_id_by_ymid(&ymid).await {
-        Ok(Some(id)) => state.bot_for(&id),
-        _ => state.bot_for(PRIMARY_BOT_ID),
-    };
+    let bot = state.bot_for(&row_bot_id);
     tokio::spawn(async move {
         if let Err(e) = crate::handlers::link::process_video_request(
             bot,
+            &row_bot_id,
             user_id,
             url,
             state.fetcher,

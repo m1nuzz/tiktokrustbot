@@ -28,11 +28,11 @@ async fn setup_test_db() -> (DatabasePool, NamedTempFile) {
             (),
         )?;
         conn.execute(
-            "CREATE TABLE payments (id INTEGER PRIMARY KEY, user_id BIGINT NOT NULL, amount INTEGER NOT NULL, payload TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE payments (id INTEGER PRIMARY KEY, bot_id TEXT NOT NULL DEFAULT 'primary', user_id BIGINT NOT NULL, amount INTEGER NOT NULL, payload TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)",
             (),
         )?;
         conn.execute(
-            "CREATE TABLE invoices (id INTEGER PRIMARY KEY, user_id BIGINT NOT NULL, amount INTEGER NOT NULL, payload TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE invoices (id INTEGER PRIMARY KEY, bot_id TEXT NOT NULL DEFAULT 'primary', user_id BIGINT NOT NULL, amount INTEGER NOT NULL, payload TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)",
             (),
         )?;
         Ok(())
@@ -54,6 +54,7 @@ async fn test_successful_payment_logic_activates_premium() {
     assert!(!pool.is_user_premium(PRIMARY_BOT_ID, user_id).await);
 
     let success = process_successful_payment_logic(
+        PRIMARY_BOT_ID,
         user_id,
         PREMIUM_PAYLOAD,
         CURRENCY_XTR,
@@ -70,12 +71,12 @@ async fn test_duplicate_successful_payment_logic_behavior() {
     let (pool, _file) = setup_test_db().await;
     let user_id = 987654321i64;
 
-    process_successful_payment_logic(user_id, PREMIUM_PAYLOAD, CURRENCY_XTR, 50, &pool).await.unwrap();
-    let premium_users = pool.get_premium_users().await.unwrap();
+    process_successful_payment_logic(PRIMARY_BOT_ID, user_id, PREMIUM_PAYLOAD, CURRENCY_XTR, 50, &pool).await.unwrap();
+    let premium_users = pool.get_premium_users(PRIMARY_BOT_ID).await.unwrap();
     let first_expiry = premium_users[0].1.clone();
 
-    process_successful_payment_logic(user_id, PREMIUM_PAYLOAD, CURRENCY_XTR, 50, &pool).await.unwrap();
-    let premium_users = pool.get_premium_users().await.unwrap();
+    process_successful_payment_logic(PRIMARY_BOT_ID, user_id, PREMIUM_PAYLOAD, CURRENCY_XTR, 50, &pool).await.unwrap();
+    let premium_users = pool.get_premium_users(PRIMARY_BOT_ID).await.unwrap();
     let second_expiry = premium_users[0].1.clone();
 
     assert!(second_expiry > first_expiry, "Expiry date should increase (accumulate) on duplicate payment");
@@ -87,6 +88,7 @@ async fn test_invalid_payload_rejection() {
     let user_id = 111222333i64;
 
     let success = process_successful_payment_logic(
+        PRIMARY_BOT_ID,
         user_id,
         "malicious_payload",
         CURRENCY_XTR,
@@ -104,6 +106,7 @@ async fn test_invalid_currency_rejection() {
     let user_id = 444555666i64;
 
     let success = process_successful_payment_logic(
+        PRIMARY_BOT_ID,
         user_id,
         PREMIUM_PAYLOAD,
         "USD",
@@ -114,9 +117,26 @@ async fn test_invalid_currency_rejection() {
     assert!(!success, "Logic should reject non-XTR currency");
 }
 
+/// Premium paid on one bot must not leak to another bot for the same human,
+// and the per-bot premium roster must only list the paying bot's users.
 #[tokio::test]
-async fn test_validate_pre_checkout_logic() {
-    // Happy path
+async fn test_payment_premium_is_per_bot() {
+    let (pool, _file) = setup_test_db().await;
+    let user_id = 555666777i64;
+
+    process_successful_payment_logic("aaa", user_id, PREMIUM_PAYLOAD, CURRENCY_XTR, 50, &pool).await.unwrap();
+
+    assert!(pool.is_user_premium("aaa", user_id).await);
+    assert!(!pool.is_user_premium("bbb", user_id).await);
+
+    let aaa_users = pool.get_premium_users("aaa").await.unwrap();
+    assert_eq!(aaa_users.len(), 1);
+    assert_eq!(aaa_users[0].0, user_id);
+    assert!(pool.get_premium_users("bbb").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_validate_pre_checkout_logic() {    // Happy path
     assert!(validate_pre_checkout(PREMIUM_PAYLOAD, CURRENCY_XTR));
     
     // Reject paths

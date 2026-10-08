@@ -11,6 +11,7 @@ use tiktokdownloader::mtproto_uploader::MTProtoUploader;
 use tiktokdownloader::utils::task_manager::TaskManager;
 use tiktokdownloader::yt_dlp_interface::{ensure_binaries, is_executable_present, YoutubeFetcher};
 use tiktokdownloader::build_handler;
+use tiktokdownloader::BotCtx;
 use teloxide::dispatching::dialogue;
 use teloxide::dptree;
 
@@ -384,6 +385,7 @@ async fn main() -> Result<(), Error> {
         let mut dispatcher = Dispatcher::builder(cfg.bot, handler)
             .dependencies(dptree::deps![
                 dialogue::InMemStorage::<BroadcastState>::new(),
+                BotCtx { bot_id: cfg.id.clone() },
                 fetcher.clone(),
                 cfg.uploader,
                 db_pool.clone(),

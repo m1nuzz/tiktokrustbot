@@ -5,6 +5,7 @@ use teloxide::types::{KeyboardButton, KeyboardMarkup};
 use crate::database::DatabasePool;
 use crate::handlers::ui::{BTN_AUTO_DETECT, BTN_BACK};
 use crate::i18n::{self, MsgKey};
+use crate::BotCtx;
 
 /// Reply keyboard: auto-detect first, then one button per supported language
 /// (two per row).
@@ -42,20 +43,22 @@ pub async fn language_command_handler(
 pub async fn language_button_handler(
     bot: Bot,
     msg: Message,
+    ctx: BotCtx,
     db_pool: Arc<DatabasePool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let text = match msg.text() {
         Some(text) => text,
         None => return Ok(()),
     };
+    let bot_id = ctx.bot_id.as_str();
     if text == BTN_AUTO_DETECT {
         let user_id = msg.chat.id.0;
-        if let Err(e) = db_pool.clear_user_lang(user_id).await {
+        if let Err(e) = db_pool.clear_user_lang(bot_id, user_id).await {
             log::error!("Failed to clear language for user {}: {}", user_id, e);
         }
-        db_pool.log_funnel_event(user_id, "language_autodetect").await;
+        db_pool.log_funnel_event(bot_id, user_id, "language_autodetect").await;
         let tg_lang = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
-        let lang = db_pool.get_effective_lang(user_id, tg_lang).await;
+        let lang = db_pool.get_effective_lang(bot_id, user_id, tg_lang).await;
         bot.send_message(msg.chat.id, i18n::t(MsgKey::LanguageSet, Some(lang.as_str())))
             .reply_markup(crate::handlers::command::get_main_reply_keyboard())
             .await
@@ -68,10 +71,10 @@ pub async fn language_button_handler(
     };
 
     let user_id = msg.chat.id.0;
-    if let Err(e) = db_pool.set_user_lang(user_id, code).await {
+    if let Err(e) = db_pool.set_user_lang(bot_id, user_id, code).await {
         log::error!("Failed to save language for user {}: {}", user_id, e);
     }
-    db_pool.log_funnel_event(user_id, "language_set").await;
+    db_pool.log_funnel_event(bot_id, user_id, "language_set").await;
 
     bot.send_message(msg.chat.id, i18n::t(MsgKey::LanguageSet, Some(code)))
         .reply_markup(crate::handlers::command::get_main_reply_keyboard())
@@ -85,11 +88,12 @@ pub async fn language_button_handler(
 pub async fn language_menu_handler(
     bot: Bot,
     msg: Message,
+    ctx: BotCtx,
     db_pool: Arc<DatabasePool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let user_id = msg.chat.id.0;
     let tg_lang = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
-    let lang = db_pool.get_effective_lang(user_id, tg_lang).await;
+    let lang = db_pool.get_effective_lang(ctx.bot_id.as_str(), user_id, tg_lang).await;
     bot.send_message(msg.chat.id, i18n::t(MsgKey::LanguageChoose, Some(lang.as_str())))
         .reply_markup(language_keyboard())
         .await
