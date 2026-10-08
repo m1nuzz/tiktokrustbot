@@ -415,10 +415,20 @@ async fn serve_mini_app(
         );
     }
     let html = inject_mini_app_strings(&html, &lang, &serde_json::Value::Object(dict));
-    // The bot username, injected the same way as the STRINGS dict so the
-    // ad-blocked screen can offer premium without the username ever appearing in
-    // the client source. Unset in the environment means no premium button.
-    let bot_username = std::env::var("BOT_USERNAME").ok();
+    // The bot username, resolved from the row's owning bot so each bot's
+    // ad-blocked screen links back to itself. Falls back to the environment
+    // exactly as before when the ymid is missing, unknown, or unmapped.
+    let bot_username: Option<String> = match query.get("ymid") {
+        Some(ymid) if !ymid.is_empty() => match state.db.get_bot_id_by_ymid(ymid).await {
+            Ok(Some(bot_id)) => state
+                .bots
+                .get(&bot_id)
+                .map(|info| info.username.to_string())
+                .or_else(|| std::env::var("BOT_USERNAME").ok()),
+            _ => std::env::var("BOT_USERNAME").ok(),
+        },
+        _ => std::env::var("BOT_USERNAME").ok(),
+    };
     let html = inject_bot_username(&html, bot_username.as_deref());
     let html = inject_loading_fallback(&html, &lang);
     // Never cache the document: Telegram WebViews keep serving a stale copy
@@ -504,9 +514,16 @@ async fn spawn_download_job(
     // Resolve locale from the stored /language override (no Telegram
     // User object in this flow, so no device language available).
     let lang = state.db.get_effective_lang(user_id, None).await;
+    // The row's owning bot sends its own sessions. Unknown ymid resolves
+    // through the same primary fallback as before (bot_for falls back to the
+    // first configured bot for unmapped ids).
+    let bot = match state.db.get_bot_id_by_ymid(&ymid).await {
+        Ok(Some(id)) => state.bot_for(&id),
+        _ => state.bot_for(PRIMARY_BOT_ID),
+    };
     tokio::spawn(async move {
         if let Err(e) = crate::handlers::link::process_video_request(
-            state.bot_for(PRIMARY_BOT_ID),
+            bot,
             user_id,
             url,
             state.fetcher,

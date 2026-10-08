@@ -761,6 +761,19 @@ impl DatabasePool {
         }).await.map_err(|e| anyhow::anyhow!("Ymid {} not found: {}", id, e))
     }
 
+    /// Owning bot of a session ymid, if the row exists. Unknown ymid is not
+    /// an error: callers fall back to the primary bot.
+    pub async fn get_bot_id_by_ymid(&self, id: &str) -> Result<Option<String>, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.query_row(
+                "SELECT bot_id FROM pending_downloads WHERE id = ?1",
+                params![id_owned],
+                |row| row.get(0),
+            ).optional()
+        }).await.map_err(|e| anyhow::anyhow!("Failed to get bot for ymid {}: {}", id, e))
+    }
+
     /// Get status for a pending download by ymid
     pub async fn get_pending_download_status(&self, id: &str) -> Result<Option<String>, anyhow::Error> {
         let id_owned = id.to_string();
@@ -1875,6 +1888,19 @@ mod tests {
         let premium_users = pool.get_premium_users().await.unwrap();
         assert_eq!(premium_users.len(), 1);
         assert_eq!(premium_users[0].0, 1);
+    }
+
+    #[tokio::test]
+    async fn bot_id_resolves_per_ymid_and_misses_unknown() {
+        let (pool, _file) = setup_test_db().await;
+        pool.execute_with_timeout(|conn| {
+            conn.execute("INSERT INTO pending_downloads (id, user_id, video_url, bot_id) VALUES ('known', 7, 'http://v', 'zzz')", ())?;
+            conn.execute("INSERT INTO pending_downloads (id, user_id, video_url) VALUES ('legacy', 7, 'http://v')", ())?;
+            Ok(())
+        }).await.unwrap();
+        assert_eq!(pool.get_bot_id_by_ymid("known").await.unwrap(), Some("zzz".to_string()));
+        assert_eq!(pool.get_bot_id_by_ymid("legacy").await.unwrap(), Some("primary".to_string()));
+        assert_eq!(pool.get_bot_id_by_ymid("nope").await.unwrap(), None);
     }
 
     #[tokio::test]
