@@ -80,9 +80,7 @@ pub fn broadcast_now_unix() -> u64 {
 pub fn broadcast_pause_set(pause_until: &AtomicU64, wait_secs: u64) {
     let until = broadcast_now_unix().saturating_add(wait_secs).saturating_add(1);
     // Only move the deadline forward, never backward.
-    let _ = pause_until.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-        if until > cur { Some(until) } else { None }
-    });
+    pause_until.fetch_max(until, Ordering::Relaxed);
 }
 
 pub fn broadcast_pause_remaining(pause_until: &AtomicU64) -> u64 {
@@ -355,7 +353,7 @@ pub async fn handle_broadcast_confirmation(
                                         // texts working if the shape changes.
                                         match &e {
                                             teloxide_core::errors::RequestError::RetryAfter(d) => {
-                                                let secs = d.as_secs().max(1);
+                                                let secs = (d.seconds() as u64).max(1);
                                                 log::info!("429 RetryAfter({}s) - pausing all senders", secs);
                                                 broadcast_pause_set(&pause_c, secs.min(300));
                                             }
