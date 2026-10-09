@@ -487,22 +487,24 @@ impl DatabasePool {
     ///
     /// `user_id` is what makes the copy language-preserving: the effective
     /// locale comes from that user's stored /language override (else the ?lang=
-    /// tag the bot button appends), so no language column is needed.
+    /// tag the bot button appends), so no language column is needed. `bot_id`
+    /// is copied for the same reason: funnel, locale and stats stay on the bot
+    /// the user came from instead of falling back to the legacy `primary` row.
     ///
     /// The whole decision runs in one transaction: two concurrent presses of the
     /// same entry ymid cannot both reuse it.
     pub async fn resolve_session_ymid(&self, entry_ymid: &str) -> Result<Option<SessionYmid>, anyhow::Error> {
         let entry_owned = entry_ymid.to_string();
         self.execute_with_timeout(move |conn| {
-            let entry: Option<(i64, String)> = conn
+            let entry: Option<(i64, String, String)> = conn
                 .query_row(
-                    "SELECT user_id, video_url FROM pending_downloads WHERE id = ?1",
+                    "SELECT user_id, video_url, bot_id FROM pending_downloads WHERE id = ?1",
                     params![entry_owned],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
 
-            let (user_id, video_url) = match entry {
+            let (user_id, video_url, bot_id) = match entry {
                 Some(row) => row,
                 None => return Ok(None),
             };
@@ -547,10 +549,10 @@ impl DatabasePool {
             let id = uuid::Uuid::new_v4().to_string();
             conn.execute(
                 &format!(
-                    "INSERT INTO pending_downloads (id, user_id, video_url, entry_ymid, lease_expires_at) VALUES (?1, ?2, ?3, ?4, datetime('now', '+{} seconds'))",
+                    "INSERT INTO pending_downloads (id, bot_id, user_id, video_url, entry_ymid, lease_expires_at) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', '+{} seconds'))",
                     SESSION_LEASE_SECS
                 ),
-                params![id, user_id, video_url, entry_owned],
+                params![id, bot_id, user_id, video_url, entry_owned],
             )?;
             Ok(Some(SessionYmid {
                 ymid: id,
@@ -2487,6 +2489,27 @@ mod tests {
         assert_eq!(
             lease_span_secs(&pool, &rotated.ymid).await,
             SESSION_LEASE_SECS
+        );
+    }
+
+    /// Regression: the minted row must inherit the entry's bot, not the
+    /// legacy `primary` default. Otherwise re-presses (same video a minute
+    /// later) leak into the @(legacy) stats bucket.
+    #[tokio::test]
+    async fn a_spent_entry_ymid_mints_a_row_for_the_same_bot() {
+        let (pool, _file) = setup_test_db().await;
+        let entry = pool
+            .create_pending_download("botX", 34, "http://v")
+            .await
+            .unwrap();
+        pool.mark_ad_requested(&entry).await.unwrap();
+
+        let rotated = pool.resolve_session_ymid(&entry).await.unwrap().unwrap();
+        assert!(!rotated.reused);
+        assert_eq!(
+            pool.get_bot_id_by_ymid(&rotated.ymid).await.unwrap(),
+            Some("botX".to_string()),
+            "minted row keeps the entry bot"
         );
     }
 
