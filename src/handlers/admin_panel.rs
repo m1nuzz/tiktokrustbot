@@ -218,8 +218,8 @@ pub async fn daily_stats_text_handler(
 
             let mut response = format!(
                 "📊 *Daily Report — {}*\n\
-                📌 *С админом:* 👥 {} · ⬇️ {} · 📦 {}\n\n\
-                *Activity Today \\(без админа\\)*\n\
+                📌 *With admin:* 👥 {} · ⬇️ {} · 📦 {}\n\n\
+                *Activity Today \\(ex\\-admin\\)*\n\
                 👥 Unique Users:       {} \\({}{} vs yesterday\\)\n\
                 ⬇️ Unique Downloaders: {} \\({}% of users\\)\n\
                 📦 Total Downloads:    {}\n\
@@ -232,9 +232,10 @@ pub async fn daily_stats_text_handler(
                 🔄 Invoices Sent:      {}\n\
                 💳 Invoice → Pay CR:   {}%\n\n\
                 *📢 Ads \\(Monetag\\)*\n\
-                💰 Засчитано сегодня:  {}\n\
-                🆓 Бесплатных:         {}\n\
-                📊 За 7 дней:          {} / {}\n",
+                💰 Valued today:     {}\n\
+                🆓 Unvalued:          {}\n\
+                🎁 Free deliveries:  {}\n\
+                📊 Last 7 days:       {} / {}\n",
                 e(s.date),
                 e(all.unique_users.to_string()),
                 e(all.unique_downloaders.to_string()),
@@ -254,11 +255,12 @@ pub async fn daily_stats_text_handler(
                 e(format!("{:.1}", inv_pay_cr)),
                 e(pb_valued.to_string()),
                 e(pb_free.to_string()),
+                e(s.free_deliveries.to_string()),
                 e(pb_valued_w.to_string()),
                 e(pb_free_w.to_string())
             );
             if uncredited_alert {
-                response.push_str("⚠️ *Незачтено больше 80% — проверь постбэк\\-URL в SSP, секрет и саппорт Monetag*\n");
+                response.push_str("⚠️ *Over 80% unvalued — check postback\\-URL in SSP, secret and Monetag support*\n");
             }
 
             if let Some((hour, count)) = s.peak_hour {
@@ -289,12 +291,13 @@ pub async fn daily_stats_text_handler(
             if let Ok(agg) = db_pool.get_rich_daily_stats(None, &admins).await {
                 let (agg_v, agg_f) = db_pool.get_postback_stats(None, 1).await.unwrap_or((0, 0));
                 response.push_str(&format!(
-                    "\n🌐 *All bots today:* 👥 {} · 📦 {} · ⭐ {} · 💰 {} / 🆓 {}\n",
+                    "\n🌐 *All bots today:* 👥 {} · 📦 {} · ⭐ {} · 💰 {} / 🆓 {} / 🎁 {}\n",
                     e(agg.unique_users.to_string()),
                     e(agg.total_downloads.to_string()),
                     e(agg.revenue_xtr.to_string()),
                     e(agg_v.to_string()),
-                    e(agg_f.to_string())
+                    e(agg_f.to_string()),
+                    e(agg.free_deliveries.to_string())
                 ));
             }
 
@@ -357,7 +360,7 @@ pub async fn weekly_stats_text_handler(
     match db_pool.get_weekly_stats(bot_id, 7, &admins).await {
         Ok(days) => {
             let e = |s: String| escape_markdown_v2(&s);
-            let mut response = String::from("📅 *Weekly Report — last 7 days \\(без админа\\)*\n\n");
+            let mut response = String::from("📅 *Weekly Report — last 7 days \\(ex\\-admin\\)*\n\n");
             let (mut total_users, mut total_new, mut total_dl, mut total_blocks) = (0i64, 0i64, 0i64, 0i64);
             for d in &days {
                 total_users += d.unique_users;
@@ -411,7 +414,7 @@ pub async fn weekly_stats_text_handler(
                     ab += d.blocks;
                 }
                 response.push_str(&format!(
-                    "📌 *С админом \\(Σ\\):* 👥 {} 🆕 {} 📦 {} 🚫 {}\n",
+                    "📌 *With admin \\(Σ\\):* 👥 {} 🆕 {} 📦 {} 🚫 {}\n",
                     e(au.to_string()),
                     e(an.to_string()),
                     e(ad.to_string()),
@@ -476,7 +479,7 @@ pub async fn funnel_text_handler(
     match db_pool.get_funnel_stats(bot_id, 7, &admins).await {
         Ok(days) => {
             let e = |s: String| escape_markdown_v2(&s);
-            let mut response = String::from("🔻 *Conversion Funnel — last 7 days \\(без админа\\)*\n\n");
+            let mut response = String::from("🔻 *Conversion Funnel — last 7 days \\(ex\\-admin\\)*\n\n");
             for d in &days {
                 response.push_str(&format!(
                     "*{}*\nS0 start {} → S1 link {} \\({}\\) → S2 ad {} \\({}\\) → S3 claim {} \\({}\\) → S4 got video {} \\({}\\) \\(💰 {} · 🆓 {}\\)\n💀 expired {} · failed {}\n\n",
@@ -492,7 +495,7 @@ pub async fn funnel_text_handler(
                     e(d.failed.to_string()),
                 ));
             }
-            response.push_str("S0\\=start · S1\\=sent link · S2\\=watched ad · S3\\=claimed · S4\\=delivered \\(💰\\=valued, 🆓\\=таймер/без зачёта\\)\\. Biggest drop \\= fix first\\.\n");
+            response.push_str("S0\\=start · S1\\=sent link · S2\\=watched ad · S3\\=claimed · S4\\=delivered \\(💰\\=valued, 🆓\\=timer/unvalued\\)\\. Biggest drop \\= fix first\\.\n");
             // Aggregate across every bot: one totals row, same exclusions.
             if let Ok(agg_days) = db_pool.get_funnel_stats(None, 7, &admins).await {
                 let (mut s0, mut s1, mut s4) = (0i64, 0i64, 0i64);

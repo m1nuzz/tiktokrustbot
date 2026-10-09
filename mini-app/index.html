@@ -1438,11 +1438,8 @@
                     return;
                 }
 
-                // Visible progress so the wait never looks like a dead button.
-                // The button itself stays hidden (no claim CTA anymore): the
-                // text update below is invisible, kept only to avoid touching
-                // the shared claim flow.
-                claimBtn.innerText = t('MiniClaimProgress').replace('{n}', attempt).replace('{m}', AD_CONFIG.claimMaxAttempts);
+                // Retries run silently now: the claim button is gone, the server
+                // auto-delivers every display, success closes the webapp.
                 await new Promise(r => setTimeout(r, AD_CONFIG.claimRetryInterval));
             }
         }

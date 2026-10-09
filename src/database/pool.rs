@@ -119,6 +119,8 @@ pub struct RichDailyStats {
     pub peak_hour: Option<(u32, i64)>,
     pub top_downloaders: Vec<(i64, i64)>,
     pub last_active_users: Vec<(i64, String)>,
+    /// Videos delivered for unvalued displays (`funnel_events.delivered_free`).
+    pub free_deliveries: i64,
 }
 
 /// SQL fragment excluding admin ids from a telegram-id column.
@@ -950,7 +952,7 @@ impl DatabasePool {
                     &format!("SELECT COUNT(*) FROM funnel_events f WHERE date(f.created_at) = {day_sql} AND f.event = 'delivered_valued'{excl_f} AND (?1 IS NULL OR f.bot_id = ?1)"),
                     params![bot_p], |r| r.get(0)).unwrap_or(0);
                 let delivered_free: i64 = conn.query_row(
-                    &format!("SELECT COUNT(*) FROM funnel_events f WHERE date(f.created_at) = {day_sql} AND f.event IN ('delivered_timer', 'delivered_admin'){excl_f} AND (?1 IS NULL OR f.bot_id = ?1)"),
+                    &format!("SELECT COUNT(*) FROM funnel_events f WHERE date(f.created_at) = {day_sql} AND f.event IN ('delivered_timer', 'delivered_admin', 'delivered_free'){excl_f} AND (?1 IS NULL OR f.bot_id = ?1)"),
                     params![bot_p], |r| r.get(0)).unwrap_or(0);
                 Ok((started, link_sent, ad_watched, claimed, delivered, expired, failed, delivered_paid, delivered_free))
             }).await?;
@@ -1184,6 +1186,7 @@ impl DatabasePool {
         let excl_u = admin_filter_sql("telegram_id", exclude_admins);
         let excl_d = admin_filter_sql("user_telegram_id", exclude_admins);
         let excl_p = admin_filter_sql("user_id", exclude_admins);
+        let excl_f = admin_filter_sql("f.user_telegram_id", exclude_admins);
         let bot_opt: Option<String> = bot_id.map(str::to_string);
         self.execute_with_timeout(move |conn| {
             // Basic counts today
@@ -1224,6 +1227,10 @@ impl DatabasePool {
                 &format!("SELECT COUNT(*) FROM invoices WHERE date(timestamp) = date('now'){excl_p} AND (?1 IS NULL OR bot_id = ?1)"),
                 params![bot_opt], |r| r.get(0)).unwrap_or(0);
 
+            let free_deliveries: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM funnel_events f WHERE date(f.created_at) = date('now'){excl_f} AND f.event = 'delivered_free' AND (?1 IS NULL OR f.bot_id = ?1)"),
+                params![bot_opt], |r| r.get(0)).unwrap_or(0);
+
             // Peak hour
             let peak_hour_data = conn.query_row(
                 &format!("SELECT strftime('%H', download_date) as hr, COUNT(*) as cnt 
@@ -1262,6 +1269,7 @@ impl DatabasePool {
                 payments_count,
                 revenue_xtr,
                 invoices_sent,
+                free_deliveries,
                 peak_hour: peak_hour_data,
                 top_downloaders,
                 last_active_users,
@@ -1926,9 +1934,37 @@ mod tests {
         // Delivery reasons split paid vs free giveaways.
         pool.log_funnel_event("primary", 1, "delivered_valued").await;
         pool.log_funnel_event("primary", 2, "delivered_timer").await;
+        pool.log_funnel_event("botX", 3, "delivered_free").await;
         let split = &pool.get_funnel_stats(None, 7, &[999]).await.unwrap()[6];
         assert_eq!(split.delivered_paid, 1);
-        assert_eq!(split.delivered_free, 1);
+        assert_eq!(split.delivered_free, 2);
+    }
+
+    /// The daily report's free-deliveries counter reads exactly the new
+    /// `delivered_free` rows: own bot + aggregate count them, foreign bots
+    /// and admin ids do not leak in.
+    #[tokio::test]
+    async fn rich_daily_stats_counts_free_deliveries_per_bot() {
+        let (pool, _file) = setup_test_db().await;
+        pool
+            .log_funnel_event("botA", 11, "delivered_free")
+            .await;
+        pool
+            .log_funnel_event("botA", 12, "delivered_free")
+            .await;
+        pool
+            .log_funnel_event("botB", 13, "delivered_free")
+            .await;
+        pool
+            .log_funnel_event("botA", 999, "delivered_free")
+            .await;
+
+        let a = pool.get_rich_daily_stats(Some("botA"), &[999]).await.unwrap();
+        assert_eq!(a.free_deliveries, 2);
+        let b = pool.get_rich_daily_stats(Some("botB"), &[]).await.unwrap();
+        assert_eq!(b.free_deliveries, 1);
+        let agg = pool.get_rich_daily_stats(None, &[999]).await.unwrap();
+        assert_eq!(agg.free_deliveries, 3);
     }
 
     #[tokio::test]
