@@ -1024,7 +1024,9 @@
         }
 
 // No ad could be loaded even though the SDK works (no fill / network):
-        // offer the video, a quick offer, or one ad retry — all functional.
+        // offer a quick offer or one ad retry — both functional. No claim
+        // button: every display (valued or not) now auto-delivers from the
+        // server, so there is nothing to tap for.
         function showNoAds() {
             stopPolling();
             cancelRetry();
@@ -1033,11 +1035,10 @@
             contentView.classList.remove('hidden');
             document.getElementById('title').innerText = t('MiniNoAdsTitle');
             description.innerText = t('MiniNoAdsDesc');
-            // Every visible button must do something: claim / offer / retry.
+            // Every visible button must do something: offer / retry.
             trackEvent('no_fill_screen');
             premiumBtn.classList.add('hidden');
-            claimBtn.innerText = t('MiniBtnGetVideo');
-            claimBtn.classList.remove('hidden');
+            claimBtn.classList.add('hidden');
             directBtn.innerText = t('MiniBtnQuickOffer');
             directAction = 'popup';
             directBtn.classList.remove('hidden');
@@ -1438,8 +1439,10 @@
                 }
 
                 // Visible progress so the wait never looks like a dead button.
+                // The button itself stays hidden (no claim CTA anymore): the
+                // text update below is invisible, kept only to avoid touching
+                // the shared claim flow.
                 claimBtn.innerText = t('MiniClaimProgress').replace('{n}', attempt).replace('{m}', AD_CONFIG.claimMaxAttempts);
-                claimBtn.classList.remove('hidden');
                 await new Promise(r => setTimeout(r, AD_CONFIG.claimRetryInterval));
             }
         }
@@ -1584,17 +1587,9 @@
             trySDKAd();
         });
 
-// Claim button: the video itself. Re-arms the guard so a retry after an
-        // error works, and gives instant feedback while the server gate
-        // is still closed.
-        claimBtn.addEventListener('click', () => {
-            trackEvent('claim_tapped');
-            cancelRetry();
-            stopPolling();
-            claimFired = false;
-            claimBtn.innerText = t('MiniClaimBusy');
-            autoClaim();
-        });
+        // Claim button element is never shown anymore (server auto-delivers
+        // every display): no tap handler. autoClaim still runs silently and
+        // closes the webapp on success.
 
         // Continue button: 'popup' opens the quick offer, 'bonus_popup'
         // opens the post-reward bonus offer (the video is already delivered

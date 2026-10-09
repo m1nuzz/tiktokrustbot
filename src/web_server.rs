@@ -505,6 +505,7 @@ async fn spawn_download_job(
         ClaimVia::Verified => "delivered_valued",
         ClaimVia::Timer => "delivered_timer",
         ClaimVia::Admin => "delivered_admin",
+        ClaimVia::Free => "delivered_free",
     };
     // The row owns the bot: funnel and locale stay on the bot the user came
     // from. Unknown ymid keeps the previous primary fallback.
@@ -557,6 +558,9 @@ const AUTO_DELIVERY_INTERVAL: Duration = Duration::from_secs(2);
 /// already claimed, and the delayed task finds a completed row and does
 /// nothing. Only a client that never came back still needs delivering.
 const VALUED_AUTODELIVERY_DELAY_SECS: u64 = 30;
+/// Free (unvalued display) delivery waits only this long: enough for a late
+/// valued postback to win the race, short enough to feel instant.
+const NONVALUED_AUTODELIVERY_DELAY_SECS: u64 = 5;
 
 /// One client POST races Monetag's postback: the ad settles before the backend
 /// confirmation is journaled, so the first attempt can lose by a second or
@@ -770,15 +774,34 @@ async fn monetag_postback(
         );
         return axum::http::StatusCode::OK;
     }
-    // A display Monetag did not value unlocks nothing: it stays journaled
-    // above for the revenue stats, and the client offers its one retry from
-    // the verdict it reads itself. Verifying here would let the very next
-    // claim take the video while the ad is still playing.
+    // A display Monetag did not value still earns the video, just on a short
+    // delay: the window lets a late valued postback for the same ymid win the
+    // race (atomic claim keeps delivery exactly-once either way), and keeps
+    // the instant path a valued-only privilege. Tracked as Free, never Valued.
     if reward != "valued" {
         log::info!(
-            "Ad display for ymid {} was not valued - journaled only, the client offers one retry",
-            query.ymid
+            "Ad display for ymid {} was not valued - free delivery in {}s",
+            query.ymid,
+            NONVALUED_AUTODELIVERY_DELAY_SECS
         );
+        let task_state = state.clone();
+        let task_ymid = query.ymid.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(NONVALUED_AUTODELIVERY_DELAY_SECS)).await;
+            match deliver_after_ad_display(&task_state.db, &task_ymid).await {
+                ValuedPostbackResult::Delivered { user_id, url, .. } => {
+                    log::info!(
+                        "Delivering download for user {} (unvalued display + delay)",
+                        user_id
+                    );
+                    spawn_download_job(task_state, user_id, url, task_ymid, ClaimVia::Free).await;
+                }
+                refused => log::debug!(
+                    "Unvalued display for ymid {} delivered nothing: {:?}",
+                    task_ymid, refused
+                ),
+            }
+        });
         return axum::http::StatusCode::OK;
     }
 
@@ -975,6 +998,19 @@ async fn claim_video(
                     );
                     return Json(json!({ "success": true }));
                 }
+            }
+            // A presented-but-unvalued session is waiting out its free-delivery
+            // delay, not failing: info, not error. (No-impression claims stay
+            // errors - nothing presented, nothing due.)
+            if db.has_ad_impression(&ymid).await.unwrap_or(false)
+                && !db.has_valued_impression(&ymid).await.unwrap_or(true)
+            {
+                log::info!(
+                    "Claim for ymid {} not yet due (free-delivery delay): {}",
+                    ymid,
+                    e
+                );
+                return Json(claim_refusal_response(&db, &ymid).await);
             }
             log::error!(
                 "Claim failed for ymid {} after {} attempts: {}",
@@ -1332,6 +1368,55 @@ mod tests {
         assert_eq!(
             db.get_pending_download_status("retried").await.unwrap(),
             Some("completed".to_string())
+        );
+    }
+
+    /// An unvalued display earns the video too, via the same atomic claim -
+    /// the 5s delay lives in the spawned task, so this delivers at once.
+    #[tokio::test]
+    async fn unvalued_display_delivers_like_valued() {
+        let (pool, _file) = crate::database::setup_test_db().await;
+        let db = Arc::new(pool);
+        crate::database::setup_gate_row(&db, "free-pending", "pending", 5, &[]).await;
+        db.log_postback("free-pending", Some("impression"), "non_valued", None, None, None, None, None)
+            .await
+            .unwrap();
+
+        let outcome = deliver_after_ad_display(&db, "free-pending").await;
+        assert!(
+            matches!(outcome, ValuedPostbackResult::Delivered { .. }),
+            "unvalued display must deliver, got {:?}",
+            outcome
+        );
+        assert_eq!(
+            db.get_pending_download_status("free-pending").await.unwrap(),
+            Some("completed".to_string())
+        );
+    }
+
+    /// The 5s race: valued delivers first, the free task arriving late must be
+    /// a no-op, never a second delivery.
+    #[tokio::test]
+    async fn late_free_task_after_valued_delivery_is_a_noop() {
+        let (pool, _file) = crate::database::setup_test_db().await;
+        let db = Arc::new(pool);
+        crate::database::setup_gate_row(&db, "race", "pending", 5, &[]).await;
+        db.log_postback("race", Some("impression"), "valued", None, None, None, None, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            deliver_after_ad_display(&db, "race").await,
+            ValuedPostbackResult::Delivered { .. }
+        ));
+
+        db.log_postback("race", Some("impression"), "non_valued", None, None, None, None, None)
+            .await
+            .unwrap();
+        let again = deliver_after_ad_display(&db, "race").await;
+        assert!(
+            !matches!(again, ValuedPostbackResult::Delivered { .. }),
+            "second delivery must not happen, got {:?}",
+            again
         );
     }
 

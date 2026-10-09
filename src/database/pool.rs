@@ -31,6 +31,9 @@ pub enum ClaimVia {
     Verified,
     Timer,
     Admin,
+    /// A presented-but-unvalued ad: the user sat through it, Monetag paid
+    /// nothing. Delivered on a short delay, tracked separately from valued.
+    Free,
 }
 
 /// Lease window pushed forward by every client heartbeat while the mini-app is
