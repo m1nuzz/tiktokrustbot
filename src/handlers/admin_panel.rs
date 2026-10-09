@@ -303,6 +303,11 @@ pub async fn daily_stats_text_handler(
             if let Ok(bot_list) = db_pool.list_bots().await {
                 let mut rows: Vec<TopBotRow> = Vec::new();
                 for (bid, username) in &bot_list {
+                    // The pre-multibot `primary` bucket has no bot face: its
+                    // traffic stays in the All-bots aggregate, not the board.
+                    if bid == crate::database::PRIMARY_BOT_ID {
+                        continue;
+                    }
                     if let Ok(st) = db_pool
                         .get_rich_daily_stats(Some(bid.as_str()), &admins)
                         .await
