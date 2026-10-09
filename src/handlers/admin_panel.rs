@@ -298,6 +298,32 @@ pub async fn daily_stats_text_handler(
                 ));
             }
 
+            // Per-bot leaderboard, most downloads first, no limit, same
+            // admin exclusions, one line per bot in the All-bots shape.
+            if let Ok(bot_list) = db_pool.list_bots().await {
+                let mut rows: Vec<TopBotRow> = Vec::new();
+                for (bid, username) in &bot_list {
+                    if let Ok(st) = db_pool
+                        .get_rich_daily_stats(Some(bid.as_str()), &admins)
+                        .await
+                    {
+                        let (v, f) = db_pool
+                            .get_postback_stats(Some(bid.as_str()), 1)
+                            .await
+                            .unwrap_or((0, 0));
+                        rows.push((
+                            username.clone(),
+                            st.unique_users,
+                            st.total_downloads,
+                            st.revenue_xtr,
+                            v,
+                            f,
+                        ));
+                    }
+                }
+                response.push_str(&format_top_bots(rows));
+            }
+
             bot.send_message(msg.chat.id, response)
                 .parse_mode(teloxide::types::ParseMode::MarkdownV2)
                 .await?;
@@ -727,6 +753,36 @@ pub async fn all_users_text_handler(
     Ok(())
 }
 
+/// One leaderboard row per bot: (username, unique_users, downloads,
+/// revenue_xtr, postbacks_valued, postbacks_free).
+pub type TopBotRow = (String, i64, i64, i64, i64, i64);
+
+/// Sort most-downloaded first (username breaks ties) and render the
+/// `Top bots today` block in the All-bots one-line shape. Pure so tests pin
+/// the order and the code-span escaping (usernames keep their `_`).
+pub fn format_top_bots(mut rows: Vec<TopBotRow>) -> String {
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+    if rows.is_empty() {
+        return String::new();
+    }
+    let e = escape_markdown_v2;
+    let mut out = String::from("\n🏆 *Top bots today:*\n");
+    for (username, users, downloads, revenue, valued, free) in &rows {
+        // Inside a MarkdownV2 code span only ` and \ need escaping.
+        let u = username.replace('\\', "\\\\").replace('`', "\\`");
+        out.push_str(&format!(
+            "`@{}`: 👥 {} · 📦 {} · ⭐ {} · 💰 {} / 🆓 {}\n",
+            u,
+            e(users.to_string()),
+            e(downloads.to_string()),
+            e(revenue.to_string()),
+            e(valued.to_string()),
+            e(free.to_string())
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,5 +792,27 @@ mod tests {
         let input = "Hello (world) + [test] - 1.2! _ * ~ ` > # = | { }";
         let expected = "Hello \\(world\\) \\+ \\[test\\] \\- 1\\.2\\! \\_ \\* \\~ \\` \\> \\# \\= \\| \\{ \\}";
         assert_eq!(escape_markdown_v2(input), expected);
+    }
+
+    #[test]
+    fn test_format_top_bots_sorts_by_downloads() {
+        let out = format_top_bots(vec![
+            ("b_bot".to_string(), 10, 5, 0, 1, 1),
+            ("a_bot".to_string(), 20, 50, 3, 9, 2),
+            ("c_bot".to_string(), 5, 50, 0, 0, 0),
+        ]);
+        let pa = out.find("@a_bot").unwrap();
+        let pc = out.find("@c_bot").unwrap();
+        let pb = out.find("@b_bot").unwrap();
+        // 50-download bots first (a before c on tie), then the 5-download one.
+        assert!(pa < pc && pc < pb);
+        assert!(out.contains("📦 50"));
+        // Underscores survive: no \_ inside the code span.
+        assert!(!out.contains("\\_"));
+    }
+
+    #[test]
+    fn test_format_top_bots_empty() {
+        assert_eq!(format_top_bots(vec![]), "");
     }
 }
