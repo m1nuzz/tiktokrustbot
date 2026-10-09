@@ -765,7 +765,7 @@ pub fn format_top_bots(mut rows: Vec<TopBotRow>) -> String {
     if rows.is_empty() {
         return String::new();
     }
-    let e = escape_markdown_v2;
+    let e = |s: String| escape_markdown_v2(&s);
     let mut out = String::from("\n🏆 *Top bots today:*\n");
     for (username, users, downloads, revenue, valued, free) in &rows {
         // Inside a MarkdownV2 code span only ` and \ need escaping.
