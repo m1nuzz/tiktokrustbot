@@ -14,9 +14,12 @@ pub mod yt_dlp_interface;
 pub use handlers::payments;
 use teloxide::prelude::*;
 use handlers::broadcast::BroadcastState;
+use handlers::broadcast::BroadcastScope;
+use handlers::broadcast::{BROADCAST_CANCEL, BROADCAST_CONFIRM, BROADCAST_SCOPE_ALL, BROADCAST_SCOPE_THIS};
 use handlers::{
     receive_broadcast_message, add_premium_user_handler, start_broadcast,
-    handle_broadcast_confirmation, admin_panel_text_handler, command_handler,
+    handle_broadcast_confirmation, handle_scope_selection, handle_scope_text,
+    admin_panel_text_handler, command_handler,
     settings_text_handler, format_text_handler, subscription_text_handler,
     back_text_handler, link_handler, BTN_BROADCAST, set_price_handler, premium_price_for,
     all_users_text_handler, stats_text_handler, top10_text_handler, premium_users_text_handler,
@@ -51,6 +54,11 @@ pub type MyDialogue = dialogue::Dialogue<
 pub struct BotCtx {
     pub bot_id: String,
 }
+
+/// Every connected bot by its `bot_id`, shared with all dispatchers so an
+/// All-bots broadcast can send from the bot each recipient last used.
+/// `Bot` is cheap to clone (an `Arc` client underneath).
+pub type BotDirectory = Arc<std::collections::HashMap<String, Bot>>;
 
 /// Which `/start` branch owns a message. Exhaustive on purpose: a deep link the
 /// bot issues itself must be routed to its own handler, and every other payload
@@ -146,7 +154,10 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
             dialogue::enter::<Update, dialogue::InMemStorage<BroadcastState>, BroadcastState, _>()
                 .branch(
                     Update::filter_message()
-                        .branch(dptree::case![BroadcastState::WaitingForMessage].endpoint(receive_broadcast_message))
+                        .branch(dptree::case![BroadcastState::WaitingForScope].endpoint(handle_scope_text))
+                        .branch(dptree::case![BroadcastState::WaitingForMessage { scope }].endpoint(|bot: Bot, dialogue: MyDialogue, msg: Message, scope: BroadcastScope| async move {
+                            receive_broadcast_message(bot, dialogue, msg, scope).await
+                        }))
                         .branch(dptree::case![BroadcastState::WaitingForAddPremiumUserId].endpoint(add_premium_user_handler))
                         .branch(dptree::case![BroadcastState::WaitingForSetPrice].endpoint(set_price_handler))
                         .branch(dptree::case![BroadcastState::Idle]
@@ -170,10 +181,14 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                 )
                 .branch(
                     Update::filter_callback_query()
-                        .filter(|q: CallbackQuery| q.data.as_ref().map_or(false, |data| data == "broadcast_confirm" || data == "broadcast_cancel"))
-                        .endpoint(|bot: Bot, dialogue: MyDialogue, q: CallbackQuery, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
-                            if let Ok(Some(BroadcastState::WaitingForConfirmation { message })) = dialogue.get().await {
-                                handle_broadcast_confirmation(bot, dialogue, q, ctx, db_pool, message).await
+                        .filter(|q: CallbackQuery| q.data.as_ref().map_or(false, |data| data == BROADCAST_CONFIRM || data == BROADCAST_CANCEL || data == BROADCAST_SCOPE_THIS || data == BROADCAST_SCOPE_ALL))
+                        .endpoint(|bot: Bot, dialogue: MyDialogue, q: CallbackQuery, ctx: BotCtx, db_pool: Arc<DatabasePool>, bots: BotDirectory| async move {
+                            let is_scope = q.data.as_ref().map_or(false, |data| data == BROADCAST_SCOPE_THIS || data == BROADCAST_SCOPE_ALL);
+                            if is_scope {
+                                return handle_scope_selection(bot, dialogue, q).await;
+                            }
+                            if let Ok(Some(BroadcastState::WaitingForConfirmation { message, scope })) = dialogue.get().await {
+                                handle_broadcast_confirmation(bot, dialogue, q, ctx, db_pool, bots, message, scope).await
                             } else {
                                 Ok(())
                             }

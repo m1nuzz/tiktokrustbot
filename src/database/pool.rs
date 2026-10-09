@@ -1042,9 +1042,56 @@ impl DatabasePool {
         .map_err(|e| anyhow::anyhow!("Failed to expire stale pending downloads: {}", e))
     }
 
-    /// Check if user has active premium status **on one bot**.
-    pub async fn is_user_premium(&self, bot_id: &str, user_id: i64) -> bool {
+    /// Broadcast recipients of one bot as (telegram_id, bot_id) pairs.
+    pub async fn get_broadcast_recipients_this_bot(
+        &self,
+        bot_id: &str,
+    ) -> Result<Vec<(i64, String)>, anyhow::Error> {
         let bot_owned = bot_id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let mut stmt =
+                conn.prepare("SELECT telegram_id, bot_id FROM users WHERE bot_id = ?1")?;
+            let users_iter = stmt.query_map(params![bot_owned], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut users = Vec::new();
+            for user_result in users_iter {
+                users.push(user_result?);
+            }
+            Ok(users)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get broadcast recipients: {}", e))
+    }
+
+    /// Broadcast recipients across all bots, one row per human, sent from the
+    /// bot of their most recent activity. Deterministic on ties (bot_id DESC);
+    /// NULL last_active sorts last, so never-active rows lose.
+    pub async fn get_broadcast_recipients_all(
+        &self,
+    ) -> Result<Vec<(i64, String)>, anyhow::Error> {
+        self.execute_with_timeout(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT u.telegram_id, u.bot_id FROM users u \
+                 WHERE u.rowid = (SELECT rowid FROM users \
+                 WHERE telegram_id = u.telegram_id \
+                 ORDER BY last_active DESC, bot_id DESC LIMIT 1)",
+            )?;
+            let users_iter = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut users = Vec::new();
+            for user_result in users_iter {
+                users.push(user_result?);
+            }
+            Ok(users)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get broadcast recipients: {}", e))
+    }
+
+    /// Check if user has active premium status **on one bot**.
+    pub async fn is_user_premium(&self, bot_id: &str, user_id: i64) -> bool {        let bot_owned = bot_id.to_string();
         let result = self.execute_with_timeout(move |conn| {
             let is_premium: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM users WHERE bot_id = ?1 AND telegram_id = ?2 AND premium_until > datetime('now'))",

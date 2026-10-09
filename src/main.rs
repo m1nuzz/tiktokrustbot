@@ -297,6 +297,7 @@ async fn main() -> Result<(), Error> {
     // primary uploader for the shared download paths until Phase 2в routes
     // them per ymid.
     let mut bots = std::collections::HashMap::new();
+    let mut bot_dir_map = std::collections::HashMap::new();
     for cfg in &configured {
         bots.insert(
             cfg.id.clone(),
@@ -306,7 +307,11 @@ async fn main() -> Result<(), Error> {
                 bot: cfg.bot.clone(),
             },
         );
+        // Same clients, plain map: All-bots broadcasts send from the bot
+        // each recipient last used.
+        bot_dir_map.insert(cfg.id.clone(), cfg.bot.clone());
     }
+    let bot_directory: tiktokdownloader::BotDirectory = std::sync::Arc::new(bot_dir_map);
     let primary_uploader = configured
         .first()
         .map(|cfg| cfg.uploader.clone())
@@ -386,6 +391,7 @@ async fn main() -> Result<(), Error> {
             .dependencies(dptree::deps![
                 dialogue::InMemStorage::<BroadcastState>::new(),
                 BotCtx { bot_id: cfg.id.clone() },
+                bot_directory.clone(),
                 fetcher.clone(),
                 cfg.uploader,
                 db_pool.clone(),
