@@ -680,10 +680,12 @@
             showNoAds();
         }
 
-        // The retry popup was not counted either. Nothing left to try, so the
-        // video goes out anyway after a short wait.
+        // The retry popup was not counted either. Nothing left to try: claim
+        // at once (server auto-delivers every display now, so this finds a
+        // completed row and closes).
         function deliverAfterFailedRetry() {
-            setTimeout(() => { autoClaim(); startPolling(); }, 15000);
+            autoClaim();
+            startPolling();
         }
 
         function trySDKAd(fromRecovery) {
