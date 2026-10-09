@@ -708,20 +708,25 @@ impl DatabasePool {
     }
 
     /// (valued, non_valued) postback counts for the last `days` days.
-    pub async fn get_postback_stats(&self, days: i64) -> Result<(i64, i64), anyhow::Error> {
+    /// `bot_id = None` counts every bot (the aggregate view); `Some` counts
+    /// only postbacks whose ymid resolves to that bot's row. Postbacks carry
+    /// no bot column themselves, so the join is a LEFT JOIN: unattributed
+    /// rows still count in the aggregate, never in a single bot.
+    pub async fn get_postback_stats(&self, bot_id: Option<&str>, days: i64) -> Result<(i64, i64), anyhow::Error> {
+        let bot_opt: Option<String> = bot_id.map(str::to_string);
         self.execute_with_timeout(move |conn| {
             let since = format!("date('now', '-{} days')", days - 1);
             let valued: i64 = conn
                 .query_row(
-                    &format!("SELECT COUNT(*) FROM monetag_postbacks WHERE date(created_at) >= {since} AND reward_event_type = 'valued'"),
-                    [],
+                    &format!("SELECT COUNT(*) FROM monetag_postbacks m LEFT JOIN pending_downloads p ON p.id = m.ymid WHERE date(m.created_at) >= {since} AND m.reward_event_type = 'valued' AND (?1 IS NULL OR p.bot_id = ?1)"),
+                    params![bot_opt],
                     |r| r.get(0),
                 )
                 .unwrap_or(0);
             let non_valued: i64 = conn
                 .query_row(
-                    &format!("SELECT COUNT(*) FROM monetag_postbacks WHERE date(created_at) >= {since} AND reward_event_type != 'valued'"),
-                    [],
+                    &format!("SELECT COUNT(*) FROM monetag_postbacks m LEFT JOIN pending_downloads p ON p.id = m.ymid WHERE date(m.created_at) >= {since} AND m.reward_event_type != 'valued' AND (?1 IS NULL OR p.bot_id = ?1)"),
+                    params![bot_opt],
                     |r| r.get(0),
                 )
                 .unwrap_or(0);
@@ -863,27 +868,30 @@ impl DatabasePool {
 
     /// Per-day aggregates for the last `days` days, oldest first.
     /// Pass admin ids to exclude admin (test/self) traffic.
-    pub async fn get_weekly_stats(&self, days: i64, exclude_admins: &[i64]) -> Result<Vec<WeeklyDayStats>, anyhow::Error> {
+    /// `bot_id = None` aggregates every bot; `Some` scopes to one bot.
+    pub async fn get_weekly_stats(&self, bot_id: Option<&str>, days: i64, exclude_admins: &[i64]) -> Result<Vec<WeeklyDayStats>, anyhow::Error> {
         let excl_u = admin_filter_sql("telegram_id", exclude_admins);
         let excl_d = admin_filter_sql("user_telegram_id", exclude_admins);
+        let bot_opt: Option<String> = bot_id.map(str::to_string);
         let mut out = Vec::new();
         for d in (0..days).rev() {
             let excl_u = excl_u.clone();
             let excl_d = excl_d.clone();
+            let bot_p = bot_opt.clone();
             let day = self.execute_with_timeout(move |conn| {
                 let day_sql = format!("date('now', '-{} days')", d);
                 let unique_users: i64 = conn.query_row(
-                    &format!("SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = {day_sql}{excl_u}"),
-                    [], |r| r.get(0)).unwrap_or(0);
+                    &format!("SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = {day_sql}{excl_u} AND (?1 IS NULL OR bot_id = ?1)"),
+                    params![bot_p], |r| r.get(0)).unwrap_or(0);
                 let new_users: i64 = conn.query_row(
-                    &format!("SELECT COUNT(*) FROM users WHERE date(created_at) = {day_sql}{excl_u}"),
-                    [], |r| r.get(0)).unwrap_or(0);
+                    &format!("SELECT COUNT(*) FROM users WHERE date(created_at) = {day_sql}{excl_u} AND (?1 IS NULL OR bot_id = ?1)"),
+                    params![bot_p], |r| r.get(0)).unwrap_or(0);
                 let downloads: i64 = conn.query_row(
-                    &format!("SELECT COUNT(*) FROM downloads WHERE date(download_date) = {day_sql}{excl_d}"),
-                    [], |r| r.get(0)).unwrap_or(0);
+                    &format!("SELECT COUNT(*) FROM downloads WHERE date(download_date) = {day_sql}{excl_d} AND (?1 IS NULL OR bot_id = ?1)"),
+                    params![bot_p], |r| r.get(0)).unwrap_or(0);
                 let blocks: i64 = conn.query_row(
-                    &format!("SELECT COUNT(*) FROM blocks WHERE date(blocked_at) = {day_sql}"),
-                    [], |r| r.get(0)).unwrap_or(0);
+                    &format!("SELECT COUNT(*) FROM blocks WHERE date(blocked_at) = {day_sql} AND (?1 IS NULL OR bot_id = ?1)"),
+                    params![bot_p], |r| r.get(0)).unwrap_or(0);
                 Ok((unique_users, new_users, downloads, blocks))
             }).await?;
             let date = (chrono::Local::now() - chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
@@ -896,46 +904,49 @@ impl DatabasePool {
     /// S0 registrations, S1 links sent, S2 ads watched, S3 claimed,
     /// S4 delivered, plus drop-off reasons. Admin traffic excluded via
     /// `exclude_admins` (the funnel diagnoses real users).
-    pub async fn get_funnel_stats(&self, days: i64, exclude_admins: &[i64]) -> Result<Vec<FunnelDayStats>, anyhow::Error> {
+    /// `bot_id = None` aggregates every bot; `Some` scopes to one bot.
+    pub async fn get_funnel_stats(&self, bot_id: Option<&str>, days: i64, exclude_admins: &[i64]) -> Result<Vec<FunnelDayStats>, anyhow::Error> {
         let excl_u = admin_filter_sql("telegram_id", exclude_admins);
         let excl_p = admin_filter_sql("user_id", exclude_admins);
         let excl_d = admin_filter_sql("user_telegram_id", exclude_admins);
         let excl_f = admin_filter_sql("f.user_telegram_id", exclude_admins);
+        let bot_opt: Option<String> = bot_id.map(str::to_string);
         let mut out = Vec::new();
         for d in (0..days).rev() {
             let excl_u = excl_u.clone();
             let excl_p = excl_p.clone();
             let excl_d = excl_d.clone();
             let excl_f = excl_f.clone();
+            let bot_p = bot_opt.clone();
             let day = self.execute_with_timeout(move |conn| {
                 let day_sql = format!("date('now', '-{} days')", d);
                 let started: i64 = conn.query_row(
-                    &format!("SELECT COUNT(*) FROM users WHERE date(created_at) = {day_sql}{excl_u}"),
-                    [], |r| r.get(0)).unwrap_or(0);
+                    &format!("SELECT COUNT(*) FROM users WHERE date(created_at) = {day_sql}{excl_u} AND (?1 IS NULL OR bot_id = ?1)"),
+                    params![bot_p], |r| r.get(0)).unwrap_or(0);
                 let link_sent: i64 = conn.query_row(
-                    &format!("SELECT COUNT(DISTINCT user_id) FROM pending_downloads WHERE date(created_at) = {day_sql}{excl_p}"),
-                    [], |r| r.get(0)).unwrap_or(0);
+                    &format!("SELECT COUNT(DISTINCT user_id) FROM pending_downloads WHERE date(created_at) = {day_sql}{excl_p} AND (?1 IS NULL OR bot_id = ?1)"),
+                    params![bot_p], |r| r.get(0)).unwrap_or(0);
                 let ad_watched: i64 = conn.query_row(
-                    &format!("SELECT COUNT(DISTINCT user_id) FROM pending_downloads WHERE date(created_at) = {day_sql} AND status IN ('verified', 'completed'){excl_p}"),
-                    [], |r| r.get(0)).unwrap_or(0);
+                    &format!("SELECT COUNT(DISTINCT user_id) FROM pending_downloads WHERE date(created_at) = {day_sql} AND status IN ('verified', 'completed'){excl_p} AND (?1 IS NULL OR bot_id = ?1)"),
+                    params![bot_p], |r| r.get(0)).unwrap_or(0);
                 let claimed: i64 = conn.query_row(
-                    &format!("SELECT COUNT(DISTINCT user_id) FROM pending_downloads WHERE date(created_at) = {day_sql} AND status = 'completed'{excl_p}"),
-                    [], |r| r.get(0)).unwrap_or(0);
+                    &format!("SELECT COUNT(DISTINCT user_id) FROM pending_downloads WHERE date(created_at) = {day_sql} AND status = 'completed'{excl_p} AND (?1 IS NULL OR bot_id = ?1)"),
+                    params![bot_p], |r| r.get(0)).unwrap_or(0);
                 let delivered: i64 = conn.query_row(
-                    &format!("SELECT COUNT(DISTINCT user_telegram_id) FROM downloads WHERE date(download_date) = {day_sql}{excl_d}"),
-                    [], |r| r.get(0)).unwrap_or(0);
+                    &format!("SELECT COUNT(DISTINCT user_telegram_id) FROM downloads WHERE date(download_date) = {day_sql}{excl_d} AND (?1 IS NULL OR bot_id = ?1)"),
+                    params![bot_p], |r| r.get(0)).unwrap_or(0);
                 let expired: i64 = conn.query_row(
-                    &format!("SELECT COUNT(*) FROM pending_downloads WHERE date(created_at) = {day_sql} AND status = 'expired'{excl_p}"),
-                    [], |r| r.get(0)).unwrap_or(0);
+                    &format!("SELECT COUNT(*) FROM pending_downloads WHERE date(created_at) = {day_sql} AND status = 'expired'{excl_p} AND (?1 IS NULL OR bot_id = ?1)"),
+                    params![bot_p], |r| r.get(0)).unwrap_or(0);
                 let failed: i64 = conn.query_row(
-                    &format!("SELECT COUNT(*) FROM pending_downloads WHERE date(created_at) = {day_sql} AND status = 'failed'{excl_p}"),
-                    [], |r| r.get(0)).unwrap_or(0);
+                    &format!("SELECT COUNT(*) FROM pending_downloads WHERE date(created_at) = {day_sql} AND status = 'failed'{excl_p} AND (?1 IS NULL OR bot_id = ?1)"),
+                    params![bot_p], |r| r.get(0)).unwrap_or(0);
                 let delivered_paid: i64 = conn.query_row(
-                    &format!("SELECT COUNT(*) FROM funnel_events f WHERE date(f.created_at) = {day_sql} AND f.event = 'delivered_valued'{excl_f}"),
-                    [], |r| r.get(0)).unwrap_or(0);
+                    &format!("SELECT COUNT(*) FROM funnel_events f WHERE date(f.created_at) = {day_sql} AND f.event = 'delivered_valued'{excl_f} AND (?1 IS NULL OR f.bot_id = ?1)"),
+                    params![bot_p], |r| r.get(0)).unwrap_or(0);
                 let delivered_free: i64 = conn.query_row(
-                    &format!("SELECT COUNT(*) FROM funnel_events f WHERE date(f.created_at) = {day_sql} AND f.event IN ('delivered_timer', 'delivered_admin'){excl_f}"),
-                    [], |r| r.get(0)).unwrap_or(0);
+                    &format!("SELECT COUNT(*) FROM funnel_events f WHERE date(f.created_at) = {day_sql} AND f.event IN ('delivered_timer', 'delivered_admin'){excl_f} AND (?1 IS NULL OR f.bot_id = ?1)"),
+                    params![bot_p], |r| r.get(0)).unwrap_or(0);
                 Ok((started, link_sent, ad_watched, claimed, delivered, expired, failed, delivered_paid, delivered_free))
             }).await?;
             let date = (chrono::Local::now() - chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
@@ -967,14 +978,16 @@ impl DatabasePool {
 
     /// Top /start ref_codes by registrations in the last `days` days.
     /// `None` means a bare t.me link with no payload.
-    pub async fn get_ref_stats(&self, days: i64) -> Result<Vec<(Option<String>, i64)>, anyhow::Error> {
+    /// `bot_id = None` aggregates every bot; `Some` scopes to one bot.
+    pub async fn get_ref_stats(&self, bot_id: Option<&str>, days: i64) -> Result<Vec<(Option<String>, i64)>, anyhow::Error> {
+        let bot_opt: Option<String> = bot_id.map(str::to_string);
         self.execute_with_timeout(move |conn| {
             let since = format!("date('now', '-{} days')", days - 1);
             let mut stmt = conn.prepare(&format!(
-                "SELECT ref_code, COUNT(*) FROM users WHERE date(created_at) >= {since} GROUP BY ref_code ORDER BY COUNT(*) DESC LIMIT 10"
+                "SELECT ref_code, COUNT(*) FROM users WHERE date(created_at) >= {since} AND (?1 IS NULL OR bot_id = ?1) GROUP BY ref_code ORDER BY COUNT(*) DESC LIMIT 10"
             ))?;
             let rows: Vec<(Option<String>, i64)> = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .query_map(params![bot_opt], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .filter_map(|r| r.ok())
                 .collect();
             Ok(rows)
@@ -1059,17 +1072,18 @@ impl DatabasePool {
         }).await.map_err(|e| anyhow::anyhow!("Failed to set premium for user {} on bot {}: {}", user_id, bot_id, e))
     }
 
-    /// Get list of users with active premium status **on one bot**.
-    pub async fn get_premium_users(&self, bot_id: &str) -> Result<Vec<(i64, String, String)>, anyhow::Error> {
-        let bot_owned = bot_id.to_string();
+    /// Get list of users with active premium status. `Some(bot)` scopes to
+    /// one bot; `None` lists every bot (the aggregate admin view).
+    pub async fn get_premium_users(&self, bot_id: Option<&str>) -> Result<Vec<(i64, String, String)>, anyhow::Error> {
+        let bot_opt: Option<String> = bot_id.map(str::to_string);
         self.execute_with_timeout(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT telegram_id, premium_until, COALESCE(last_active, 'N/A')
                  FROM users 
-                 WHERE bot_id = ?1 AND premium_until > datetime('now')
+                 WHERE (?1 IS NULL OR bot_id = ?1) AND premium_until > datetime('now')
                  ORDER BY premium_until DESC"
             )?;
-            let users_iter = stmt.query_map(params![bot_owned], |row| {
+            let users_iter = stmt.query_map(params![bot_opt], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -1113,73 +1127,75 @@ impl DatabasePool {
     /// Get rich daily statistics
     /// Rich daily stats. Pass admin ids in `exclude_admins` to get the same
     /// numbers without admin (test/self) traffic; empty slice = everyone.
-    pub async fn get_rich_daily_stats(&self, exclude_admins: &[i64]) -> Result<RichDailyStats, anyhow::Error> {
+    /// `bot_id = None` aggregates every bot; `Some` scopes to one bot.
+    pub async fn get_rich_daily_stats(&self, bot_id: Option<&str>, exclude_admins: &[i64]) -> Result<RichDailyStats, anyhow::Error> {
         let excl_u = admin_filter_sql("telegram_id", exclude_admins);
         let excl_d = admin_filter_sql("user_telegram_id", exclude_admins);
         let excl_p = admin_filter_sql("user_id", exclude_admins);
+        let bot_opt: Option<String> = bot_id.map(str::to_string);
         self.execute_with_timeout(move |conn| {
             // Basic counts today
             let unique_users: i64 = conn.query_row(
-                &format!("SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = date('now'){excl_u}"),
-                [], |r| r.get(0)).unwrap_or(0);
+                &format!("SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = date('now'){excl_u} AND (?1 IS NULL OR bot_id = ?1)"),
+                params![bot_opt], |r| r.get(0)).unwrap_or(0);
             
             let yesterday_users: i64 = conn.query_row(
-                &format!("SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = date('now', '-1 day'){excl_u}"),
-                [], |r| r.get(0)).unwrap_or(0);
+                &format!("SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = date('now', '-1 day'){excl_u} AND (?1 IS NULL OR bot_id = ?1)"),
+                params![bot_opt], |r| r.get(0)).unwrap_or(0);
             
             let unique_downloaders: i64 = conn.query_row(
-                &format!("SELECT COUNT(DISTINCT user_telegram_id) FROM downloads WHERE date(download_date) = date('now'){excl_d}"),
-                [], |r| r.get(0)).unwrap_or(0);
+                &format!("SELECT COUNT(DISTINCT user_telegram_id) FROM downloads WHERE date(download_date) = date('now'){excl_d} AND (?1 IS NULL OR bot_id = ?1)"),
+                params![bot_opt], |r| r.get(0)).unwrap_or(0);
 
             let total_downloads: i64 = conn.query_row(
-                &format!("SELECT COUNT(*) FROM downloads WHERE date(download_date) = date('now'){excl_d}"),
-                [], |r| r.get(0)).unwrap_or(0);
+                &format!("SELECT COUNT(*) FROM downloads WHERE date(download_date) = date('now'){excl_d} AND (?1 IS NULL OR bot_id = ?1)"),
+                params![bot_opt], |r| r.get(0)).unwrap_or(0);
 
             let ad_impressions: i64 = conn.query_row(
-                &format!("SELECT COUNT(*) FROM pending_downloads WHERE date(created_at) = date('now'){excl_p}"),
-                [], |r| r.get(0)).unwrap_or(0);
+                &format!("SELECT COUNT(*) FROM pending_downloads WHERE date(created_at) = date('now'){excl_p} AND (?1 IS NULL OR bot_id = ?1)"),
+                params![bot_opt], |r| r.get(0)).unwrap_or(0);
 
             let new_users: i64 = conn.query_row(
-                &format!("SELECT COUNT(*) FROM users WHERE date(created_at) = date('now'){excl_u}"),
-                [], |r| r.get(0)).unwrap_or(0);
+                &format!("SELECT COUNT(*) FROM users WHERE date(created_at) = date('now'){excl_u} AND (?1 IS NULL OR bot_id = ?1)"),
+                params![bot_opt], |r| r.get(0)).unwrap_or(0);
 
             // Payments & Revenue
             let payments_count: i64 = conn.query_row(
-                &format!("SELECT COUNT(*) FROM payments WHERE date(timestamp) = date('now'){excl_p}"),
-                [], |r| r.get(0)).unwrap_or(0);
+                &format!("SELECT COUNT(*) FROM payments WHERE date(timestamp) = date('now'){excl_p} AND (?1 IS NULL OR bot_id = ?1)"),
+                params![bot_opt], |r| r.get(0)).unwrap_or(0);
 
             let revenue_xtr: i64 = conn.query_row(
-                &format!("SELECT COALESCE(SUM(amount), 0) FROM payments WHERE date(timestamp) = date('now'){excl_p}"),
-                [], |r| r.get(0)).unwrap_or(0);
+                &format!("SELECT COALESCE(SUM(amount), 0) FROM payments WHERE date(timestamp) = date('now'){excl_p} AND (?1 IS NULL OR bot_id = ?1)"),
+                params![bot_opt], |r| r.get(0)).unwrap_or(0);
 
             let invoices_sent: i64 = conn.query_row(
-                &format!("SELECT COUNT(*) FROM invoices WHERE date(timestamp) = date('now'){excl_p}"),
-                [], |r| r.get(0)).unwrap_or(0);
+                &format!("SELECT COUNT(*) FROM invoices WHERE date(timestamp) = date('now'){excl_p} AND (?1 IS NULL OR bot_id = ?1)"),
+                params![bot_opt], |r| r.get(0)).unwrap_or(0);
 
             // Peak hour
             let peak_hour_data = conn.query_row(
                 &format!("SELECT strftime('%H', download_date) as hr, COUNT(*) as cnt 
-                 FROM downloads WHERE date(download_date) = date('now'){excl_d}
+                 FROM downloads WHERE date(download_date) = date('now'){excl_d} AND (?1 IS NULL OR bot_id = ?1)
                  GROUP BY hr ORDER BY cnt DESC LIMIT 1"),
-                [], |r| Ok((r.get::<_, String>(0)?.parse::<u32>().unwrap_or(0), r.get::<_, i64>(1)?))
+                params![bot_opt], |r| Ok((r.get::<_, String>(0)?.parse::<u32>().unwrap_or(0), r.get::<_, i64>(1)?))
             ).ok();
 
             // Top 10 downloaders
             let mut stmt = conn.prepare(
                 &format!("SELECT user_telegram_id, COUNT(*) as cnt 
-                 FROM downloads WHERE date(download_date) = date('now'){excl_d}
+                 FROM downloads WHERE date(download_date) = date('now'){excl_d} AND (?1 IS NULL OR bot_id = ?1)
                  GROUP BY user_telegram_id ORDER BY cnt DESC LIMIT 10")
             )?;
-            let top_downloaders = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            let top_downloaders = stmt.query_map(params![bot_opt], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .filter_map(|r| r.ok()).collect();
 
             // 10 Last active
             let mut stmt = conn.prepare(
                 &format!("SELECT telegram_id, strftime('%H:%M', last_active) 
-                 FROM users WHERE date(last_active) = date('now'){excl_u}
+                 FROM users WHERE date(last_active) = date('now'){excl_u} AND (?1 IS NULL OR bot_id = ?1)
                  ORDER BY last_active DESC LIMIT 10")
             )?;
-            let last_active_users = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            let last_active_users = stmt.query_map(params![bot_opt], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .filter_map(|r| r.ok()).collect();
 
             Ok(RichDailyStats {
@@ -1476,7 +1492,7 @@ mod tests {
         pool.record_block("primary", 111).await.unwrap();
         pool.record_block("primary", 222).await.unwrap();
 
-        let week = pool.get_weekly_stats(7, &[]).await.unwrap();
+        let week = pool.get_weekly_stats(None, 7, &[]).await.unwrap();
         assert_eq!(week.len(), 7);
         // Oldest first, newest last.
         assert!(week.first().unwrap().date < week.last().unwrap().date);
@@ -1774,7 +1790,7 @@ mod tests {
             Ok(())
         }).await.unwrap();
 
-        let refs = pool.get_ref_stats(7).await.unwrap();
+        let refs = pool.get_ref_stats(None, 7).await.unwrap();
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0], (Some("site".to_string()), 2));
         assert_eq!(refs[1], (None, 1));
@@ -1838,13 +1854,13 @@ mod tests {
         assert_eq!(n, 1);
 
         // All traffic: S0=4 starters.
-        let all = &pool.get_funnel_stats(7, &[]).await.unwrap()[6];
+        let all = &pool.get_funnel_stats(None, 7, &[]).await.unwrap()[6];
         assert_eq!(all.started, 4);
         assert_eq!(all.link_sent, 3);
         assert_eq!(all.delivered, 2);
 
         // Without admin: admin rows vanish from every stage.
-        let clean = &pool.get_funnel_stats(7, &[999]).await.unwrap()[6];
+        let clean = &pool.get_funnel_stats(None, 7, &[999]).await.unwrap()[6];
         assert_eq!(clean.started, 3);
         assert_eq!(clean.link_sent, 2);
         assert_eq!(clean.ad_watched, 1);
@@ -1858,7 +1874,7 @@ mod tests {
         // Delivery reasons split paid vs free giveaways.
         pool.log_funnel_event("primary", 1, "delivered_valued").await;
         pool.log_funnel_event("primary", 2, "delivered_timer").await;
-        let split = &pool.get_funnel_stats(7, &[999]).await.unwrap()[6];
+        let split = &pool.get_funnel_stats(None, 7, &[999]).await.unwrap()[6];
         assert_eq!(split.delivered_paid, 1);
         assert_eq!(split.delivered_free, 1);
     }
@@ -1885,7 +1901,7 @@ mod tests {
         assert!(pool.is_user_premium("aaa", user_id).await);
 
         // Check premium users list
-        let premium_users = pool.get_premium_users("aaa").await.unwrap();
+        let premium_users = pool.get_premium_users(Some("aaa")).await.unwrap();
         assert_eq!(premium_users.len(), 1);
         assert_eq!(premium_users[0].0, user_id);
     }
@@ -1906,11 +1922,11 @@ mod tests {
 
         // Set initial premium
         pool.set_user_premium("aaa", user_id, 30).await.unwrap();
-        let first_expiry = pool.get_premium_users("aaa").await.unwrap()[0].1.clone();
+        let first_expiry = pool.get_premium_users(Some("aaa")).await.unwrap()[0].1.clone();
 
         // Extend premium
         pool.set_user_premium("aaa", user_id, 30).await.unwrap();
-        let second_expiry = pool.get_premium_users("aaa").await.unwrap()[0].1.clone();
+        let second_expiry = pool.get_premium_users(Some("aaa")).await.unwrap()[0].1.clone();
 
         // Second expiry should be later than first
         assert!(second_expiry > first_expiry);
@@ -1932,7 +1948,7 @@ mod tests {
             Ok(())
         }).await.unwrap();
 
-        let premium_users = pool.get_premium_users("aaa").await.unwrap();
+        let premium_users = pool.get_premium_users(Some("aaa")).await.unwrap();
         assert_eq!(premium_users.len(), 1);
         assert_eq!(premium_users[0].0, 1);
     }

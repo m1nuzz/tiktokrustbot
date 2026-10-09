@@ -8,6 +8,7 @@ pub const BTN_TOGGLE_FAIL_NOTIFS: &str = "Notify Fail: ";
 pub const BTN_BACK: &str = "Back";
 pub const BTN_LANGUAGE: &str = "🌐 Language";
 pub const BTN_AUTO_DETECT: &str = "🌐 Auto-detect";
+pub const BTN_PRICE: &str = "💰 Price";
 
 pub fn is_menu_button(text: &str) -> bool {
     matches!(text,
@@ -27,10 +28,11 @@ pub fn is_system_button(text: &str) -> bool {
         BTN_LANGUAGE | BTN_AUTO_DETECT |
         "📢 Broadcast" | "📊 Stats" | "🏆 Top 10" | "👥 All users" | "💎 Premium Users" | "➕ Add Premium User" |
         "📈 Daily Stats" | "📅 Week" | "🔻 Funnel" |
-        "h265" | "h264" | "audio"
+        "h265" | "h264" | "audio" | BTN_PRICE
     ) || text.starts_with(BTN_TOGGLE_ADS)
       || text.starts_with(BTN_TOGGLE_SUCCESS_NOTIFS)
       || text.starts_with(BTN_TOGGLE_FAIL_NOTIFS)
+      || text.starts_with(BTN_PRICE)
       || crate::i18n::is_language_button(text)
 }
 
@@ -54,5 +56,7 @@ mod tests {
     fn auto_detect_is_system_but_not_menu() {
         assert!(is_system_button(BTN_AUTO_DETECT));
         assert!(is_system_button(BTN_LANGUAGE));
+        assert!(is_system_button(BTN_PRICE));
+        assert!(is_system_button(&format!("{}: 50 ⭐", BTN_PRICE)));
     }
 }

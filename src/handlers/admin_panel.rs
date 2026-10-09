@@ -3,7 +3,7 @@ use teloxide::types::{KeyboardMarkup, KeyboardButton};
 use teloxide::dispatching::dialogue::{InMemStorage, Dialogue};
 use crate::handlers::admin::is_admin;
 use crate::handlers::ui::{
-    BTN_ADMIN_PANEL, BTN_SUBSCRIPTION, BTN_BACK,
+    BTN_ADMIN_PANEL, BTN_SUBSCRIPTION, BTN_BACK, BTN_PRICE,
     BTN_TOGGLE_ADS, BTN_TOGGLE_SUCCESS_NOTIFS, BTN_TOGGLE_FAIL_NOTIFS
 };
 use crate::database::DatabasePool;
@@ -15,9 +15,22 @@ pub const BTN_BROADCAST: &str = "📢 Broadcast";
 
 type MyDialogue = Dialogue<BroadcastState, InMemStorage<BroadcastState>>;
 
+/// Current premium price for one bot: the per-bot override wins, else the
+/// PREMIUM_STARS_PRICE env, else 50. Never fails; shared by the invoice
+/// sender and the admin price button so they can never disagree.
+pub async fn premium_price_for(db_pool: &DatabasePool, bot_id: &str) -> u32 {
+    let env_default = std::env::var("PREMIUM_STARS_PRICE").unwrap_or_else(|_| "50".to_string());
+    db_pool
+        .resolve_bot_setting(bot_id, "premium_stars_price", &env_default)
+        .await
+        .parse::<u32>()
+        .unwrap_or_else(|_| env_default.parse::<u32>().unwrap_or(50))
+}
+
 pub async fn admin_panel_text_handler(
     bot: Bot,
     msg: Message,
+    ctx: BotCtx,
     db_pool: Arc<DatabasePool>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
@@ -31,6 +44,7 @@ pub async fn admin_panel_text_handler(
     let admin_ads_enabled = db_pool.get_setting("admin_ads_enabled").await.map(|v| v == "true").unwrap_or(false);
     let notify_success = db_pool.get_setting("notify_success").await.map(|v| v == "true").unwrap_or(true);
     let notify_fail = db_pool.get_setting("notify_fail").await.map(|v| v == "true").unwrap_or(true);
+    let price = premium_price_for(&db_pool, ctx.bot_id.as_str()).await;
 
     let keyboard = KeyboardMarkup::new(vec![
         vec![KeyboardButton::new("📊 Stats"), KeyboardButton::new("📈 Daily Stats")],
@@ -47,6 +61,7 @@ pub async fn admin_panel_text_handler(
             KeyboardButton::new(format!("{}{}", BTN_TOGGLE_SUCCESS_NOTIFS, if notify_success { "ON ✅" } else { "OFF ❌" })),
             KeyboardButton::new(format!("{}{}", BTN_TOGGLE_FAIL_NOTIFS, if notify_fail { "ON ✅" } else { "OFF ❌" })),
         ],
+        vec![KeyboardButton::new(format!("{}: {} ⭐", BTN_PRICE, price))],
         vec![KeyboardButton::new(BTN_BACK)],
     ])
     .resize_keyboard();
@@ -105,6 +120,50 @@ pub async fn add_premium_user_handler(
     Ok(())
 }
 
+/// Admin typed a price (or /cancel) after the 💰 Price button.
+/// Digits only: anything else re-prompts instead of writing garbage.
+pub async fn set_price_handler(
+    bot: Bot,
+    dialogue: MyDialogue,
+    msg: Message,
+    ctx: BotCtx,
+    db_pool: Arc<DatabasePool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !is_admin(&msg).await {
+        return Ok(());
+    }
+
+    if let Some(text) = msg.text() {
+        if text == "/cancel" {
+            bot.send_message(msg.chat.id, "❌ Cancelled.")
+                .reply_markup(crate::handlers::command::get_main_reply_keyboard())
+                .await?;
+            dialogue.exit().await?;
+            return Ok(());
+        }
+
+        match text.trim().parse::<u32>() {
+            Ok(price) if price > 0 => {
+                if let Err(e) = db_pool.set_bot_setting(ctx.bot_id.as_str(), "premium_stars_price", &price.to_string()).await {
+                    log::error!("Failed to save price: {}", e);
+                    bot.send_message(msg.chat.id, "❌ Database error.").await?;
+                } else {
+                    bot.send_message(msg.chat.id, format!("✅ Premium price for this bot: {} ⭐", price))
+                        .reply_markup(crate::handlers::command::get_main_reply_keyboard())
+                        .await?;
+                    dialogue.exit().await?;
+                }
+            }
+            _ => {
+                bot.send_message(msg.chat.id, "⚠️ Send digits only, e.g. 50 (or /cancel):")
+                    .await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Escape special characters for Telegram MarkdownV2
 pub fn escape_markdown_v2(s: &str) -> String {
     s.replace("_", "\\_")
@@ -130,24 +189,26 @@ pub fn escape_markdown_v2(s: &str) -> String {
 pub async fn daily_stats_text_handler(
     bot: Bot,
     msg: Message,
+    ctx: BotCtx,
     db_pool: Arc<DatabasePool>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
         return Ok(());
     }
 
-    match db_pool.get_rich_daily_stats(&[]).await {
+    let bot_id = Some(ctx.bot_id.as_str());
+    match db_pool.get_rich_daily_stats(bot_id, &[]).await {
         Ok(all) => {
             // Same numbers without admin (test/self) traffic.
             let admins = crate::handlers::admin::admin_ids();
             let s = db_pool
-                .get_rich_daily_stats(&admins)
+                .get_rich_daily_stats(bot_id, &admins)
                 .await
                 .unwrap_or_else(|_| all.clone());
             let user_conv = if s.unique_users > 0 { (s.unique_downloaders as f64 / s.unique_users as f64) * 100.0 } else { 0.0 };
             let inv_pay_cr = if s.invoices_sent > 0 { (s.payments_count as f64 / s.invoices_sent as f64) * 100.0 } else { 0.0 };
-            let (pb_valued, pb_free) = db_pool.get_postback_stats(1).await.unwrap_or((0, 0));
-            let (pb_valued_w, pb_free_w) = db_pool.get_postback_stats(7).await.unwrap_or((0, 0));
+            let (pb_valued, pb_free) = db_pool.get_postback_stats(bot_id, 1).await.unwrap_or((0, 0));
+            let (pb_valued_w, pb_free_w) = db_pool.get_postback_stats(bot_id, 7).await.unwrap_or((0, 0));
             let pb_total = pb_valued + pb_free;
             let uncredited_alert =
                 pb_total >= 10 && (pb_free as f64 / pb_total as f64) > 0.8;
@@ -224,6 +285,19 @@ pub async fn daily_stats_text_handler(
                 ));
             }
 
+            // Aggregate across every bot: one summary row, same exclusions.
+            if let Ok(agg) = db_pool.get_rich_daily_stats(None, &admins).await {
+                let (agg_v, agg_f) = db_pool.get_postback_stats(None, 1).await.unwrap_or((0, 0));
+                response.push_str(&format!(
+                    "\n🌐 *All bots today:* 👥 {} · 📦 {} · ⭐ {} · 💰 {} / 🆓 {}\n",
+                    e(agg.unique_users.to_string()),
+                    e(agg.total_downloads.to_string()),
+                    e(agg.revenue_xtr.to_string()),
+                    e(agg_v.to_string()),
+                    e(agg_f.to_string())
+                ));
+            }
+
             bot.send_message(msg.chat.id, response)
                 .parse_mode(teloxide::types::ParseMode::MarkdownV2)
                 .await?;
@@ -239,15 +313,17 @@ pub async fn daily_stats_text_handler(
 pub async fn weekly_stats_text_handler(
     bot: Bot,
     msg: Message,
+    ctx: BotCtx,
     db_pool: Arc<DatabasePool>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
         return Ok(());
     }
 
+    let bot_id = Some(ctx.bot_id.as_str());
     let admins = crate::handlers::admin::admin_ids();
-    let days_all = db_pool.get_weekly_stats(7, &[]).await;
-    match db_pool.get_weekly_stats(7, &admins).await {
+    let days_all = db_pool.get_weekly_stats(bot_id, 7, &[]).await;
+    match db_pool.get_weekly_stats(bot_id, 7, &admins).await {
         Ok(days) => {
             let e = |s: String| escape_markdown_v2(&s);
             let mut response = String::from("📅 *Weekly Report — last 7 days \\(без админа\\)*\n\n");
@@ -273,12 +349,28 @@ pub async fn weekly_stats_text_handler(
                 e(total_dl.to_string()),
                 e(total_blocks.to_string())
             ));
-            let (pb_valued_w, pb_free_w) = db_pool.get_postback_stats(7).await.unwrap_or((0, 0));
+            let (pb_valued_w, pb_free_w) = db_pool.get_postback_stats(bot_id, 7).await.unwrap_or((0, 0));
             response.push_str(&format!(
                 "📢 *Ads 7d:* 💰 {} · 🆓 {}\n",
                 e(pb_valued_w.to_string()),
                 e(pb_free_w.to_string())
             ));
+            // Aggregate across every bot: summary row + its own ads line.
+            if let Ok(agg_days) = db_pool.get_weekly_stats(None, 7, &admins).await {
+                let (mut au, mut ad) = (0i64, 0i64);
+                for d in &agg_days {
+                    au += d.unique_users;
+                    ad += d.downloads;
+                }
+                let (agg_v, agg_f) = db_pool.get_postback_stats(None, 7).await.unwrap_or((0, 0));
+                response.push_str(&format!(
+                    "🌐 *All bots 7d \\(Σ\\):* 👥 {} 📦 {} · 📢 💰 {} / 🆓 {}\n",
+                    e(au.to_string()),
+                    e(ad.to_string()),
+                    e(agg_v.to_string()),
+                    e(agg_f.to_string())
+                ));
+            }
             if let Ok(all_days) = days_all {
                 let (mut au, mut an, mut ad, mut ab) = (0i64, 0i64, 0i64, 0i64);
                 for d in &all_days {
@@ -295,7 +387,7 @@ pub async fn weekly_stats_text_handler(
                     e(ab.to_string())
                 ));
             }
-            match db_pool.get_ref_stats(7).await {
+            match db_pool.get_ref_stats(bot_id, 7).await {
                 Ok(refs) if !refs.is_empty() => {
                     response.push_str("\n🔗 *Top refs \\(new users, 7d\\):*\n");
                     for (ref_code, count) in &refs {
@@ -307,6 +399,15 @@ pub async fn weekly_stats_text_handler(
                     }
                 }
                 _ => {}
+            }
+            if let Ok(agg_refs) = db_pool.get_ref_stats(None, 7).await {
+                if !agg_refs.is_empty() {
+                    let agg_new: i64 = agg_refs.iter().map(|(_, c)| c).sum();
+                    response.push_str(&format!(
+                        "🌐 *All bots new users 7d:* {}\n",
+                        e(agg_new.to_string())
+                    ));
+                }
             }
             bot.send_message(msg.chat.id, response)
                 .parse_mode(teloxide::types::ParseMode::MarkdownV2)
@@ -331,6 +432,7 @@ fn funnel_conv(step: i64, prev: i64) -> String {
 pub async fn funnel_text_handler(
     bot: Bot,
     msg: Message,
+    ctx: BotCtx,
     db_pool: Arc<DatabasePool>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
@@ -339,7 +441,8 @@ pub async fn funnel_text_handler(
 
     // Funnel diagnoses real users: admin (test/self) traffic excluded.
     let admins = crate::handlers::admin::admin_ids();
-    match db_pool.get_funnel_stats(7, &admins).await {
+    let bot_id = Some(ctx.bot_id.as_str());
+    match db_pool.get_funnel_stats(bot_id, 7, &admins).await {
         Ok(days) => {
             let e = |s: String| escape_markdown_v2(&s);
             let mut response = String::from("🔻 *Conversion Funnel — last 7 days \\(без админа\\)*\n\n");
@@ -359,6 +462,21 @@ pub async fn funnel_text_handler(
                 ));
             }
             response.push_str("S0\\=start · S1\\=sent link · S2\\=watched ad · S3\\=claimed · S4\\=delivered \\(💰\\=valued, 🆓\\=таймер/без зачёта\\)\\. Biggest drop \\= fix first\\.\n");
+            // Aggregate across every bot: one totals row, same exclusions.
+            if let Ok(agg_days) = db_pool.get_funnel_stats(None, 7, &admins).await {
+                let (mut s0, mut s1, mut s4) = (0i64, 0i64, 0i64);
+                for d in &agg_days {
+                    s0 += d.started;
+                    s1 += d.link_sent;
+                    s4 += d.delivered;
+                }
+                response.push_str(&format!(
+                    "🌐 *All bots 7d \\(Σ\\):* S0 {} → S1 {} → S4 {}\n",
+                    e(s0.to_string()),
+                    e(s1.to_string()),
+                    e(s4.to_string())
+                ));
+            }
             bot.send_message(msg.chat.id, response)
                 .parse_mode(teloxide::types::ParseMode::MarkdownV2)
                 .await?;
@@ -374,6 +492,7 @@ pub async fn funnel_text_handler(
 pub async fn admin_ads_text_handler(
     bot: Bot,
     msg: Message,
+    ctx: BotCtx,
     db_pool: Arc<DatabasePool>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
@@ -384,7 +503,7 @@ pub async fn admin_ads_text_handler(
     let next = if !curr { "true" } else { "false" };
     db_pool.set_setting("admin_ads_enabled", next).await?;
     
-    admin_panel_text_handler(bot, msg, db_pool).await
+    admin_panel_text_handler(bot, msg, ctx, db_pool).await
 }
 
 pub async fn premium_users_text_handler(
@@ -399,7 +518,7 @@ pub async fn premium_users_text_handler(
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         return Ok(());
     }
-    let result = db_pool.get_premium_users(ctx.bot_id.as_str()).await;
+    let result = db_pool.get_premium_users(Some(ctx.bot_id.as_str())).await;
 
     match result {
         Ok(users) => {
@@ -412,6 +531,9 @@ pub async fn premium_users_text_handler(
             }
             if users.is_empty() {
                 response.push_str("No active premium users found.");
+            }
+            if let Ok(agg) = db_pool.get_premium_users(None).await {
+                response.push_str(&format!("\n🌐 All bots premium: {}", agg.len()));
             }
             bot.send_message(msg.chat.id, response)
                 .await
@@ -432,6 +554,7 @@ pub async fn premium_users_text_handler(
 pub async fn stats_text_handler(
     bot: Bot,
     msg: Message,
+    ctx: BotCtx,
     db_pool: Arc<DatabasePool>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
@@ -441,19 +564,24 @@ pub async fn stats_text_handler(
         return Ok(());
     }
 
-    let result = db_pool.execute_with_timeout(|conn| {
-        let total_users: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
-        let total_downloads: i64 = conn.query_row("SELECT COUNT(*) FROM downloads", [], |row| row.get(0))?;
-        Ok((total_users, total_downloads))
+    let bot_owned = ctx.bot_id.clone();
+    let result = db_pool.execute_with_timeout(move |conn| {
+        let bot_users: i64 = conn.query_row("SELECT COUNT(*) FROM users WHERE bot_id = ?1", rusqlite::params![bot_owned], |row| row.get(0))?;
+        let bot_downloads: i64 = conn.query_row("SELECT COUNT(*) FROM downloads WHERE bot_id = ?1", rusqlite::params![bot_owned], |row| row.get(0))?;
+        let all_users: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+        let all_downloads: i64 = conn.query_row("SELECT COUNT(*) FROM downloads", [], |row| row.get(0))?;
+        Ok((bot_users, bot_downloads, all_users, all_downloads))
     }).await;
 
     match result {
-        Ok((total_users, total_downloads)) => {
+        Ok((bot_users, bot_downloads, all_users, all_downloads)) => {
             let response = format!(
                 "📊 Statistics\n\n\
-                 👥 Total users: {}\n\
-                 📥 Total downloads: {}",
-                total_users, total_downloads
+                 👥 This bot users: {}\n\
+                 📥 This bot downloads: {}\n\
+                 🌐 All bots users: {}\n\
+                 🌐 All bots downloads: {}",
+                bot_users, bot_downloads, all_users, all_downloads
             );
             bot.send_message(msg.chat.id, response)
                 .await
@@ -473,6 +601,7 @@ pub async fn stats_text_handler(
 pub async fn top10_text_handler(
     bot: Bot,
     msg: Message,
+    ctx: BotCtx,
     db_pool: Arc<DatabasePool>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
@@ -482,16 +611,18 @@ pub async fn top10_text_handler(
         return Ok(());
     }
 
-    let result = db_pool.execute_with_timeout(|conn| {
+    let bot_owned = ctx.bot_id.clone();
+    let result = db_pool.execute_with_timeout(move |conn| {
         let mut stmt = conn.prepare(
             "SELECT user_telegram_id, COUNT(*) as count
              FROM downloads
+             WHERE bot_id = ?1
              GROUP BY user_telegram_id
              ORDER BY count DESC
              LIMIT 10"
         )?;
 
-        let users_iter = stmt.query_map([], |row| {
+        let users_iter = stmt.query_map(rusqlite::params![bot_owned], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
         })?;
 
@@ -499,15 +630,17 @@ pub async fn top10_text_handler(
         for user_result in users_iter {
             users.push(user_result?);
         }
-        Ok(users)
+        let all_downloads: i64 = conn.query_row("SELECT COUNT(*) FROM downloads", [], |row| row.get(0))?;
+        Ok((users, all_downloads))
     }).await;
 
     match result {
-        Ok(users) => {
-            let mut response = String::from("🏆 Top 10 Users\n\n");
+        Ok((users, all_downloads)) => {
+            let mut response = String::from("🏆 Top 10 Users (this bot)\n\n");
             for (index, (user_id, count)) in users.iter().enumerate() {
                 response.push_str(&format!("{}. User {} - {} downloads\n", index + 1, user_id, count));
             }
+            response.push_str(&format!("\n🌐 All bots downloads: {}", all_downloads));
 
             bot.send_message(msg.chat.id, response)
                 .await
@@ -527,6 +660,7 @@ pub async fn top10_text_handler(
 pub async fn all_users_text_handler(
     bot: Bot,
     msg: Message,
+    ctx: BotCtx,
     db_pool: Arc<DatabasePool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
@@ -536,20 +670,24 @@ pub async fn all_users_text_handler(
         return Ok(());
     }
 
-    // SQL query with LEFT JOIN and COUNT
-    let result = db_pool.execute_with_timeout(|conn| {
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+    // SQL query with LEFT JOIN and COUNT. The join matches bot_id on both
+    // sides: without it one bot's users would count another bot's downloads
+    // for the same numeric telegram id.
+    let bot_owned = ctx.bot_id.clone();
+    let result = db_pool.execute_with_timeout(move |conn| {
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM users WHERE bot_id = ?1", rusqlite::params![bot_owned], |row| row.get(0))?;
 
         let mut stmt = conn.prepare(
             "SELECT u.telegram_id, u.last_active, COUNT(d.id) as download_count
              FROM users u
-             LEFT JOIN downloads d ON u.telegram_id = d.user_telegram_id
+             LEFT JOIN downloads d ON u.telegram_id = d.user_telegram_id AND u.bot_id = d.bot_id
+             WHERE u.bot_id = ?1
              GROUP BY u.telegram_id, u.last_active
              ORDER BY download_count DESC
              LIMIT 50"
         )?;
 
-        let users_iter = stmt.query_map([], |row| {
+        let users_iter = stmt.query_map(rusqlite::params![bot_owned], |row| {
             Ok((
                 row.get::<_, i64>(0)?,      // telegram_id
                 row.get::<_, String>(1)?,   // last_active
@@ -561,12 +699,13 @@ pub async fn all_users_text_handler(
         for user_result in users_iter {
             users.push(user_result?);
         }
-        Ok((count, users))
+        let all_count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+        Ok((count, users, all_count))
     }).await;
 
     match result {
-        Ok((total_count, users)) => {
-            let mut response = format!("📊 All Users - Total: {} (last 50)\n\n", total_count);
+        Ok((total_count, users, all_count)) => {
+            let mut response = format!("📊 All Users - This bot: {} (last 50) · 🌐 All bots: {}\n\n", total_count, all_count);
             for (user_id, last_active, downloads) in users.iter() {
                 response.push_str(&format!(
                     "👤 User: {} | 📥 Downloads: {} | 🕒 {}\n",

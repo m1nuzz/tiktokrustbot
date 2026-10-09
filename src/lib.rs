@@ -18,12 +18,12 @@ use handlers::{
     receive_broadcast_message, add_premium_user_handler, start_broadcast,
     handle_broadcast_confirmation, admin_panel_text_handler, command_handler,
     settings_text_handler, format_text_handler, subscription_text_handler,
-    back_text_handler, link_handler, BTN_BROADCAST,
+    back_text_handler, link_handler, BTN_BROADCAST, set_price_handler, premium_price_for,
     all_users_text_handler, stats_text_handler, top10_text_handler, premium_users_text_handler,
     daily_stats_text_handler, admin_ads_text_handler, language_button_handler, language_menu_handler,
     weekly_stats_text_handler, start_with_payload_handler, funnel_text_handler,
 };
-use handlers::ui::{BTN_ADMIN_PANEL, BTN_BACK, BTN_FORMAT, BTN_SETTINGS, BTN_SUBSCRIPTION, BTN_LANGUAGE, BTN_AUTO_DETECT};
+use handlers::ui::{BTN_ADMIN_PANEL, BTN_BACK, BTN_FORMAT, BTN_SETTINGS, BTN_SUBSCRIPTION, BTN_LANGUAGE, BTN_AUTO_DETECT, BTN_PRICE};
 use database::DatabasePool;
 use mtproto_uploader::MTProtoUploader;
 use yt_dlp_interface::YoutubeFetcher;
@@ -148,6 +148,7 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                     Update::filter_message()
                         .branch(dptree::case![BroadcastState::WaitingForMessage].endpoint(receive_broadcast_message))
                         .branch(dptree::case![BroadcastState::WaitingForAddPremiumUserId].endpoint(add_premium_user_handler))
+                        .branch(dptree::case![BroadcastState::WaitingForSetPrice].endpoint(set_price_handler))
                         .branch(dptree::case![BroadcastState::Idle]
                                 .filter(|msg: Message| msg.text().map(|t| t == BTN_BROADCAST).unwrap_or(false))
                                 .endpoint(start_broadcast))
@@ -156,6 +157,14 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                                 .endpoint(|bot: Bot, dialogue: MyDialogue, msg: Message| async move {
                                     bot.send_message(msg.chat.id, "👤 Send the numeric Telegram ID to grant 30 days of Premium (or /cancel):").await?;
                                     dialogue.update(BroadcastState::WaitingForAddPremiumUserId).await?;
+                                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                                }))
+                        .branch(dptree::case![BroadcastState::Idle]
+                                .filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(BTN_PRICE)))
+                                .endpoint(|bot: Bot, dialogue: MyDialogue, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
+                                    let curr = premium_price_for(&db_pool, ctx.bot_id.as_str()).await;
+                                    bot.send_message(msg.chat.id, format!("💰 Current premium price for this bot: {} ⭐\nSend the new price in Stars (digits only) or /cancel:", curr)).await?;
+                                    dialogue.update(BroadcastState::WaitingForSetPrice).await?;
                                     Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
                                 }))
                 )
@@ -260,29 +269,29 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                 .branch(Update::filter_message().filter_command::<Command>().endpoint(command_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_SETTINGS)).endpoint(settings_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_FORMAT)).endpoint(format_text_handler))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_ADMIN_PANEL)).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
-                    admin_panel_text_handler(bot, msg, db_pool).await
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_ADMIN_PANEL)).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
+                    admin_panel_text_handler(bot, msg, ctx, db_pool).await
                 }))
                 .branch(Update::filter_callback_query().filter(|q: CallbackQuery| q.data == Some("buy_premium".to_string())).endpoint(|bot: Bot, q: CallbackQuery, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                     let _ = bot.answer_callback_query(q.id).await;
                     db_pool.log_funnel_event(ctx.bot_id.as_str(), q.from.id.0 as i64, "premium_click").await;
                     handlers::payments::send_premium_invoice(bot, q.from.id.into(), ctx.bot_id.as_str(), db_pool, None).await
                 }))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(handlers::ui::BTN_TOGGLE_ADS))).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+                .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(handlers::ui::BTN_TOGGLE_ADS))).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                     let curr = db_pool.get_setting("ads_enabled").await.map(|v| v == "true").unwrap_or(true);
                     let _ = db_pool.set_setting("ads_enabled", if !curr { "true" } else { "false" }).await;
-                    admin_panel_text_handler(bot, msg, db_pool).await
+                    admin_panel_text_handler(bot, msg, ctx, db_pool).await
                 }))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with("🔔 Admin Ads:"))).endpoint(admin_ads_text_handler))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(handlers::ui::BTN_TOGGLE_SUCCESS_NOTIFS))).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+                .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(handlers::ui::BTN_TOGGLE_SUCCESS_NOTIFS))).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                     let curr = db_pool.get_setting("notify_success").await.map(|v| v == "true").unwrap_or(true);
                     let _ = db_pool.set_setting("notify_success", if !curr { "true" } else { "false" }).await;
-                    admin_panel_text_handler(bot, msg, db_pool).await
+                    admin_panel_text_handler(bot, msg, ctx, db_pool).await
                 }))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(handlers::ui::BTN_TOGGLE_FAIL_NOTIFS))).endpoint(|bot: Bot, msg: Message, db_pool: Arc<DatabasePool>| async move {
+                .branch(Update::filter_message().filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(handlers::ui::BTN_TOGGLE_FAIL_NOTIFS))).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                     let curr = db_pool.get_setting("notify_fail").await.map(|v| v == "true").unwrap_or(true);
                     let _ = db_pool.set_setting("notify_fail", if !curr { "true" } else { "false" }).await;
-                    admin_panel_text_handler(bot, msg, db_pool).await
+                    admin_panel_text_handler(bot, msg, ctx, db_pool).await
                 }))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("📊 Stats")).endpoint(stats_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("📈 Daily Stats")).endpoint(daily_stats_text_handler))

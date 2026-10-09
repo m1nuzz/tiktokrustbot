@@ -72,11 +72,11 @@ async fn test_duplicate_successful_payment_logic_behavior() {
     let user_id = 987654321i64;
 
     process_successful_payment_logic(PRIMARY_BOT_ID, user_id, PREMIUM_PAYLOAD, CURRENCY_XTR, 50, &pool).await.unwrap();
-    let premium_users = pool.get_premium_users(PRIMARY_BOT_ID).await.unwrap();
+    let premium_users = pool.get_premium_users(Some(PRIMARY_BOT_ID)).await.unwrap();
     let first_expiry = premium_users[0].1.clone();
 
     process_successful_payment_logic(PRIMARY_BOT_ID, user_id, PREMIUM_PAYLOAD, CURRENCY_XTR, 50, &pool).await.unwrap();
-    let premium_users = pool.get_premium_users(PRIMARY_BOT_ID).await.unwrap();
+    let premium_users = pool.get_premium_users(Some(PRIMARY_BOT_ID)).await.unwrap();
     let second_expiry = premium_users[0].1.clone();
 
     assert!(second_expiry > first_expiry, "Expiry date should increase (accumulate) on duplicate payment");
@@ -129,10 +129,12 @@ async fn test_payment_premium_is_per_bot() {
     assert!(pool.is_user_premium("aaa", user_id).await);
     assert!(!pool.is_user_premium("bbb", user_id).await);
 
-    let aaa_users = pool.get_premium_users("aaa").await.unwrap();
+    let aaa_users = pool.get_premium_users(Some("aaa")).await.unwrap();
     assert_eq!(aaa_users.len(), 1);
     assert_eq!(aaa_users[0].0, user_id);
-    assert!(pool.get_premium_users("bbb").await.unwrap().is_empty());
+    assert!(pool.get_premium_users(Some("bbb")).await.unwrap().is_empty());
+    // Aggregate sees the payer regardless of bot.
+    assert_eq!(pool.get_premium_users(None).await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -185,7 +187,7 @@ async fn test_rich_daily_stats_logic() {
     }).await.unwrap();
 
     // 3. Get stats
-    let stats = pool.get_rich_daily_stats(&[]).await.unwrap();
+    let stats = pool.get_rich_daily_stats(None, &[]).await.unwrap();
 
     // 4. Verify
     assert_eq!(stats.unique_users, 2); // 101 and 201

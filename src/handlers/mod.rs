@@ -15,6 +15,7 @@ pub use admin_panel::{
     BTN_BROADCAST, admin_panel_text_handler, all_users_text_handler, stats_text_handler,
     top10_text_handler, premium_users_text_handler, add_premium_user_handler,
     daily_stats_text_handler, weekly_stats_text_handler, funnel_text_handler, admin_ads_text_handler,
+    set_price_handler, premium_price_for,
 };
 pub use language::{language_button_handler, language_command_handler, language_keyboard, language_menu_handler};
 pub use broadcast::{

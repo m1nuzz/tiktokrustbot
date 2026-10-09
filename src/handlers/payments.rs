@@ -30,10 +30,7 @@ pub async fn send_premium_invoice(
     db_pool: Arc<DatabasePool>,
     extra_button: Option<InlineKeyboardButton>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let price_val: u32 = env::var("PREMIUM_STARS_PRICE")
-        .unwrap_or_else(|_| "50".to_string())
-        .parse()
-        .unwrap_or(50);
+    let price_val: u32 = crate::handlers::admin_panel::premium_price_for(&db_pool, bot_id).await;
     
     log::info!("[PAYMENT_CHAIN] 1. Initiation: User={}, Amount={} Stars", chat_id, price_val);
 
