@@ -423,15 +423,18 @@ impl DatabasePool {
     /// or job budget exceeded) and return how many rows actually moved, so the
     /// caller can tell "this job failed" from "the row was already terminal".
     ///
-    /// The status guard is the point: without it a row could be flipped to
-    /// `failed` twice - once by the job and once by the sweeper - and the row
-    /// that owns the single failure notification must be unique. Notified
-    /// immediately so the sweeper skips it.
+    /// `completed` is included on purpose: the claim flips `verified` to
+    /// `completed` BEFORE the job runs, so a job that dies mid-download leaves
+    /// a `completed` row with no delivery. The sole caller is the job-failure
+    /// path, and one ymid spawns exactly one job (the atomic claim admits a
+    /// single winner; every other path finds `completed` and does nothing), so
+    /// `completed` at this point always means "claimed but never delivered".
+    /// Notified immediately so the sweeper skips it.
     pub async fn mark_pending_failed(&self, id: &str) -> Result<usize, anyhow::Error> {
         let id_owned = id.to_string();
         self.execute_with_timeout(move |conn| {
             let rows = conn.execute(
-                "UPDATE pending_downloads SET status = 'failed', notified_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('pending', 'verified')",
+                "UPDATE pending_downloads SET status = 'failed', notified_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('pending', 'verified', 'completed')",
                 params![id_owned],
             )?;
             Ok(rows)
@@ -1807,28 +1810,36 @@ mod tests {
     }
 
     /// A row can be failed twice only if the write is unguarded: the sweeper
-    /// and a slow job must not both own the same notification.
+    /// and a slow job must not both own the same notification. A `completed`
+    /// row with no delivery flips to `failed` (claimed but the job died);
+    /// anything already `failed` stays put.
     #[tokio::test]
     async fn mark_pending_failed_only_moves_a_non_terminal_row() {
         let (pool, _file) = setup_test_db().await;
         pool.execute_with_timeout(|conn| {
             conn.execute(
-                "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('delivered', 1, 'http://x', 'completed')",
+                "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('claimed-undelivered', 1, 'http://x', 'completed')",
                 (),
             )?;
             conn.execute(
                 "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('live', 2, 'http://y', 'pending')",
                 (),
             )?;
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status, notified_at) VALUES ('already-failed', 3, 'http://z', 'failed', CURRENT_TIMESTAMP)",
+                (),
+            )?;
             Ok(())
         }).await.unwrap();
 
-        assert_eq!(pool.mark_pending_failed("delivered").await.unwrap(), 0);
+        assert_eq!(pool.mark_pending_failed("claimed-undelivered").await.unwrap(), 1);
         assert_eq!(
-            pool.get_pending_download_status("delivered").await.unwrap(),
-            Some("completed".to_string()),
-            "a delivered row must not be flipped back to failed"
+            pool.get_pending_download_status("claimed-undelivered").await.unwrap(),
+            Some("failed".to_string()),
+            "a claimed-but-undelivered row must become visible as failed"
         );
+
+        assert_eq!(pool.mark_pending_failed("already-failed").await.unwrap(), 0);
 
         assert_eq!(pool.mark_pending_failed("live").await.unwrap(), 1);
         assert_eq!(pool.mark_pending_failed("live").await.unwrap(), 0);

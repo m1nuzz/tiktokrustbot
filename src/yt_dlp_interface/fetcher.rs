@@ -386,7 +386,13 @@ impl YoutubeFetcher {
         if !resp.status().is_success() {
             log::error!("tikwm API returned HTTP {}, delivering original file", resp.status());
             progress_bar.update(80, Some("⬇️ Download completed")).await?;
-            return Ok(primary_path.map(|p| p.to_path_buf()).unwrap_or_else(|| self.output_dir.join(format!("{}_fallback.mp4", filename_stem))));
+            return match primary_path {
+                Some(p) => Ok(p.to_path_buf()),
+                // No primary file and the alternate source failed: return Err,
+                // never a path to a file that was never created (that phantom
+                // Ok died later at fs::metadata with a misleading ENOENT).
+                None => Err(anyhow::anyhow!("No downloadable video for {}", url)),
+            };
         }
 
         // Parse { "code": 0, "data": { "play": "<url>", "wmplay": "<url>", ... } }
@@ -397,7 +403,13 @@ impl YoutubeFetcher {
                 body.get("code")
             );
             progress_bar.update(80, Some("⬇️ Download completed")).await?;
-            return Ok(primary_path.map(|p| p.to_path_buf()).unwrap_or_else(|| self.output_dir.join(format!("{}_fallback.mp4", filename_stem))));
+            return match primary_path {
+                Some(p) => Ok(p.to_path_buf()),
+                // No primary file and the alternate source failed: return Err,
+                // never a path to a file that was never created (that phantom
+                // Ok died later at fs::metadata with a misleading ENOENT).
+                None => Err(anyhow::anyhow!("No downloadable video for {}", url)),
+            };
         }
 
         // Prefer the no-watermark "play" URL; fall back to "wmplay" if absent.
@@ -421,7 +433,13 @@ impl YoutubeFetcher {
             None => {
                 log::error!("tikwm API returned no video URL in data.play/wmplay; delivering original file");
                 progress_bar.update(80, Some("⬇️ Download completed")).await?;
-                return Ok(primary_path.map(|p| p.to_path_buf()).unwrap_or_else(|| self.output_dir.join(format!("{}_fallback.mp4", filename_stem))));
+                return match primary_path {
+                Some(p) => Ok(p.to_path_buf()),
+                // No primary file and the alternate source failed: return Err,
+                // never a path to a file that was never created (that phantom
+                // Ok died later at fs::metadata with a misleading ENOENT).
+                None => Err(anyhow::anyhow!("No downloadable video for {}", url)),
+            };
             }
         };
 
@@ -444,14 +462,26 @@ impl YoutubeFetcher {
                 download_resp.status()
             );
             progress_bar.update(80, Some("⬇️ Download completed")).await?;
-            return Ok(primary_path.map(|p| p.to_path_buf()).unwrap_or_else(|| self.output_dir.join(format!("{}_fallback.mp4", filename_stem))));
+            return match primary_path {
+                Some(p) => Ok(p.to_path_buf()),
+                // No primary file and the alternate source failed: return Err,
+                // never a path to a file that was never created (that phantom
+                // Ok died later at fs::metadata with a misleading ENOENT).
+                None => Err(anyhow::anyhow!("No downloadable video for {}", url)),
+            };
         }
 
         let bytes = download_resp.bytes().await?;
         if bytes.is_empty() {
             log::error!("tikwm CDN returned empty body, delivering original file");
             progress_bar.update(80, Some("⬇️ Download completed")).await?;
-            return Ok(primary_path.map(|p| p.to_path_buf()).unwrap_or_else(|| self.output_dir.join(format!("{}_fallback.mp4", filename_stem))));
+            return match primary_path {
+                Some(p) => Ok(p.to_path_buf()),
+                // No primary file and the alternate source failed: return Err,
+                // never a path to a file that was never created (that phantom
+                // Ok died later at fs::metadata with a misleading ENOENT).
+                None => Err(anyhow::anyhow!("No downloadable video for {}", url)),
+            };
         }
         tokio::fs::write(&fallback_path, &bytes).await?;
         log::info!("tikwm fallback downloaded {} bytes to {:?}", bytes.len(), fallback_path);
@@ -460,7 +490,13 @@ impl YoutubeFetcher {
         if !self.file_has_video(&fallback_path).await {
             log::error!("tikwm fallback file has no video stream, delivering original file");
             progress_bar.update(80, Some("⬇️ Download completed")).await?;
-            return Ok(primary_path.map(|p| p.to_path_buf()).unwrap_or_else(|| self.output_dir.join(format!("{}_fallback.mp4", filename_stem))));
+            return match primary_path {
+                Some(p) => Ok(p.to_path_buf()),
+                // No primary file and the alternate source failed: return Err,
+                // never a path to a file that was never created (that phantom
+                // Ok died later at fs::metadata with a misleading ENOENT).
+                None => Err(anyhow::anyhow!("No downloadable video for {}", url)),
+            };
         }
 
         // If we have a primary_path, try to replace it (rename/copy) so callers see the same file.

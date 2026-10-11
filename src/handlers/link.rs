@@ -303,6 +303,21 @@ pub async fn link_handler(
     ).await
 }
 
+/// Delete partial files of one failed download attempt. Stems are per-attempt
+/// UUIDs, so a prefix match can only hit this attempt's files; unknown output
+/// names (yt-dlp extensions) are why this globs instead of removing one path.
+async fn remove_attempt_partials(file_stem: &str) {
+    let stem = file_stem.strip_prefix("output/").unwrap_or(file_stem);
+    let Ok(mut dir) = tokio::fs::read_dir("output").await else {
+        return;
+    };
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        if entry.file_name().to_string_lossy().starts_with(stem) {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+}
+
 pub async fn process_video_request(
     bot: Bot,
     bot_id: &str,
@@ -373,6 +388,7 @@ pub async fn process_video_request(
             match timeout(DOWNLOAD_TIMEOUT, fut).await {
                 Ok(Ok(path)) => break path,
                 Ok(Err(e)) => {
+                    remove_attempt_partials(&file_stem).await;
                     retries += 1;
                     if retries >= 3 {
                         return Err(e);
@@ -380,6 +396,7 @@ pub async fn process_video_request(
                     tokio::time::sleep(Duration::from_millis(1000 * 2_u64.pow(retries - 1))).await;
                 }
                 Err(_) => {
+                    remove_attempt_partials(&file_stem).await;
                     retries += 1;
                     if retries >= 3 {
                         return Err(anyhow::anyhow!("Download timeout"));

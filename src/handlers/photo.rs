@@ -2,6 +2,7 @@ use teloxide::prelude::*;
 use teloxide::types::{ChatId, InputFile, InputMedia, InputMediaPhoto};
 
 use crate::utils::progress_bar::ProgressBar;
+use crate::utils::temp_file::TempFileGuard;
 use crate::yt_dlp_interface::{PhotoPostFiles, TikwmMeta, YoutubeFetcher};
 
 /// Split a photo count into sendMediaGroup chunks. Telegram allows 2-10 items
@@ -59,6 +60,15 @@ pub async fn handle_photo_post(
     let files: PhotoPostFiles = fetcher
         .download_photo_post(meta, filename_stem, audio_only, progress_bar)
         .await?;
+    // Own every downloaded file: guards drop (delete) on all exits, success
+    // or `?`, so carousel images and the track never leak into output/.
+    let _guards: Vec<TempFileGuard> = files
+        .images
+        .iter()
+        .cloned()
+        .chain(files.audio.clone())
+        .map(TempFileGuard::new)
+        .collect();
     if !audio_only {
         send_photo_post(bot, chat_id, &files, progress_bar)
             .await

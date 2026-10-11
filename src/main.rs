@@ -130,6 +130,35 @@ async fn setup_one_bot(
     })
 }
 
+/// Delete `output/` leftovers older than 2h. Stems are per-attempt UUIDs that
+/// are never reused, no code resumes interrupted jobs, and the longest legit
+/// window (JOB_BUDGET 25min + lease) fits inside 2h with margin — so anything
+/// older cannot belong to a live job. Backstop for kill/OOM leftovers; the
+/// TempFileGuards own everything else.
+async fn prune_stale_output_files() {
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
+    let Ok(mut dir) = tokio::fs::read_dir("output").await else {
+        return;
+    };
+    let mut removed = 0u32;
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let old = entry
+            .metadata()
+            .await
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().unwrap_or_default() > MAX_AGE)
+            .unwrap_or(false);
+        if old {
+            if tokio::fs::remove_file(entry.path()).await.is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    if removed > 0 {
+        log::info!("Pruned {} stale output file(s) older than 2h", removed);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     // 1. Initialize logger IMMEDIATELY
@@ -382,6 +411,8 @@ async fn main() -> Result<(), Error> {
     // One dispatcher per bot sharing everything except identity, dialogue
     // state and uploader. BroadcastState must NOT be shared: dialogue state
     // is per conversation, and conversations belong to one bot.
+
+    prune_stale_output_files().await;
 
     log::info!("Bot initialized in {:.2?}", start_time.elapsed());
     let mut dispatch_tasks = Vec::new();
