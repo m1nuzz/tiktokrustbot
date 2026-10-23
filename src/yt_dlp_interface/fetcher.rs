@@ -909,11 +909,7 @@ impl YoutubeFetcher {
                     let canonical = parent.join(&stem).with_extension("mp4");
                     if path != canonical {
                         if tokio::fs::rename(&path, &canonical).await.is_ok() {
-                            log::info!(
-                                "Normalized merged container {:?} -> {:?}",
-                                path,
-                                canonical
-                            );
+                            log::info!("Normalized merged container {:?} -> {:?}", path, canonical);
                         } else {
                             // Rename failed; deliver the real produced file.
                             log::info!(
