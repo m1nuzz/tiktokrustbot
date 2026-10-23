@@ -308,7 +308,11 @@ pub async fn link_handler(
 /// names (yt-dlp extensions) are why this globs instead of removing one path.
 async fn remove_attempt_partials(file_stem: &str) {
     let stem = file_stem.strip_prefix("output/").unwrap_or(file_stem);
-    let Ok(mut dir) = tokio::fs::read_dir("output").await else {
+    // The bot runs under systemd with cwd = "/", so a relative "output" used
+    // to read the filesystem root and match nothing; resolve the real dir
+    // from the executable's location instead.
+    let output_dir = crate::yt_dlp_interface::fetcher::default_downloads_dir().join("output");
+    let Ok(mut dir) = tokio::fs::read_dir(&output_dir).await else {
         return;
     };
     while let Ok(Some(entry)) = dir.next_entry().await {

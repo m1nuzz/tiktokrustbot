@@ -135,9 +135,11 @@ async fn setup_one_bot(
 /// window (JOB_BUDGET 25min + lease) fits inside 2h with margin — so anything
 /// older cannot belong to a live job. Backstop for kill/OOM leftovers; the
 /// TempFileGuards own everything else.
-async fn prune_stale_output_files() {
+async fn prune_stale_output_files(output_dir: std::path::PathBuf) {
     const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
-    let Ok(mut dir) = tokio::fs::read_dir("output").await else {
+    // Systemd starts the binary without a working directory, so a relative
+    // "output" would point at "/" and silently skip every cleanup.
+    let Ok(mut dir) = tokio::fs::read_dir(&output_dir).await else {
         return;
     };
     let mut removed = 0u32;
@@ -412,7 +414,7 @@ async fn main() -> Result<(), Error> {
     // state and uploader. BroadcastState must NOT be shared: dialogue state
     // is per conversation, and conversations belong to one bot.
 
-    prune_stale_output_files().await;
+    prune_stale_output_files(exe_dir.join("downloads").join("output")).await;
 
     log::info!("Bot initialized in {:.2?}", start_time.elapsed());
     let mut dispatch_tasks = Vec::new();

@@ -229,6 +229,18 @@ impl YoutubeFetcher {
 }
 
 impl YoutubeFetcher {
+    /// Root directory all yt-dlp outputs live under (`<exe_dir>/downloads`,
+    /// handed to `new` in `main()`). Standalone helpers (boot prune, partials
+    /// cleanup) resolve the same path from the executable's location because
+    /// systemd launches the binary with cwd = "/".
+    pub fn default_downloads_dir() -> std::path::PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .map(|exe| exe.join("downloads"))
+            .unwrap_or_else(|| std::path::PathBuf::from("downloads"))
+    }
+
     pub fn new(yt_dlp_path: PathBuf, output_dir: PathBuf, ffmpeg_dir: PathBuf) -> Result<Self> {
         Ok(YoutubeFetcher {
             yt_dlp_path,
@@ -856,35 +868,79 @@ impl YoutubeFetcher {
             let parent = self.output_dir.clone();
             let stem = PathBuf::from(filename_stem);
 
-            // Look for any file produced by yt-dlp that matches the stem.
-            log::debug!("Looking for files in: {:?}", parent);
-            if let Ok(entries) = tokio::fs::read_dir(&parent).await {
+            // The caller embeds a subdirectory in the stem ("output/<uuid>"),
+            // so the produced files live under that subdir of the root dir.
+            let stem_dir = stem
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| parent.join(p))
+                .unwrap_or_else(|| parent.clone());
+            let file_prefix = stem
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| stem.to_string_lossy().to_string());
+
+            // Scan that subdir for the produced file. yt-dlp may merge streams
+            // into a container the forced ".mp4" template did not anticipate:
+            // the merged file is then "<stem>.mp4.mkv" (YouTube shorts with
+            // opus audio). Prefer the exact template name; accept any sibling
+            // sharing the stem prefix and normalize it to "<stem>.mp4" below.
+            if let Ok(entries) = tokio::fs::read_dir(&stem_dir).await {
+                let mut exact_path: Option<PathBuf> = None;
+                let mut sibling_path: Option<PathBuf> = None;
                 let mut entry = entries;
                 while let Ok(Some(file)) = entry.next_entry().await {
                     if let Ok(file_type) = file.file_type().await {
                         if file_type.is_file() {
-                            if let Some(filename) = file.file_name().to_str() {
-                                if filename.starts_with(&*stem.to_string_lossy()) {
-                                    let path = parent.join(filename);
-                                    log::info!(
-                                        "Found downloaded file for {}: {:?}",
-                                        filename_stem,
-                                        path
-                                    );
-                                    log::info!(
-                                        "Download completed successfully in {:.2?} for: {}",
-                                        elapsed,
-                                        url
-                                    );
-                                    return Ok(path);
+                            let name = file.file_name().to_string_lossy().to_string();
+                            if name.starts_with(&file_prefix) {
+                                let path = stem_dir.join(&name);
+                                if name == format!("{}.mp4", file_prefix) {
+                                    exact_path = Some(path);
+                                } else if sibling_path.is_none() {
+                                    sibling_path = Some(path);
                                 }
                             }
                         }
                     }
                 }
+
+                if let Some(path) = exact_path.or(sibling_path) {
+                    let canonical = parent.join(&stem).with_extension("mp4");
+                    if path != canonical {
+                        if tokio::fs::rename(&path, &canonical).await.is_ok() {
+                            log::info!(
+                                "Normalized merged container {:?} -> {:?}",
+                                path,
+                                canonical
+                            );
+                        } else {
+                            // Rename failed; deliver the real produced file.
+                            log::info!(
+                                "Download completed successfully in {:.2?} for: {} with file: {:?}",
+                                elapsed,
+                                url,
+                                path
+                            );
+                            return Ok(path);
+                        }
+                    }
+                    log::info!(
+                        "Found downloaded file for {}: {:?}",
+                        filename_stem,
+                        canonical
+                    );
+                    log::info!(
+                        "Download completed successfully in {:.2?} for: {}",
+                        elapsed,
+                        url
+                    );
+                    return Ok(canonical);
+                }
             }
 
-            // Fall back to known extensions if no stem match was found.
+            // No sibling in the stem dir matched. Fall back to the known
+            // extension probes at the stem path itself, then fail loudly.
             for ext in [
                 ".mp4", ".mov", ".webm", ".mkv", ".flv", ".m4a", ".mp3", ".ogg", ".aac",
             ] {
