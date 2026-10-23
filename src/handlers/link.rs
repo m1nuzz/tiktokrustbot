@@ -322,7 +322,7 @@ pub async fn link_handler(
                     user_id: user_id as i64,
                     username: msg.chat.username().map(|s| s.to_string()).or_else(|| msg.from.as_ref().and_then(|u| u.username.clone())),
                     chat_id: msg.chat.id.0,
-                    lang: lang.clone(),
+                    lang: Some(lang.clone()),
                     created_at: std::time::Instant::now(),
                 },
             );
@@ -419,7 +419,7 @@ pub async fn link_handler(
 pub async fn handle_yt_pick_callback(
     bot: Bot,
     q: CallbackQuery,
-    ctx: BotCtx,
+    _ctx: BotCtx,
     fetcher: Arc<YoutubeFetcher>,
     mtproto_uploader: Arc<MTProtoUploader>,
     db_pool: Arc<DatabasePool>,
