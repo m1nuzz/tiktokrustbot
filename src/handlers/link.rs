@@ -141,7 +141,9 @@ fn classify_download_error(err: &anyhow::Error, url: &str) -> MsgKey {
         || msg.contains("429")
         || msg.contains("too many requests")
         || msg.contains("rate limit")
-        || msg.contains("rate-limit");
+        || msg.contains("rate-limit")
+        || msg.contains("login required")
+        || msg.contains("checkpoint");
     if blocked && (url.contains("youtube.com/") || url.contains("youtu.be/")) {
         return MsgKey::YtBlocked;
     }
