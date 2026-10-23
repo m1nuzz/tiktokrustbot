@@ -330,6 +330,34 @@ pub async fn daily_stats_text_handler(
                     }
                 }
                 response.push_str(&format_top_bots(rows));
+
+                // Week and month leaderboards, same shape, longer windows.
+                for (days, title) in [(7i64, "Top bots week"), (30i64, "Top bots month")] {
+                    let mut period_rows: Vec<TopBotRow> = Vec::new();
+                    for (bid, username) in &bot_list {
+                        if bid == crate::database::PRIMARY_BOT_ID {
+                            continue;
+                        }
+                        if let Ok((users, downloads, revenue)) = db_pool
+                            .get_bot_period_stats(Some(bid.as_str()), days, &admins)
+                            .await
+                        {
+                            let (v, f) = db_pool
+                                .get_postback_stats(Some(bid.as_str()), days)
+                                .await
+                                .unwrap_or((0, 0));
+                            period_rows.push((
+                                username.clone(),
+                                users,
+                                downloads,
+                                revenue,
+                                v,
+                                f,
+                            ));
+                        }
+                    }
+                    response.push_str(&format_top_bots_with_title(title, period_rows));
+                }
             }
 
             bot.send_message(msg.chat.id, response)
@@ -768,13 +796,19 @@ pub type TopBotRow = (String, i64, i64, i64, i64, i64);
 /// Sort most-downloaded first (username breaks ties) and render the
 /// `Top bots today` block in the All-bots one-line shape. Pure so tests pin
 /// the order and the code-span escaping (usernames keep their `_`).
-pub fn format_top_bots(mut rows: Vec<TopBotRow>) -> String {
+pub fn format_top_bots(rows: Vec<TopBotRow>) -> String {
+    format_top_bots_with_title("Top bots today", rows)
+}
+
+/// Same leaderboard shape as [`format_top_bots`], but with a caller-supplied
+/// heading so the daily report can reuse it for week/month windows.
+pub fn format_top_bots_with_title(title: &str, mut rows: Vec<TopBotRow>) -> String {
     rows.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
     if rows.is_empty() {
         return String::new();
     }
     let e = |s: String| escape_markdown_v2(&s);
-    let mut out = String::from("\n🏆 *Top bots today:*\n");
+    let mut out = format!("\n🏆 *{}:*\n", title);
     for (username, users, downloads, revenue, valued, free) in &rows {
         // Inside a MarkdownV2 code span only ` and \ need escaping.
         let u = username.replace('\\', "\\\\").replace('`', "\\`");

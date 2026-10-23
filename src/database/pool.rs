@@ -717,6 +717,54 @@ impl DatabasePool {
             .map_err(|e| anyhow::anyhow!("claim failed for {}: {}", id, e))
     }
 
+    /// Per-bot leaderboard aggregates over the last `days` days: distinct
+    /// active users, total downloads and revenue. Admin ids are excluded from
+    /// every count. Used by the daily report's "Top bots week/month" blocks.
+    pub async fn get_bot_period_stats(
+        &self,
+        bot_id: Option<&str>,
+        days: i64,
+        exclude_admins: &[i64],
+    ) -> Result<(i64, i64, i64), anyhow::Error> {
+        let excl_u = admin_filter_sql("telegram_id", exclude_admins);
+        let excl_d = admin_filter_sql("user_telegram_id", exclude_admins);
+        let excl_p = admin_filter_sql("user_id", exclude_admins);
+        let bot_opt: Option<String> = bot_id.map(str::to_string);
+        let since = format!("date('now', '-{} days')", days.saturating_sub(1).max(0));
+        self.execute_with_timeout(move |conn| {
+            let unique_users: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) >= {since}{excl_u} AND (?1 IS NULL OR bot_id = ?1)"
+                    ),
+                    params![bot_opt],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let total_downloads: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM downloads WHERE date(download_date) >= {since}{excl_d} AND (?1 IS NULL OR bot_id = ?1)"
+                    ),
+                    params![bot_opt],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let revenue_xtr: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE date(timestamp) >= {since}{excl_p} AND (?1 IS NULL OR bot_id = ?1)"
+                    ),
+                    params![bot_opt],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            Ok((unique_users, total_downloads, revenue_xtr))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get bot period stats: {}", e))
+    }
+
     /// (valued, non_valued) postback counts for the last `days` days.
     /// `bot_id = None` counts every bot (the aggregate view); `Some` counts
     /// only postbacks whose ymid resolves to that bot's row. Postbacks carry
