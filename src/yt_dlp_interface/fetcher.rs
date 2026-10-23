@@ -228,19 +228,19 @@ impl YoutubeFetcher {
     }
 }
 
-impl YoutubeFetcher {
-    /// Root directory all yt-dlp outputs live under (`<exe_dir>/downloads`,
-    /// handed to `new` in `main()`). Standalone helpers (boot prune, partials
-    /// cleanup) resolve the same path from the executable's location because
-    /// systemd launches the binary with cwd = "/".
-    pub fn default_downloads_dir() -> std::path::PathBuf {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            .map(|exe| exe.join("downloads"))
-            .unwrap_or_else(|| std::path::PathBuf::from("downloads"))
-    }
+/// Root directory all yt-dlp outputs live under (`<exe_dir>/downloads`,
+/// handed to `YoutubeFetcher::new` in `main()`). Standalone helpers (boot
+/// prune, partials cleanup) resolve the same path from the executable's
+/// location because systemd launches the binary with cwd = "/".
+pub fn default_downloads_dir() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .map(|exe| exe.join("downloads"))
+        .unwrap_or_else(|| std::path::PathBuf::from("downloads"))
+}
 
+impl YoutubeFetcher {
     pub fn new(yt_dlp_path: PathBuf, output_dir: PathBuf, ffmpeg_dir: PathBuf) -> Result<Self> {
         Ok(YoutubeFetcher {
             yt_dlp_path,
