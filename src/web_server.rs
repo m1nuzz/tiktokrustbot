@@ -540,7 +540,8 @@ async fn spawn_download_job(
             None,
             ChatId(user_id),
             Some(lang),
-            Some(ymid)
+            Some(ymid),
+            None
         ).await {
             log::error!("Error processing claimed download: {}", e);
         }

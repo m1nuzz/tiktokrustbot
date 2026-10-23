@@ -28,7 +28,47 @@ use crate::yt_dlp_interface::YoutubeFetcher;
 lazy_static::lazy_static! {
     static ref LAST_SEND: Arc<tokio::sync::Mutex<HashMap<i64, Instant>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     static ref URL_PROCESSING: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+    /// Pending YouTube quality picks: inline-keyboard session id -> request.
+    /// In-memory only: a restart drops pending menus (the user just re-sends
+    /// the link), and nothing in pending_downloads is reserved for them.
+    static ref YT_PICKS: Mutex<HashMap<String, YtPick>> = Mutex::new(HashMap::new());
 }
+
+/// One outstanding YouTube quality menu. `quality_override` semantics live in
+/// `process_video_request`; the numeric height ("1080") or "audio" travels in
+/// the callback data itself, and this struct only reproduces the chat context.
+struct YtPick {
+    url: String,
+    bot_id: String,
+    user_id: i64,
+    username: Option<String>,
+    chat_id: i64,
+    lang: Option<String>,
+    created_at: std::time::Instant,
+}
+
+impl YtPick {
+    /// Menus older than this are dropped lazily on the next insert/lookup;
+    /// the inline buttons stay tappable (the callback answers with
+    /// "session expired" instead of a silent stop).
+    const TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+    fn is_fresh(&self) -> bool {
+        self.created_at.elapsed() < Self::TTL
+    }
+}
+
+/// Evicts stale YT picks; called with the map lock already held.
+fn prune_stale_yt_picks(map: &mut HashMap<String, YtPick>) {
+    map.retain(|_, pick| pick.is_fresh());
+}
+
+/// True when the parsed URL is a YouTube link (the only platform served with
+/// the quality picker). TikTok and Instagram keep the ad-flow / default path.
+fn is_youtube_url(url: &str) -> bool {
+    url.contains("youtube.com/") || url.contains("youtu.be/")
+}
+
 
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes per download attempt
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes per upload attempt
@@ -82,15 +122,33 @@ impl Drop for UrlProcessingGuard {
 
 /// Tier 1: classify a terminal download error for an immediate, localised
 /// reply instead of leaking the raw tool output to the user.
-fn classify_download_error(err: &anyhow::Error) -> MsgKey {
+fn classify_download_error(err: &anyhow::Error, url: &str) -> MsgKey {
     let msg = err.to_string().to_lowercase();
     if msg.contains("unsupported url") {
-        MsgKey::UnsupportedFormat
-    } else if msg.contains("timed out") || msg.contains("timeout") {
-        MsgKey::DownloadTimeout
-    } else {
-        MsgKey::DownloadFailed
+        return MsgKey::UnsupportedFormat;
     }
+    if msg.contains("timed out") || msg.contains("timeout") {
+        return MsgKey::DownloadTimeout;
+    }
+    // Platform-level blocks: yt-dlp surfaces them as bot checks, 403s and
+    // rate limits, not as "this video is gone". Tell the user the platform is
+    // temporarily unavailable instead of implying the link itself is broken.
+    let blocked = msg.contains("sign in to confirm")
+        || msg.contains("not a bot")
+        || msg.contains("captcha")
+        || msg.contains("http error 403")
+        || msg.contains("403: forbidden")
+        || msg.contains("429")
+        || msg.contains("too many requests")
+        || msg.contains("rate limit")
+        || msg.contains("rate-limit");
+    if blocked && (url.contains("youtube.com/") || url.contains("youtu.be/")) {
+        return MsgKey::YtBlocked;
+    }
+    if blocked && url.contains("instagram.com/") {
+        return MsgKey::IgBlocked;
+    }
+    MsgKey::DownloadFailed
 }
 
 /// Which message an expired session earns.
@@ -243,6 +301,54 @@ pub async fn link_handler(
         }
     };
 
+    // YouTube quality picker: probe available heights and show buttons.
+    // Not routed through the Monetag mini-app: the SDK only pays for TikTok/IG
+    // traffic, so an ad session here would make the user watch ads for money
+    // the funnel never receives. The chosen quality rides in the callback data.
+    if is_youtube_url(&url) {
+        let heights = fetcher.probe_youtube_heights(&url).await;
+        if !heights.is_empty() {
+            let mut picks = YT_PICKS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            prune_stale_yt_picks(&mut picks);
+
+            let key = Uuid::new_v4().to_string();
+            picks.insert(
+                key.clone(),
+                YtPick {
+                    url: url.clone(),
+                    bot_id: bot_id.to_string(),
+                    user_id: user_id as i64,
+                    username: msg.chat.username().map(|s| s.to_string()).or_else(|| msg.from.as_ref().and_then(|u| u.username.clone())),
+                    chat_id: msg.chat.id.0,
+                    lang: lang.clone(),
+                    created_at: std::time::Instant::now(),
+                },
+            );
+            drop(picks);
+
+            // Buttons run top-down from the tallest height; climbs beyond
+            // eight rows look broken in a chat window, so cap the menu there.
+            let mut rows: Vec<Vec<InlineKeyboardButton>> = heights
+                .iter()
+                .rev()
+                .take(8)
+                .map(|h| vec![InlineKeyboardButton::callback(format!("{}p", h), format!("ytq|{}|{}", key, h))])
+                .collect();
+            rows.push(vec![InlineKeyboardButton::callback(
+                i18n::t(MsgKey::YtAudioOnly, Some(lang.as_str())),
+                format!("yta|{}", key),
+            )]);
+
+            bot.send_message(msg.chat.id, i18n::t(MsgKey::YtQualityPick, Some(lang.as_str())))
+                .reply_markup(InlineKeyboardMarkup::new(rows))
+                .await?;
+            return Ok(());
+        }
+        // Probe failed (private/live streams etc.): default download flow.
+    }
+
     // Mini App Ad invitation logic (single source of truth, shared with /api/ads-status)
     let is_user_admin = is_admin(&msg).await;
     let ads_enabled = ads_enabled_for(&db_pool, bot_id, user_id as i64, is_user_admin).await;
@@ -300,7 +406,88 @@ pub async fn link_handler(
         msg.chat.id,
         Some(lang),
         None,
+        None,
     ).await
+}
+
+/// Handles a tap on one of the YouTube quality-picker inline buttons.
+///
+/// The menu stores its request in [`YT_PICKS`] keyed by a UUID; the callback
+/// data carries only that key plus the chosen height (or the audio marker).
+/// A tap consumes the pick: one menu can be answered once, and a stale pick
+/// (restart, 30-minute TTL, pruned map) just answers with the expiry text.
+pub async fn handle_yt_pick_callback(
+    bot: Bot,
+    q: CallbackQuery,
+    ctx: BotCtx,
+    fetcher: Arc<YoutubeFetcher>,
+    mtproto_uploader: Arc<MTProtoUploader>,
+    db_pool: Arc<DatabasePool>,
+    task_manager: Arc<tokio::sync::Mutex<TaskManager>>,
+    upload_semaphore: Arc<tokio::sync::Semaphore>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _ = bot.answer_callback_query(q.id.clone()).await;
+
+    let Some(data) = q.data.as_deref() else {
+        return Ok(());
+    };
+    let quality = if data.starts_with("ytq|") {
+        data.strip_prefix("ytq|")
+            .and_then(|rest| rest.split('|').nth(1))
+            .map(|h| h.to_string())
+    } else if data.starts_with("yta|") {
+        Some("audio".to_string())
+    } else {
+        None
+    };
+    let key = data
+        .strip_prefix("ytq|")
+        .or_else(|| data.strip_prefix("yta|"))
+        .map(|rest| rest.split('|').next().unwrap_or(rest).to_string());
+
+    let (Some(quality), Some(key)) = (quality, key) else {
+        log::warn!("YT pick callback with unexpected data: {}", data);
+        return Ok(());
+    };
+
+    let pick = {
+        let mut picks = YT_PICKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_stale_yt_picks(&mut picks);
+        picks.remove(&key)
+    };
+    let Some(pick) = pick.filter(YtPick::is_fresh) else {
+        // The menu only lives in memory; a restart, the 30-minute TTL or a
+        // foreign bot process dropped it, so there is nothing to deliver.
+        log::info!("YT pick {} missing or stale; ignoring tap", key);
+        return Ok(());
+    };
+
+    log::info!(
+        "YT pick accepted: user {} -> {} (quality {})",
+        pick.user_id,
+        pick.url,
+        quality
+    );
+
+    process_video_request(
+        bot,
+        &pick.bot_id,
+        pick.user_id,
+        pick.url.clone(),
+        fetcher,
+        mtproto_uploader,
+        db_pool,
+        task_manager,
+        upload_semaphore,
+        pick.username.clone(),
+        ChatId(pick.chat_id),
+        pick.lang.clone(),
+        None,
+        Some(quality),
+    )
+    .await
 }
 
 /// Delete partial files of one failed download attempt. Stems are per-attempt
@@ -336,9 +523,14 @@ pub async fn process_video_request(
     chat_id: ChatId,
     lang: Option<String>,
     ymid: Option<String>,
+    quality_override: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Get user quality preference
-    let quality_preference = db_pool.get_user_quality(bot_id, user_id).await.unwrap_or_else(|_| "best".to_string());
+    // Get user quality preference: the YT picker callbacks pass an explicit
+    // numeric height ("1080") or "audio" instead of the stored default.
+    let quality_preference = match quality_override {
+        Some(q) => q,
+        None => db_pool.get_user_quality(bot_id, user_id).await.unwrap_or_else(|_| "best".to_string()),
+    };
     let fingerprint = crate::handlers::fingerprint::get_current_fingerprint(db_pool.clone()).await;
     let is_audio = quality_preference == "audio";
 
@@ -487,7 +679,7 @@ pub async fn process_video_request(
         }
         Ok(Err(e)) => {
             // Tier 1: the bot knows why it failed — say so immediately.
-            let key = classify_download_error(&e);
+            let key = classify_download_error(&e, &url);
             fail_request(&bot, chat_id, &db_pool, &ymid, &url, &e, key, lang.as_deref(), &mut progress_bar).await;
             Ok(())
         }
@@ -509,16 +701,33 @@ mod tests {
     #[test]
     fn download_errors_classified_for_immediate_reply() {
         let unsupported = anyhow::anyhow!("yt-dlp failed: ERROR: Unsupported URL: https://www.tiktok.com/@u/photo/1");
-        assert_eq!(classify_download_error(&unsupported), crate::i18n::MsgKey::UnsupportedFormat);
+        assert_eq!(classify_download_error(&unsupported, "https://example.com"), crate::i18n::MsgKey::UnsupportedFormat);
 
         let timed_out = anyhow::anyhow!("Download timeout");
-        assert_eq!(classify_download_error(&timed_out), crate::i18n::MsgKey::DownloadTimeout);
+        assert_eq!(classify_download_error(&timed_out, "https://example.com"), crate::i18n::MsgKey::DownloadTimeout);
 
         let upload_timed_out = anyhow::anyhow!("Upload timed out after 300 seconds");
-        assert_eq!(classify_download_error(&upload_timed_out), crate::i18n::MsgKey::DownloadTimeout);
+        assert_eq!(classify_download_error(&upload_timed_out, "https://example.com"), crate::i18n::MsgKey::DownloadTimeout);
 
         let generic = anyhow::anyhow!("yt-dlp failed: ERROR: Video unavailable");
-        assert_eq!(classify_download_error(&generic), crate::i18n::MsgKey::DownloadFailed);
+        assert_eq!(classify_download_error(&generic, "https://example.com"), crate::i18n::MsgKey::DownloadFailed);
+
+        let yt_block = anyhow::anyhow!("yt-dlp failed: Sign in to confirm you're not a bot");
+        assert_eq!(
+            classify_download_error(&yt_block, "https://youtu.be/abc"),
+            crate::i18n::MsgKey::YtBlocked
+        );
+        let ig_block = anyhow::anyhow!("Instagram login required");
+        assert_eq!(
+            classify_download_error(&ig_block, "https://www.instagram.com/reel/abc/"),
+            crate::i18n::MsgKey::IgBlocked
+        );
+        // A blocked-looking message from an unrelated platform keeps the
+        // generic text: the warning names a platform for a reason.
+        assert_eq!(
+            classify_download_error(&yt_block, "https://www.tiktok.com/@u/video/1"),
+            crate::i18n::MsgKey::DownloadFailed
+        );
     }
 
     /// One message per row: the job budget has to end before the lease window

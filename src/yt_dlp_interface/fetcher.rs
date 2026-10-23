@@ -732,6 +732,63 @@ impl YoutubeFetcher {
         }
     }
 
+    /// Lists available video heights for an external URL without downloading.
+    /// Returns unique heights sorted ascending. Empty vec on any failure — the
+    /// caller falls back to the plain download path (no quality picker shown).
+    ///
+    /// Deliberately minimal flags: TikTok downloads must keep their custom
+    /// flags (this probe runs before the user picks quality), and a playlist
+    /// link must degrade to its single entry, not dump mb of JSON.
+    pub async fn probe_youtube_heights(&self, url: &str) -> Vec<u32> {
+        log::info!("🔎 Probing available formats for {}", url);
+        let probe = Command::new(&self.yt_dlp_path)
+            .arg("--dump-single-json")
+            .arg("--no-warnings")
+            .arg("--no-playlist")
+            .arg("--retries")
+            .arg("1")
+            .arg(url)
+            .output();
+
+        // yt-dlp with retries can take a while on throttled CDNs; the picker is
+        // only allowed a bounded wait, otherwise the user stares at silence.
+        let output = match tokio::time::timeout(std::time::Duration::from_secs(45), probe).await {
+            Ok(Ok(out)) if out.status.success() => out,
+            _ => {
+                log::warn!("Format probe failed for {}; continuing without quality picker", url);
+                return Vec::new();
+            }
+        };
+
+        let parsed = match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("Format probe returned non-JSON for {}: {}", url, e);
+                return Vec::new();
+            }
+        };
+
+        let mut heights: Vec<u32> = parsed
+            .get("formats")
+            .and_then(|f| f.as_array())
+            .map(|formats| {
+                formats
+                    .iter()
+                    // Video streams for progressive "best" downloads only;
+                    // audio-only formats have vcodec "none".
+                    .filter(|f| f.get("vcodec").and_then(|v| v.as_str()) != Some("none"))
+                    .filter_map(|f| f.get("height").and_then(|h| h.as_u64()))
+                    .filter(|h| *h > 0)
+                    .map(|h| h as u32)
+                    .collect()
+            })
+            .unwrap_or_default();
+        heights.sort_unstable();
+        heights.dedup();
+        log::info!("Format probe for {} found heights {:?}", url, heights);
+        heights
+    }
+
     /// Runs yt-dlp for the given quality and reports download progress into the slice
     /// of the progress bar defined by [start_pct, end_pct]. Returns the produced file path.
     async fn run_yt_dlp(
@@ -787,6 +844,14 @@ impl YoutubeFetcher {
             cmd.arg("-S").arg("vcodec:avc,mres");
         } else if quality == "audio" {
             cmd.arg("-x").arg("--audio-format").arg("best");
+        } else if let Ok(max_height) = quality.parse::<u32>() {
+            // YouTube quality picker: the callback stored a numeric height cap
+            // ("720", "1080"...). Take the best streams up to that height and
+            // fall back to lower heights, then to a combined progressive file.
+            cmd.arg("-f").arg(format!(
+                "bestvideo[height<={}]+bestaudio/best[height<={}]",
+                max_height, max_height
+            ));
         } else {
             // best / h265 / anything else: pick the best quality available.
             cmd.arg("-f").arg("bestvideo+bestaudio/best");

@@ -287,6 +287,7 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_ADMIN_PANEL)).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                     admin_panel_text_handler(bot, msg, ctx, db_pool).await
                 }))
+                .branch(Update::filter_callback_query().filter(|q: CallbackQuery| q.data.as_deref().map_or(false, |d| d.starts_with("ytq|") || d.starts_with("yta|"))).endpoint(handlers::link::handle_yt_pick_callback))
                 .branch(Update::filter_callback_query().filter(|q: CallbackQuery| q.data == Some("buy_premium".to_string())).endpoint(|bot: Bot, q: CallbackQuery, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                     let _ = bot.answer_callback_query(q.id).await;
                     db_pool.log_funnel_event(ctx.bot_id.as_str(), q.from.id.0 as i64, "premium_click").await;
