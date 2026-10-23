@@ -308,25 +308,31 @@ pub async fn link_handler(
     if is_youtube_url(&url) {
         let heights = fetcher.probe_youtube_heights(&url).await;
         if !heights.is_empty() {
-            let mut picks = YT_PICKS
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            prune_stale_yt_picks(&mut picks);
+            let key = {
+                let mut picks = YT_PICKS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                prune_stale_yt_picks(&mut picks);
 
-            let key = Uuid::new_v4().to_string();
-            picks.insert(
-                key.clone(),
-                YtPick {
-                    url: url.clone(),
-                    bot_id: bot_id.to_string(),
-                    user_id: user_id as i64,
-                    username: msg.chat.username().map(|s| s.to_string()).or_else(|| msg.from.as_ref().and_then(|u| u.username.clone())),
-                    chat_id: msg.chat.id.0,
-                    lang: Some(lang.clone()),
-                    created_at: std::time::Instant::now(),
-                },
-            );
-            drop(picks);
+                let key = Uuid::new_v4().to_string();
+                picks.insert(
+                    key.clone(),
+                    YtPick {
+                        url: url.clone(),
+                        bot_id: bot_id.to_string(),
+                        user_id: user_id as i64,
+                        username: msg
+                            .chat
+                            .username()
+                            .map(|s| s.to_string())
+                            .or_else(|| msg.from.as_ref().and_then(|u| u.username.clone())),
+                        chat_id: msg.chat.id.0,
+                        lang: Some(lang.clone()),
+                        created_at: std::time::Instant::now(),
+                    },
+                );
+                key
+            };
 
             // Buttons run top-down from the tallest height; climbs beyond
             // eight rows look broken in a chat window, so cap the menu there.
