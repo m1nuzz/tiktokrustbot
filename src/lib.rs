@@ -310,7 +310,7 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                     admin_panel_text_handler(bot, msg, ctx, db_pool).await
                 }))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("📊 Stats")).endpoint(stats_text_handler))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("📈 Daily Stats")).endpoint(daily_stats_text_handler))
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("📈 Stats")).endpoint(daily_stats_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("📅 Week")).endpoint(weekly_stats_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("🔻 Funnel")).endpoint(funnel_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("🏆 Top 10")).endpoint(top10_text_handler))

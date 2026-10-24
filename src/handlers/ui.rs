@@ -27,7 +27,7 @@ pub fn is_system_button(text: &str) -> bool {
         BTN_ADMIN_PANEL | BTN_SETTINGS | BTN_FORMAT | BTN_SUBSCRIPTION | BTN_BACK |
         BTN_LANGUAGE | BTN_AUTO_DETECT |
         "📢 Broadcast" | "📊 Stats" | "🏆 Top 10" | "👥 All users" | "💎 Premium Users" | "➕ Add Premium User" |
-        "📈 Daily Stats" | "📅 Week" | "🔻 Funnel" |
+        "📈 Stats" | "📅 Week" | "🔻 Funnel" |
         "h265" | "h264" | "audio" | BTN_PRICE
     ) || text.starts_with(BTN_TOGGLE_ADS)
       || text.starts_with(BTN_TOGGLE_SUCCESS_NOTIFS)

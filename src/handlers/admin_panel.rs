@@ -47,7 +47,7 @@ pub async fn admin_panel_text_handler(
     let price = premium_price_for(&db_pool, ctx.bot_id.as_str()).await;
 
     let keyboard = KeyboardMarkup::new(vec![
-        vec![KeyboardButton::new("📊 Stats"), KeyboardButton::new("📈 Daily Stats")],
+        vec![KeyboardButton::new("📊 Stats"), KeyboardButton::new("📈 Stats")],
         vec![KeyboardButton::new("📅 Week"), KeyboardButton::new("🔻 Funnel")],
         vec![KeyboardButton::new(BTN_BROADCAST), KeyboardButton::new("➕ Add Premium User")],
         vec![KeyboardButton::new("🏆 Top 10"), KeyboardButton::new("👥 All users")],
