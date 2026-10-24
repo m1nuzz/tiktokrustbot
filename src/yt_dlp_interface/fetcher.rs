@@ -870,6 +870,11 @@ impl YoutubeFetcher {
 
         let mut last_percentage = 0.0f64;
         let mut last_update_time = std::time::Instant::now();
+        // stderr is drained in the select loop above, so `output.stderr`
+        // (from wait_with_output) comes back empty. Keep our own copy so the
+        // caller can classify IP-block / bot-check failures instead of seeing
+        // an empty "yt-dlp failed: ".
+        let mut stderr_collected = String::new();
         const MIN_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
         loop {
@@ -898,6 +903,8 @@ impl YoutubeFetcher {
                 line = stderr_reader.next_line() => {
                     match line {
                         Ok(Some(line)) => {
+                            stderr_collected.push_str(&line);
+                            stderr_collected.push('\n');
                             log::trace!("yt-dlp stderr: {}", line);
                             if let Some((percentage, total_size)) = parse_progress_line(&line) {
                                 if percentage > last_percentage {
@@ -1023,7 +1030,11 @@ impl YoutubeFetcher {
             );
             Err(anyhow::anyhow!("Downloaded file not found"))
         } else {
-            let stderr_output = String::from_utf8_lossy(&output.stderr);
+            let stderr_output = if stderr_collected.is_empty() {
+                String::from_utf8_lossy(&output.stderr).to_string()
+            } else {
+                stderr_collected.clone()
+            };
             let stdout_output = String::from_utf8_lossy(&output.stdout);
 
             log::error!(
