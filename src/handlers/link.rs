@@ -928,14 +928,14 @@ mod tests {
         for &key in &keys {
             for &lang in i18n::SUPPORTED_LANGS {
                 let text = batch_text(key, Some(lang), 7, 9);
-                assert!(!text.contains(\"{current}\"), \"lang {lang}: {text}\");
-                assert!(!text.contains(\"{total}\"), \"lang {lang}: {text}\");
-                assert!(text.contains('7'), \"current not substituted for {lang}: {text}\");
-                assert!(text.contains('9'), \"total not substituted for {lang}: {text}\");
+                assert!(!text.contains("{current}"), "lang {lang}: {text}");
+                assert!(!text.contains("{total}"), "lang {lang}: {text}");
+                assert!(text.contains('7'), "current not substituted for {lang}: {text}");
+                assert!(text.contains('9'), "total not substituted for {lang}: {text}");
             }
             let text = batch_text(key, None, 7, 9);
-            assert!(!text.contains(\"{current}\"), \"{text}\");
-            assert!(!text.contains(\"{total}\"), \"{text}\");
+            assert!(!text.contains("{current}"), "{text}");
+            assert!(!text.contains("{total}"), "{text}");
         }
     }
 
@@ -945,14 +945,14 @@ mod tests {
         BATCH_WAITERS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(\"ymid-wake\".to_string(), tx);
-        assert!(is_batch_waiting(\"ymid-wake\"));
+            .insert("ymid-wake".to_string(), tx);
+        assert!(is_batch_waiting("ymid-wake"));
 
-        notify_batch_outcome(Some(\"ymid-wake\"), BatchOutcome::Delivered);
+        notify_batch_outcome(Some("ymid-wake"), BatchOutcome::Delivered);
 
-        assert!(!is_batch_waiting(\"ymid-wake\"));
+        assert!(!is_batch_waiting("ymid-wake"));
         assert_eq!(rx.try_recv().unwrap(), BatchOutcome::Delivered);
-        notify_batch_outcome(Some(\"ymid-wake\"), BatchOutcome::Failed);
+        notify_batch_outcome(Some("ymid-wake"), BatchOutcome::Failed);
     }
 
     #[test]
@@ -966,14 +966,14 @@ mod tests {
         BATCH_WAITERS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(\"ymid-guard\".to_string(), tx);
+            .insert("ymid-guard".to_string(), tx);
 
         {
-            let _guard = BatchFailureGuard(Some(\"ymid-guard\".to_string()));
+            let _guard = BatchFailureGuard(Some("ymid-guard".to_string()));
             assert!(rx.try_recv().is_err());
         }
 
-        assert!(!is_batch_waiting(\"ymid-guard\"));
+        assert!(!is_batch_waiting("ymid-guard"));
         assert_eq!(rx.try_recv().unwrap(), BatchOutcome::Failed);
     }
 
