@@ -473,7 +473,14 @@ pub async fn link_handler(
         let webapp_url = std::env::var("WEBAPP_URL").unwrap_or_default();
         if !webapp_url.is_empty() {
             if let Ok(url_obj) = webapp_url.parse::<reqwest::Url>() {
-                let ymid = match db_pool.create_pending_download(bot_id, user_id as i64, &url).await {
+                let ymid = match db_pool.create_pending_download_with_batch(
+                    bot_id,
+                    user_id as i64,
+                    &url,
+                    batch.as_ref().map(|b| b.id.as_str()),
+                    batch.as_ref().map(|b| b.position),
+                    batch.as_ref().map(|b| b.total),
+                ).await {
                     Ok(id) => id,
                     Err(e) => {
                         log::error!("Failed to create pending download: {}", e);
@@ -535,33 +542,44 @@ pub async fn link_handler(
                     }
                 };
 
-                if let (Some(info), Some(waiter)) = (batch, waiter) {
-                    let outcome = match timeout(BATCH_WAIT_TIMEOUT, waiter).await {
-                        Ok(Ok(outcome)) => outcome,
-                        Ok(Err(_)) => BatchOutcome::Failed,
-                        Err(_) => {
-                            // No ad and no skip: close the row so the FIFO can
-                            // move on. A late claim can no longer deliver it.
-                            let _ = db_pool.mark_pending_skipped(&ymid).await;
-                            BatchOutcome::Skipped
-                        }
-                    };
-                    remove_batch_waiter(&ymid);
+                // Do not block the queue here: send every choice message of the
+                // burst immediately, then let a background task edit this item's
+                // status once its delivery/skip/failure is known. New links sent
+                // while an older item is still waiting must get their button at
+                // once instead of waiting for a skip.
+                if let (Some(info), Some(waiter)) = (batch.clone(), waiter) {
+                    let bot_task = bot.clone();
+                    let db_task = db_pool.clone();
+                    let ymid_task = ymid.clone();
+                    let lang_task = lang.clone();
+                    let chat_id_task = sent.chat.id;
+                    let message_id_task = sent.id;
+                    tokio::spawn(async move {
+                        let outcome = match timeout(BATCH_WAIT_TIMEOUT, waiter).await {
+                            Ok(Ok(outcome)) => outcome,
+                            Ok(Err(_)) => BatchOutcome::Failed,
+                            Err(_) => {
+                                let _ = db_task.mark_pending_skipped(&ymid_task).await;
+                                BatchOutcome::Skipped
+                            }
+                        };
+                        remove_batch_waiter(&ymid_task);
 
-                    let status_key = match outcome {
-                        BatchOutcome::Delivered => MsgKey::BatchDelivered,
-                        BatchOutcome::Skipped => MsgKey::BatchSkipped,
-                        BatchOutcome::Failed => MsgKey::BatchFailed,
-                    };
-                    let status_text = batch_text(
-                        status_key,
-                        Some(lang.as_str()),
-                        info.position,
-                        info.total,
-                    );
-                    let _ = bot.edit_message_text(sent.chat.id, sent.id, status_text).await;
-                    // Remove the ad/premium/skip buttons from the finished item.
-                    let _ = bot.edit_message_reply_markup(sent.chat.id, sent.id).await;
+                        let status_key = match outcome {
+                            BatchOutcome::Delivered => MsgKey::BatchDelivered,
+                            BatchOutcome::Skipped => MsgKey::BatchSkipped,
+                            BatchOutcome::Failed => MsgKey::BatchFailed,
+                        };
+                        let status_text = batch_text(
+                            status_key,
+                            Some(lang_task.as_str()),
+                            info.position,
+                            info.total,
+                        );
+                        let _ = bot_task.edit_message_text(chat_id_task, message_id_task, status_text).await;
+                        // Remove the ad/premium/skip buttons from the finished item.
+                        let _ = bot_task.edit_message_reply_markup(chat_id_task, message_id_task).await;
+                    });
                 }
 
                 return Ok(());
@@ -731,6 +749,21 @@ pub async fn process_video_request(
     // If this is a batch row, every exit path must wake the ad-choice waiter.
     // Success and fail_request notify first; this guard covers early `?` exits.
     let _batch_failure_guard = BatchFailureGuard(ymid.clone());
+
+    // A burst is delivered in message order even when several of its videos
+    // are claimed at once: wait here until every earlier row of the same
+    // burst has finished (completed/failed/expired) before sending this one.
+    if let Some(ymid) = ymid.as_deref() {
+        if let Ok(Some((batch_id, position, _total))) = db_pool.get_batch_info(ymid).await {
+            let deadline = std::time::Instant::now() + Duration::from_secs(1800);
+            while db_pool.earlier_batch_rows_unfinished(&batch_id, position).await.unwrap_or(false) {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
 
     // Get user quality preference: the YT picker callbacks pass an explicit
     // numeric height ("1080") or "audio" instead of the stored default.

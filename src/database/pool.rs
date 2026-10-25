@@ -385,20 +385,39 @@ impl DatabasePool {
     /// Create a pending download record and return its unique ID (ymid).
     /// The row starts with a live lease so it is claimable from the first
     /// second, before the client sends its first heartbeat.
-     pub async fn create_pending_download(&self, bot_id: &str, user_id: i64, video_url: &str) -> Result<String, anyhow::Error> {
+    /// Create a pending download record and return its unique ID (ymid).
+    /// The row starts with a live lease so it is claimable from the first
+    /// second, before the client sends its first heartbeat.
+    pub async fn create_pending_download(&self, bot_id: &str, user_id: i64, video_url: &str) -> Result<String, anyhow::Error> {
+        self.create_pending_download_with_batch(bot_id, user_id, video_url, None, None, None).await
+    }
+
+    /// Like [`create_pending_download`], but stamps the row with its position
+    /// inside a burst of forwarded links. `batch_id` is shared by every row of
+    /// one burst; `position` is 1-based and follows `Message.message_id`.
+    pub async fn create_pending_download_with_batch(
+        &self,
+        bot_id: &str,
+        user_id: i64,
+        video_url: &str,
+        batch_id: Option<&str>,
+        position: Option<i64>,
+        total: Option<i64>,
+    ) -> Result<String, anyhow::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let id_owned = id.clone();
         let video_url_owned = video_url.to_string();
         let bot_owned = bot_id.to_string();
+        let batch_owned = batch_id.map(str::to_string);
         let lease_secs = SESSION_LEASE_SECS;
-        
+
         self.execute_with_timeout(move |conn| {
             conn.execute(
                 &format!(
-                    "INSERT INTO pending_downloads (id, bot_id, user_id, video_url, lease_expires_at) VALUES (?1, ?2, ?3, ?4, datetime('now', '+{} seconds'))",
+                    "INSERT INTO pending_downloads (id, bot_id, user_id, video_url, lease_expires_at, batch_id, batch_position, batch_total) VALUES (?1, ?2, ?3, ?4, datetime('now', '+{} seconds'), ?5, ?6, ?7)",
                     lease_secs
                 ),
-                params![id_owned, bot_owned, user_id, video_url_owned],
+                params![id_owned, bot_owned, user_id, video_url_owned, batch_owned, position, total],
             )?;
             Ok(())
         }).await.map(|_| id).map_err(|e| anyhow::anyhow!("Failed to create pending download: {}", e))
@@ -454,6 +473,44 @@ impl DatabasePool {
             )?;
             Ok(rows)
         }).await.map_err(|e| anyhow::anyhow!("Failed to mark {} as skipped: {}", id, e))
+    }
+
+    /// Return `(batch_id, batch_position, batch_total)` for a row that belongs
+    /// to a burst of forwarded links. `None` if the row is a single link.
+    pub async fn get_batch_info(&self, id: &str) -> Result<Option<(String, i64, i64)>, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let row: Option<(Option<String>, Option<i64>, Option<i64>)> = conn
+                .query_row(
+                    "SELECT batch_id, batch_position, batch_total FROM pending_downloads WHERE id = ?1",
+                    params![id_owned],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            Ok(match row {
+                Some((Some(batch_id), Some(pos), Some(total))) => Some((batch_id, pos, total)),
+                _ => None,
+            })
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get batch info for {}: {}", id, e))
+    }
+
+    /// Whether an earlier row of the same burst is still pending or verified.
+    /// `process_video_request` waits on this so the final videos land in order
+    /// even when several of them were claimed at once.
+    pub async fn earlier_batch_rows_unfinished(&self, batch_id: &str, position: i64) -> Result<bool, anyhow::Error> {
+        let batch_owned = batch_id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pending_downloads WHERE batch_id = ?1 AND batch_position < ?2 AND status IN ('pending', 'verified')",
+                params![batch_owned, position],
+                |r| r.get(0),
+            )?;
+            Ok(count > 0)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to check earlier batch rows for {}: {}", batch_id, e))
     }
 
     /// Record that a download job really began for this row, returning how
@@ -519,15 +576,15 @@ impl DatabasePool {
     pub async fn resolve_session_ymid(&self, entry_ymid: &str) -> Result<Option<SessionYmid>, anyhow::Error> {
         let entry_owned = entry_ymid.to_string();
         self.execute_with_timeout(move |conn| {
-            let entry: Option<(i64, String, String)> = conn
+            let entry: Option<(i64, String, String, Option<String>, Option<i64>, Option<i64>)> = conn
                 .query_row(
-                    "SELECT user_id, video_url, bot_id FROM pending_downloads WHERE id = ?1",
+                    "SELECT user_id, video_url, bot_id, batch_id, batch_position, batch_total FROM pending_downloads WHERE id = ?1",
                     params![entry_owned],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
                 )
                 .optional()?;
 
-            let (user_id, video_url, bot_id) = match entry {
+            let (user_id, video_url, bot_id, entry_batch_id, entry_batch_position, entry_batch_total) = match entry {
                 Some(row) => row,
                 None => return Ok(None),
             };
@@ -552,8 +609,20 @@ impl DatabasePool {
 
             // The user's own newest unused session wins over minting: one live
             // session per user, and no orphan row in the common double-press case.
-            let sibling: Option<String> = conn
-                .query_row(
+            // For a burst, prefer the earliest still-unused sibling of the same
+            // burst so a reload does not jump to a later video.
+            let sibling: Option<String> = if let Some(batch_id) = entry_batch_id.as_deref() {
+                conn.query_row(
+                    &format!(
+                        "SELECT id FROM pending_downloads WHERE batch_id = ?1 AND id <> ?2 AND status IN ('pending', 'verified') AND notified_at IS NULL AND ad_requested_at IS NULL AND COALESCE(lease_expires_at, datetime(created_at, '+{} seconds')) > datetime('now') ORDER BY batch_position ASC, id ASC LIMIT 1",
+                        SESSION_LEASE_SECS
+                    ),
+                    params![batch_id, entry_owned],
+                    |row| row.get(0),
+                )
+                .optional()?
+            } else {
+                conn.query_row(
                     &format!(
                         "SELECT id FROM pending_downloads WHERE user_id = ?1 AND id <> ?2 AND status IN ('pending', 'verified') AND notified_at IS NULL AND ad_requested_at IS NULL AND COALESCE(lease_expires_at, datetime(created_at, '+{} seconds')) > datetime('now') ORDER BY created_at DESC, id DESC LIMIT 1",
                         SESSION_LEASE_SECS
@@ -561,7 +630,8 @@ impl DatabasePool {
                     params![user_id, entry_owned],
                     |row| row.get(0),
                 )
-                .optional()?;
+                .optional()?
+            };
             if let Some(ymid) = sibling {
                 return Ok(Some(SessionYmid {
                     ymid,
@@ -572,10 +642,10 @@ impl DatabasePool {
             let id = uuid::Uuid::new_v4().to_string();
             conn.execute(
                 &format!(
-                    "INSERT INTO pending_downloads (id, bot_id, user_id, video_url, entry_ymid, lease_expires_at) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', '+{} seconds'))",
+                    "INSERT INTO pending_downloads (id, bot_id, user_id, video_url, entry_ymid, lease_expires_at, batch_id, batch_position, batch_total) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', '+{} seconds'), ?6, ?7, ?8)",
                     SESSION_LEASE_SECS
                 ),
-                params![id, bot_id, user_id, video_url, entry_owned],
+                params![id, bot_id, user_id, video_url, entry_owned, entry_batch_id, entry_batch_position, entry_batch_total],
             )?;
             Ok(Some(SessionYmid {
                 ymid: id,
@@ -1372,7 +1442,7 @@ pub(crate) async fn setup_test_db() -> (DatabasePool, tempfile::NamedTempFile) {
             (),
         )?;
         conn.execute(
-            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL, job_started_at DATETIME DEFAULT NULL, entry_ymid TEXT DEFAULT NULL, ad_requested_at DATETIME DEFAULT NULL, bot_id TEXT NOT NULL DEFAULT 'primary')",
+            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL, job_started_at DATETIME DEFAULT NULL, entry_ymid TEXT DEFAULT NULL, ad_requested_at DATETIME DEFAULT NULL, bot_id TEXT NOT NULL DEFAULT 'primary', batch_id TEXT DEFAULT NULL, batch_position INTEGER DEFAULT NULL, batch_total INTEGER DEFAULT NULL)",
             (),
         )?;
         conn.execute(
