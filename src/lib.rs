@@ -202,7 +202,7 @@ async fn run_link_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<LinkJob>) {
                 source_message_id: job.msg.id.0 as i64,
             });
 
-            let handle = tokio::spawn(link_handler(job, batch));
+            let mut handle = tokio::spawn(link_handler(job, batch));
             // While this burst item is waiting (for example on an ad choice),
             // a newly sent link must not be stuck behind it: handle it in its
             // own task with the single-link flow and keep the burst going.
