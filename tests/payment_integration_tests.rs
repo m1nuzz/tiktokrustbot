@@ -20,7 +20,7 @@ async fn setup_test_db() -> (DatabasePool, NamedTempFile) {
             (),
         )?;
         conn.execute(
-            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, bot_id TEXT NOT NULL DEFAULT 'primary', user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, bot_id TEXT NOT NULL DEFAULT 'primary', user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, batch_id TEXT DEFAULT NULL, batch_position INTEGER DEFAULT NULL, batch_total INTEGER DEFAULT NULL)",
             (),
         )?;
         conn.execute(
