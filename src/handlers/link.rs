@@ -979,11 +979,11 @@ mod tests {
 
     #[test]
     fn batch_failure_guard_none_is_noop() {
-        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<BatchOutcome>();
         let _guard = BatchFailureGuard(None);
         drop(_guard);
         assert!(rx.try_recv().is_err());
-        let _ = tx;
+        drop(tx);
     }
 
     #[test]
