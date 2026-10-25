@@ -58,6 +58,97 @@ impl YtPick {
     }
 }
 
+/// One queued link message plus every dependency the handler needs. Ordering
+/// lives in `lib.rs`; this struct only carries the request context.
+#[derive(Clone)]
+pub struct LinkJob {
+    pub bot: Bot,
+    pub msg: Message,
+    pub ctx: BotCtx,
+    pub fetcher: Arc<YoutubeFetcher>,
+    pub mtproto_uploader: Arc<MTProtoUploader>,
+    pub db_pool: Arc<DatabasePool>,
+    pub task_manager: Arc<tokio::sync::Mutex<TaskManager>>,
+    pub upload_semaphore: Arc<tokio::sync::Semaphore>,
+    pub dedupe_key: String,
+}
+
+/// Position of one link inside a burst of forwarded messages. `position` is
+/// 1-based and follows `Message.message_id` ascending (top message first).
+#[derive(Clone, Debug)]
+pub struct BatchInfo {
+    pub id: String,
+    pub position: i64,
+    pub total: i64,
+    pub source_message_id: i64,
+}
+
+/// How the current batch item finished. The ad-choice waiter uses this to
+/// replace its own message with a short status line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchOutcome {
+    Delivered,
+    Skipped,
+    Failed,
+}
+
+/// ymid -> waiter for the link handler that is currently blocked on the ad
+/// choice message. Only the ad flow registers here; premium/admin/direct
+/// downloads never wait.
+lazy_static::lazy_static! {
+    static ref BATCH_WAITERS: Mutex<HashMap<String, tokio::sync::oneshot::Sender<BatchOutcome>>> =
+        Mutex::new(HashMap::new());
+}
+
+/// Fill the `{current}` / `{total}` placeholders in a batch status string.
+/// `i18n::t` returns `&'static str`, so the substitution must allocate.
+fn batch_text(key: MsgKey, lang: Option<&str>, position: i64, total: i64) -> String {
+    i18n::t(key, lang)
+        .replace("{current}", &position.to_string())
+        .replace("{total}", &total.to_string())
+}
+
+fn remove_batch_waiter(ymid: &str) {
+    BATCH_WAITERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(ymid);
+}
+
+fn is_batch_waiting(ymid: &str) -> bool {
+    BATCH_WAITERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(ymid)
+}
+
+/// Safety net for early `?` returns inside [`process_video_request`] (for
+/// example a failed progress-bar send). The normal success/failure paths
+/// notify first and remove the waiter, so this drop-time Failed is a no-op
+/// there; it only matters when the job exits before reaching either path.
+struct BatchFailureGuard(Option<String>);
+
+impl Drop for BatchFailureGuard {
+    fn drop(&mut self) {
+        notify_batch_outcome(self.0.as_deref(), BatchOutcome::Failed);
+    }
+}
+
+/// Wake the link handler that is waiting on this row. No-op for direct
+/// downloads (`None`) and for rows that never entered the ad flow.
+pub fn notify_batch_outcome(ymid: Option<&str>, outcome: BatchOutcome) {
+    let Some(id) = ymid else {
+        return;
+    };
+    let waiter = BATCH_WAITERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(id);
+    if let Some(tx) = waiter {
+        let _ = tx.send(outcome);
+    }
+}
+
 /// Evicts stale YT picks; called with the map lock already held.
 fn prune_stale_yt_picks(map: &mut HashMap<String, YtPick>) {
     map.retain(|_, pick| pick.is_fresh());
@@ -84,6 +175,11 @@ const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes per uplo
 /// same video.
 const JOB_BUDGET_SECS: u64 = 1500;
 const JOB_BUDGET: Duration = Duration::from_secs(JOB_BUDGET_SECS);
+/// Safety net for a batch item whose ad choice is never answered. The normal
+/// exit is the explicit "Skip this video" button; this only keeps one abandoned
+/// chat from pinning its FIFO queue forever. 30 minutes is longer than the job
+/// budget, so a job that did start always gets to report its own outcome.
+const BATCH_WAIT_TIMEOUT: Duration = Duration::from_secs(1800);
 const _: () = assert!(
     JOB_BUDGET_SECS < crate::database::SESSION_LEASE_SECS as u64,
     "the job budget must end before the session lease window"
@@ -169,6 +265,7 @@ async fn fail_request(
     progress_bar: &mut ProgressBar,
 ) {
     log::error!("Download job failed for {} (ymid {:?}): {}", url, ymid, err);
+    let batch_row = ymid.as_deref().map(is_batch_waiting).unwrap_or(false);
     if let Some(id) = ymid {
         match db_pool.mark_pending_failed(id).await {
             // 0 rows means the row was already terminal: somebody else owns
@@ -179,7 +276,13 @@ async fn fail_request(
         }
     }
     let _ = progress_bar.delete().await;
-    let _ = bot.send_message(chat_id, i18n::t(key, lang)).await;
+    // A batch row already has a choice message: the waiter edits that message
+    // to "❌ Видео N из M — не удалось скачать" instead of sending a second
+    // generic failure bubble.
+    if !batch_row {
+        let _ = bot.send_message(chat_id, i18n::t(key, lang)).await;
+    }
+    notify_batch_outcome(ymid.as_deref(), BatchOutcome::Failed);
 }
 
 // Add this function at the beginning of the file
@@ -247,15 +350,20 @@ pub async fn ads_enabled_for(db_pool: &DatabasePool, bot_id: &str, user_id: i64,
 }
 
 pub async fn link_handler(
-    bot: Bot,
-    msg: Message,
-    ctx: BotCtx,
-    fetcher: Arc<YoutubeFetcher>,
-    mtproto_uploader: Arc<MTProtoUploader>,
-    db_pool: Arc<DatabasePool>,
-    task_manager: Arc<tokio::sync::Mutex<TaskManager>>,
-    upload_semaphore: Arc<tokio::sync::Semaphore>,
+    job: LinkJob,
+    batch: Option<BatchInfo>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let LinkJob {
+        bot,
+        msg,
+        ctx,
+        fetcher,
+        mtproto_uploader,
+        db_pool,
+        task_manager,
+        upload_semaphore,
+        ..
+    } = job;
     let user_id = msg.chat.id.0;
     let bot_id = ctx.bot_id.as_str();
 
@@ -384,15 +492,77 @@ pub async fn link_handler(
                 let prem_btn_text = i18n::t(MsgKey::PremiumButton, Some(lang.as_str()));
                 let choice_text = i18n::t(MsgKey::ChoiceText, Some(lang.as_str()));
 
-                let keyboard = InlineKeyboardMarkup::new(vec![
+                let mut rows = vec![
                     vec![InlineKeyboardButton::web_app(ad_btn_text, WebAppInfo { url: final_url })],
                     vec![InlineKeyboardButton::callback(prem_btn_text, "buy_premium")],
-                ]);
+                ];
+                if batch.is_some() {
+                    rows.push(vec![InlineKeyboardButton::callback(
+                        i18n::t(MsgKey::BatchSkipButton, Some(lang.as_str())),
+                        format!("batch_skip|{}", ymid),
+                    )]);
+                }
 
-                // Send a friendly choice message instead of an invoice
-                let _ = bot.send_message(msg.chat.id, choice_text)
-                    .reply_markup(keyboard)
-                    .await;
+                let message_text = match &batch {
+                    Some(info) => format!(
+                        "{}\n\n{}",
+                        batch_text(MsgKey::BatchProgress, Some(lang.as_str()), info.position, info.total),
+                        choice_text
+                    ),
+                    None => choice_text.to_string(),
+                };
+
+                // Register before sending: a very fast tap must find the waiter.
+                let waiter = if batch.is_some() {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    BATCH_WAITERS
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(ymid.clone(), tx);
+                    Some(rx)
+                } else {
+                    None
+                };
+
+                let sent = match bot.send_message(msg.chat.id, message_text)
+                    .reply_markup(InlineKeyboardMarkup::new(rows))
+                    .await
+                {
+                    Ok(sent) => sent,
+                    Err(e) => {
+                        remove_batch_waiter(&ymid);
+                        return Err(e.into());
+                    }
+                };
+
+                if let (Some(info), Some(waiter)) = (batch, waiter) {
+                    let outcome = match timeout(BATCH_WAIT_TIMEOUT, waiter).await {
+                        Ok(Ok(outcome)) => outcome,
+                        Ok(Err(_)) => BatchOutcome::Failed,
+                        Err(_) => {
+                            // No ad and no skip: close the row so the FIFO can
+                            // move on. A late claim can no longer deliver it.
+                            let _ = db_pool.mark_pending_skipped(&ymid).await;
+                            BatchOutcome::Skipped
+                        }
+                    };
+                    remove_batch_waiter(&ymid);
+
+                    let status_key = match outcome {
+                        BatchOutcome::Delivered => MsgKey::BatchDelivered,
+                        BatchOutcome::Skipped => MsgKey::BatchSkipped,
+                        BatchOutcome::Failed => MsgKey::BatchFailed,
+                    };
+                    let status_text = batch_text(
+                        status_key,
+                        Some(lang.as_str()),
+                        info.position,
+                        info.total,
+                    );
+                    let _ = bot.edit_message_text(sent.chat.id, sent.id, status_text).await;
+                    // Remove the ad/premium/skip buttons from the finished item.
+                    let _ = bot.edit_message_reply_markup(sent.chat.id, sent.id).await;
+                }
 
                 return Ok(());
             }
@@ -416,6 +586,31 @@ pub async fn link_handler(
         None,
         None,
     ).await
+}
+
+/// Handle the per-item "Skip this video" button. Only a still-pending row can
+/// be skipped: once an ad impression verified it or a claim completed it, the
+/// download is already in flight and the waiter will get its own outcome.
+pub async fn handle_batch_skip(
+    bot: Bot,
+    q: CallbackQuery,
+    db_pool: Arc<DatabasePool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let data = q.data.clone().unwrap_or_default();
+    let Some(ymid) = data.strip_prefix("batch_skip|").map(|s| s.to_string()) else {
+        return Ok(());
+    };
+
+    let _ = bot.answer_callback_query(q.id).await;
+    match db_pool.mark_pending_skipped(&ymid).await {
+        Ok(rows) if rows > 0 => notify_batch_outcome(Some(ymid.as_str()), BatchOutcome::Skipped),
+        Ok(_) => {
+            // Already verified/completed: the ad was watched or the download
+            // started, so the skip would race the delivery. Let it finish.
+        }
+        Err(e) => log::error!("Failed to skip batch row {}: {}", ymid, e),
+    }
+    Ok(())
 }
 
 /// Handles a tap on one of the YouTube quality-picker inline buttons.
@@ -533,6 +728,10 @@ pub async fn process_video_request(
     ymid: Option<String>,
     quality_override: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // If this is a batch row, every exit path must wake the ad-choice waiter.
+    // Success and fail_request notify first; this guard covers early `?` exits.
+    let _batch_failure_guard = BatchFailureGuard(ymid.clone());
+
     // Get user quality preference: the YT picker callbacks pass an explicit
     // numeric height ("1080") or "audio" instead of the stored default.
     let quality_preference = match quality_override {
@@ -553,6 +752,7 @@ pub async fn process_video_request(
 
             if !admins.contains(&user_id) {
                 bot.send_message(chat_id, i18n::t(MsgKey::SubscribeRequired, lang.as_deref())).await?;
+                notify_batch_outcome(ymid.as_deref(), BatchOutcome::Failed);
                 return Ok(());
             }
         }
@@ -683,6 +883,7 @@ pub async fn process_video_request(
                 Ok(())
             }).await;
 
+            notify_batch_outcome(ymid.as_deref(), BatchOutcome::Delivered);
             Ok(())
         }
         Ok(Err(e)) => {
@@ -705,6 +906,15 @@ pub async fn process_video_request(
 mod tests {
     use super::*;
     use rusqlite::params;
+
+    #[test]
+    fn batch_status_fills_current_and_total() {
+        let text = batch_text(MsgKey::BatchProgress, Some("ru"), 2, 3);
+        assert!(text.contains('2'), "current missing: {text}");
+        assert!(text.contains('3'), "total missing: {text}");
+        assert!(!text.contains("{current}"));
+        assert!(!text.contains("{total}"));
+    }
 
     #[test]
     fn download_errors_classified_for_immediate_reply() {

@@ -441,6 +441,21 @@ impl DatabasePool {
         }).await.map_err(|e| anyhow::anyhow!("Failed to mark {} as failed: {}", id, e))
     }
 
+    /// Close a still-pending batch item without downloading it. Only `pending`
+    /// rows move: a `verified` row already has an ad impression and a
+    /// `completed` row already has a delivery in flight, so skipping either
+    /// would race the job. Notified immediately so the sweeper ignores it.
+    pub async fn mark_pending_skipped(&self, id: &str) -> Result<usize, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let rows = conn.execute(
+                "UPDATE pending_downloads SET status = 'expired', notified_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status = 'pending'",
+                params![id_owned],
+            )?;
+            Ok(rows)
+        }).await.map_err(|e| anyhow::anyhow!("Failed to mark {} as skipped: {}", id, e))
+    }
+
     /// Record that a download job really began for this row, returning how
     /// many rows moved (0 = unknown ymid).
     ///
@@ -1895,6 +1910,38 @@ mod tests {
             pool.get_pending_download_status("live").await.unwrap(),
             Some("failed".to_string())
         );
+    }
+
+    /// Skip is only legal before the ad is verified. A `verified` row already
+    /// has an impression and a `completed` row already has a delivery in
+    /// flight; closing either would race the job that owns it.
+    #[tokio::test]
+    async fn mark_pending_skipped_only_closes_a_pending_row() {
+        let (pool, _file) = setup_test_db().await;
+        pool.execute_with_timeout(|conn| {
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('skip-me', 1, 'http://x', 'pending')",
+                (),
+            )?;
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('ad-watched', 2, 'http://y', 'verified')",
+                (),
+            )?;
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('delivering', 3, 'http://z', 'completed')",
+                (),
+            )?;
+            Ok(())
+        }).await.unwrap();
+
+        assert_eq!(pool.mark_pending_skipped("skip-me").await.unwrap(), 1);
+        assert_eq!(
+            pool.get_pending_download_status("skip-me").await.unwrap(),
+            Some("expired".to_string())
+        );
+        assert_eq!(pool.mark_pending_skipped("skip-me").await.unwrap(), 0);
+        assert_eq!(pool.mark_pending_skipped("ad-watched").await.unwrap(), 0);
+        assert_eq!(pool.mark_pending_skipped("delivering").await.unwrap(), 0);
     }
 
     #[tokio::test]

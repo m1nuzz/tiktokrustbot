@@ -26,16 +26,19 @@ use handlers::{
     daily_stats_text_handler, admin_ads_text_handler, language_button_handler, language_menu_handler,
     weekly_stats_text_handler, start_with_payload_handler, funnel_text_handler,
 };
+use handlers::link::{BatchInfo, LinkJob};
 use handlers::ui::{BTN_ADMIN_PANEL, BTN_BACK, BTN_FORMAT, BTN_SETTINGS, BTN_SUBSCRIPTION, BTN_LANGUAGE, BTN_AUTO_DETECT, BTN_PRICE};
 use database::DatabasePool;
 use mtproto_uploader::MTProtoUploader;
 use yt_dlp_interface::YoutubeFetcher;
 use utils::task_manager::TaskManager;
 use std::sync::Arc;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::Mutex;
+use tokio::time::{Duration, timeout};
 use teloxide::dispatching::dialogue;
 use teloxide::dptree;
+use uuid::Uuid;
 use teloxide::types::CallbackQuery;
 use teloxide::types::{ChatMemberKind, ChatMemberUpdated};
 use teloxide::dispatching::DpHandlerDescription;
@@ -131,6 +134,82 @@ async fn premium_start_handler(
 // For deduplication
 lazy_static::lazy_static! {
     static ref PROCESSING: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    /// One FIFO worker per (bot_id, chat_id). Telegram delivers updates from a
+    /// chat in message order, but the old endpoint spawned every link in its own
+    /// task, so a fast download could overtake a slow one. The queue keeps a
+    /// chat's links strictly sequential and lets a short collection window turn
+    /// a burst of forwarded messages into one ordered batch.
+    static ref LINK_QUEUES: std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<LinkJob>>> =
+        std::sync::Mutex::new(HashMap::new());
+}
+
+/// Enqueue one link message. The worker is created lazily per chat and lives
+/// for the process lifetime, so a message can never be lost to an idle-worker
+/// timeout race.
+fn enqueue_link_job(job: LinkJob) {
+    let queue_key = format!("{}:{}", job.ctx.bot_id, job.msg.chat.id.0);
+    let mut queues = LINK_QUEUES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let existing = queues.get(&queue_key).cloned();
+    if let Some(tx) = existing {
+        if tx.send(job.clone()).is_ok() {
+            return;
+        }
+        // Receiver is gone (only possible if the runtime is shutting down).
+        queues.remove(&queue_key);
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    queues.insert(queue_key, tx.clone());
+    tokio::spawn(run_link_queue(rx));
+    let _ = tx.send(job);
+}
+
+/// Drain one chat's queue. A burst is collected for 800 ms, sorted by
+/// `Message.message_id` (top message = smaller id), and processed one by one.
+/// The next link is not started until `link_handler` returns, which is what
+/// makes ad-choice messages appear in top-to-bottom order.
+async fn run_link_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<LinkJob>) {
+    while let Some(first) = rx.recv().await {
+        let mut jobs = vec![first];
+        let deadline = std::time::Instant::now() + Duration::from_millis(800);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match timeout(remaining, rx.recv()).await {
+                Ok(Some(job)) => jobs.push(job),
+                _ => break,
+            }
+        }
+
+        jobs.sort_by_key(|job| job.msg.id.0);
+        let batch_id = Uuid::new_v4().to_string();
+        let total = jobs.len() as i64;
+
+        for (index, job) in jobs.into_iter().enumerate() {
+            let dedupe_key = job.dedupe_key.clone();
+            // A lone link keeps the old single-link flow (no "1 of 1" header,
+            // no skip button, no wait). Only a real burst gets batch UI and
+            // blocks the queue until its item is delivered or skipped.
+            let batch = (total > 1).then(|| BatchInfo {
+                id: batch_id.clone(),
+                position: index as i64 + 1,
+                total,
+                source_message_id: job.msg.id.0 as i64,
+            });
+            // Spawn + await gives panic isolation without breaking order.
+            match tokio::spawn(link_handler(job, batch)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => log::error!("link_handler failed: {}", e),
+                Err(e) => log::error!("link_handler task failed: {}", e),
+            }
+            PROCESSING.lock().await.remove(&dedupe_key);
+        }
+    }
 }
 
 /// Build the main dispatcher handler tree for testing and production
@@ -288,6 +367,7 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                     admin_panel_text_handler(bot, msg, ctx, db_pool).await
                 }))
                 .branch(Update::filter_callback_query().filter(|q: CallbackQuery| q.data.as_deref().map_or(false, |d| d.starts_with("ytq|") || d.starts_with("yta|"))).endpoint(handlers::link::handle_yt_pick_callback))
+                .branch(Update::filter_callback_query().filter(|q: CallbackQuery| q.data.as_deref().map_or(false, |d| d.starts_with("batch_skip|"))).endpoint(handlers::link::handle_batch_skip))
                 .branch(Update::filter_callback_query().filter(|q: CallbackQuery| q.data == Some("buy_premium".to_string())).endpoint(|bot: Bot, q: CallbackQuery, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                     let _ = bot.answer_callback_query(q.id).await;
                     db_pool.log_funnel_event(ctx.bot_id.as_str(), q.from.id.0 as i64, "premium_click").await;
@@ -363,9 +443,16 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                         if p.contains(&key) { return Ok(()); }
                         p.insert(key.clone());
                     }
-                    tokio::spawn(async move {
-                        let _ = link_handler(bot.clone(), msg.clone(), ctx, fetcher, mtproto_uploader, db_pool, task_manager, upload_semaphore).await;
-                        PROCESSING.lock().await.remove(&key);
+                    enqueue_link_job(LinkJob {
+                        bot,
+                        msg,
+                        ctx,
+                        fetcher,
+                        mtproto_uploader,
+                        db_pool,
+                        task_manager,
+                        upload_semaphore,
+                        dedupe_key: key,
                     });
                     Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
                 }))
