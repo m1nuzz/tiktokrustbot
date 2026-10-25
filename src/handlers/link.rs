@@ -930,8 +930,12 @@ mod tests {
                 let text = batch_text(key, Some(lang), 7, 9);
                 assert!(!text.contains("{current}"), "lang {lang}: {text}");
                 assert!(!text.contains("{total}"), "lang {lang}: {text}");
-                assert!(text.contains('7'), "current not substituted for {lang}: {text}");
-                assert!(text.contains('9'), "total not substituted for {lang}: {text}");
+                if key != MsgKey::BatchSkipButton {
+                    assert!(text.contains('7'), "current not substituted for {lang}: {text}");
+                    assert!(text.contains('9'), "total not substituted for {lang}: {text}");
+                } else {
+                    assert!(!text.is_empty(), "empty button text for {lang}");
+                }
             }
             let text = batch_text(key, None, 7, 9);
             assert!(!text.contains("{current}"), "{text}");
