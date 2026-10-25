@@ -194,18 +194,37 @@ async fn run_link_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<LinkJob>) {
             let dedupe_key = job.dedupe_key.clone();
             // A lone link keeps the old single-link flow (no "1 of 1" header,
             // no skip button, no wait). Only a real burst gets batch UI and
-            // blocks the queue until its item is delivered or skipped.
+            // waits for its item before showing the next one.
             let batch = (total > 1).then(|| BatchInfo {
                 id: batch_id.clone(),
                 position: index as i64 + 1,
                 total,
                 source_message_id: job.msg.id.0 as i64,
             });
-            // Spawn + await gives panic isolation without breaking order.
-            match tokio::spawn(link_handler(job, batch)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => log::error!("link_handler failed: {}", e),
-                Err(e) => log::error!("link_handler task failed: {}", e),
+
+            let handle = tokio::spawn(link_handler(job, batch));
+            // While this burst item is waiting (for example on an ad choice),
+            // a newly sent link must not be stuck behind it: handle it in its
+            // own task with the single-link flow and keep the burst going.
+            let mut finished = false;
+            while !finished {
+                tokio::select! {
+                    res = &mut handle => {
+                        match res {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => log::error!("link_handler failed: {}", e),
+                            Err(e) => log::error!("link_handler task failed: {}", e),
+                        }
+                        finished = true;
+                    }
+                    Some(new_job) = rx.recv() => {
+                        let new_dedupe_key = new_job.dedupe_key.clone();
+                        tokio::spawn(async move {
+                            let _ = link_handler(new_job, None).await;
+                            PROCESSING.lock().await.remove(&new_dedupe_key);
+                        });
+                    }
+                }
             }
             PROCESSING.lock().await.remove(&dedupe_key);
         }

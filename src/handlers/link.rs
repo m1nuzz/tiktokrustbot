@@ -542,44 +542,34 @@ pub async fn link_handler(
                     }
                 };
 
-                // Do not block the queue here: send every choice message of the
-                // burst immediately, then let a background task edit this item's
-                // status once its delivery/skip/failure is known. New links sent
-                // while an older item is still waiting must get their button at
-                // once instead of waiting for a skip.
-                if let (Some(info), Some(waiter)) = (batch.clone(), waiter) {
-                    let bot_task = bot.clone();
-                    let db_task = db_pool.clone();
-                    let ymid_task = ymid.clone();
-                    let lang_task = lang.clone();
-                    let chat_id_task = sent.chat.id;
-                    let message_id_task = sent.id;
-                    tokio::spawn(async move {
-                        let outcome = match timeout(BATCH_WAIT_TIMEOUT, waiter).await {
-                            Ok(Ok(outcome)) => outcome,
-                            Ok(Err(_)) => BatchOutcome::Failed,
-                            Err(_) => {
-                                let _ = db_task.mark_pending_skipped(&ymid_task).await;
-                                BatchOutcome::Skipped
-                            }
-                        };
-                        remove_batch_waiter(&ymid_task);
+                // A real burst is handled strictly one item at a time: the next
+                // choice message only appears after this one is delivered,
+                // skipped or failed. Single links keep the old immediate flow.
+                if let (Some(info), Some(waiter)) = (batch, waiter) {
+                    let outcome = match timeout(BATCH_WAIT_TIMEOUT, waiter).await {
+                        Ok(Ok(outcome)) => outcome,
+                        Ok(Err(_)) => BatchOutcome::Failed,
+                        Err(_) => {
+                            let _ = db_pool.mark_pending_skipped(&ymid).await;
+                            BatchOutcome::Skipped
+                        }
+                    };
+                    remove_batch_waiter(&ymid);
 
-                        let status_key = match outcome {
-                            BatchOutcome::Delivered => MsgKey::BatchDelivered,
-                            BatchOutcome::Skipped => MsgKey::BatchSkipped,
-                            BatchOutcome::Failed => MsgKey::BatchFailed,
-                        };
-                        let status_text = batch_text(
-                            status_key,
-                            Some(lang_task.as_str()),
-                            info.position,
-                            info.total,
-                        );
-                        let _ = bot_task.edit_message_text(chat_id_task, message_id_task, status_text).await;
-                        // Remove the ad/premium/skip buttons from the finished item.
-                        let _ = bot_task.edit_message_reply_markup(chat_id_task, message_id_task).await;
-                    });
+                    let status_key = match outcome {
+                        BatchOutcome::Delivered => MsgKey::BatchDelivered,
+                        BatchOutcome::Skipped => MsgKey::BatchSkipped,
+                        BatchOutcome::Failed => MsgKey::BatchFailed,
+                    };
+                    let status_text = batch_text(
+                        status_key,
+                        Some(lang.as_str()),
+                        info.position,
+                        info.total,
+                    );
+                    let _ = bot.edit_message_text(sent.chat.id, sent.id, status_text).await;
+                    // Remove the ad/premium/skip buttons from the finished item.
+                    let _ = bot.edit_message_reply_markup(sent.chat.id, sent.id).await;
                 }
 
                 return Ok(());
