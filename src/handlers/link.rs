@@ -917,6 +917,76 @@ mod tests {
     }
 
     #[test]
+    fn batch_text_replaces_placeholders_for_all_keys_and_langs() {
+        let keys = [
+            MsgKey::BatchProgress,
+            MsgKey::BatchDelivered,
+            MsgKey::BatchSkipped,
+            MsgKey::BatchFailed,
+            MsgKey::BatchSkipButton,
+        ];
+        for &key in &keys {
+            for &lang in i18n::SUPPORTED_LANGS {
+                let text = batch_text(key, Some(lang), 7, 9);
+                assert!(!text.contains(\"{current}\"), \"lang {lang}: {text}\");
+                assert!(!text.contains(\"{total}\"), \"lang {lang}: {text}\");
+                assert!(text.contains('7'), \"current not substituted for {lang}: {text}\");
+                assert!(text.contains('9'), \"total not substituted for {lang}: {text}\");
+            }
+            let text = batch_text(key, None, 7, 9);
+            assert!(!text.contains(\"{current}\"), \"{text}\");
+            assert!(!text.contains(\"{total}\"), \"{text}\");
+        }
+    }
+
+    #[test]
+    fn notify_batch_outcome_wakes_and_removes_waiter() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        BATCH_WAITERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(\"ymid-wake\".to_string(), tx);
+        assert!(is_batch_waiting(\"ymid-wake\"));
+
+        notify_batch_outcome(Some(\"ymid-wake\"), BatchOutcome::Delivered);
+
+        assert!(!is_batch_waiting(\"ymid-wake\"));
+        assert_eq!(rx.try_recv().unwrap(), BatchOutcome::Delivered);
+        notify_batch_outcome(Some(\"ymid-wake\"), BatchOutcome::Failed);
+    }
+
+    #[test]
+    fn notify_batch_outcome_none_is_noop() {
+        notify_batch_outcome(None, BatchOutcome::Failed);
+    }
+
+    #[test]
+    fn batch_failure_guard_notifies_failed_on_drop() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        BATCH_WAITERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(\"ymid-guard\".to_string(), tx);
+
+        {
+            let _guard = BatchFailureGuard(Some(\"ymid-guard\".to_string()));
+            assert!(rx.try_recv().is_err());
+        }
+
+        assert!(!is_batch_waiting(\"ymid-guard\"));
+        assert_eq!(rx.try_recv().unwrap(), BatchOutcome::Failed);
+    }
+
+    #[test]
+    fn batch_failure_guard_none_is_noop() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let _guard = BatchFailureGuard(None);
+        drop(_guard);
+        assert!(rx.try_recv().is_err());
+        let _ = tx;
+    }
+
+    #[test]
     fn download_errors_classified_for_immediate_reply() {
         let unsupported = anyhow::anyhow!("yt-dlp failed: ERROR: Unsupported URL: https://www.tiktok.com/@u/photo/1");
         assert_eq!(classify_download_error(&unsupported, "https://example.com"), crate::i18n::MsgKey::UnsupportedFormat);
