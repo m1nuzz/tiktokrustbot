@@ -200,6 +200,11 @@ pub fn init_database() -> Result<()> {
     // joined to the session that served it.
     ensure_column(&conn, "pending_downloads", "entry_ymid", "entry_ymid TEXT DEFAULT NULL")?;
     ensure_column(&conn, "pending_downloads", "ad_requested_at", "ad_requested_at DATETIME DEFAULT NULL")?;
+    // Burst ordering metadata: which burst a row belongs to and its 1-based
+    // position inside it. NULL for single-link rows.
+    ensure_column(&conn, "pending_downloads", "batch_id", "batch_id TEXT DEFAULT NULL")?;
+    ensure_column(&conn, "pending_downloads", "batch_position", "batch_position INTEGER DEFAULT NULL")?;
+    ensure_column(&conn, "pending_downloads", "batch_total", "batch_total INTEGER DEFAULT NULL")?;
     // Owning bot for delivery routing, sweeper notifications and per-bot
     // stats. DEFAULT keeps old INSERTs (which predate multi-bot) working and
     // attributes legacy rows to 'primary'.
