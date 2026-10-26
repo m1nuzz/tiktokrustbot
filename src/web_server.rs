@@ -37,6 +37,7 @@ pub struct AppState {
     pub mtproto_uploader: Arc<MTProtoUploader>,
     pub task_manager: Arc<tokio::sync::Mutex<TaskManager>>,
     pub upload_semaphore: Arc<tokio::sync::Semaphore>,
+    pub download_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -575,6 +576,7 @@ async fn spawn_download_job(
             state.db,
             state.task_manager,
             state.upload_semaphore,
+            state.download_semaphore,
             None,
             ChatId(user_id),
             Some(lang),

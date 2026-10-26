@@ -427,6 +427,7 @@ async fn main() -> Result<(), Error> {
         mtproto_uploader: primary_uploader,
         task_manager: task_manager.clone(),
         upload_semaphore: upload_semaphore.clone(),
+        download_semaphore: download_semaphore.clone(),
     };
 
     let web_port: u16 = env::var("WEB_SERVER_PORT")

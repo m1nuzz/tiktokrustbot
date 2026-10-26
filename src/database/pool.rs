@@ -756,6 +756,7 @@ impl DatabasePool {
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()
+            .map(|v| v.flatten())
         })
         .await
         .map_err(|e| anyhow::anyhow!("Failed to get file path for {}: {}", id, e))

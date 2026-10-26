@@ -974,7 +974,9 @@ pub async fn process_video_request(
         // Mark download finished so the next batch item can start downloading
         // while this one uploads.
         if let Some(ymid) = ymid.as_deref() {
-            let _ = db_pool.mark_pending_downloaded(ymid, &path).await;
+            let _ = db_pool
+                .mark_pending_downloaded(ymid, path.to_str().unwrap_or(""))
+                .await;
             if let Ok(Some((batch_id, _, _))) = db_pool.get_batch_info(ymid).await {
                 batch_notifier(&batch_id).notify_waiters();
             }
