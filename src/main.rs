@@ -1,19 +1,19 @@
 use anyhow::Error;
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::env;
+use std::sync::Arc;
 use teloxide::prelude::*;
 use tokio::sync::Mutex;
 
+use teloxide::dispatching::dialogue;
+use teloxide::dptree;
+use tiktokdownloader::BotCtx;
+use tiktokdownloader::build_handler;
 use tiktokdownloader::database::DatabasePool;
 use tiktokdownloader::handlers::broadcast::BroadcastState;
 use tiktokdownloader::mtproto_uploader::MTProtoUploader;
 use tiktokdownloader::utils::task_manager::TaskManager;
-use tiktokdownloader::yt_dlp_interface::{ensure_binaries, is_executable_present, YoutubeFetcher};
-use tiktokdownloader::build_handler;
-use tiktokdownloader::BotCtx;
-use teloxide::dispatching::dialogue;
-use teloxide::dptree;
+use tiktokdownloader::yt_dlp_interface::{YoutubeFetcher, ensure_binaries, is_executable_present};
 
 // For deduplication
 lazy_static::lazy_static! {
@@ -21,12 +21,17 @@ lazy_static::lazy_static! {
 }
 
 fn build_bot(is_test_mode: bool, client: reqwest::Client) -> (Bot, String) {
-    let token_var = if is_test_mode { "TELEGRAM_TEST_TOKEN" } else { "TELOXIDE_TOKEN" };
-    
+    let token_var = if is_test_mode {
+        "TELEGRAM_TEST_TOKEN"
+    } else {
+        "TELOXIDE_TOKEN"
+    };
+
     let raw_token = std::env::var(token_var)
         .unwrap_or_else(|_| {
             if is_test_mode {
-                std::env::var("TELOXIDE_TOKEN").expect("Neither TELEGRAM_TEST_TOKEN nor TELOXIDE_TOKEN is set")
+                std::env::var("TELOXIDE_TOKEN")
+                    .expect("Neither TELEGRAM_TEST_TOKEN nor TELOXIDE_TOKEN is set")
             } else {
                 panic!("TELOXIDE_TOKEN must be set")
             }
@@ -111,7 +116,11 @@ async fn setup_one_bot(
             me.user.username.unwrap_or_default()
         }
         Err(e) => {
-            log::error!("❌ Auth Error for bot id {}: {}. Check its token.", bot_id, e);
+            log::error!(
+                "❌ Auth Error for bot id {}: {}. Check its token.",
+                bot_id,
+                e
+            );
             return Err(anyhow::anyhow!("auth failed for bot id {}", bot_id));
         }
     };
@@ -165,7 +174,9 @@ async fn prune_stale_output_files(output_dir: std::path::PathBuf) {
 async fn main() -> Result<(), Error> {
     // 1. Initialize logger IMMEDIATELY
     if std::env::var("RUST_LOG").is_err() {
-        unsafe { std::env::set_var("RUST_LOG", "info"); }
+        unsafe {
+            std::env::set_var("RUST_LOG", "info");
+        }
     }
     pretty_env_logger::init();
     log::info!("Starting TikTok downloader bot...");
@@ -189,14 +200,21 @@ async fn main() -> Result<(), Error> {
         return Err(e.into());
     }
 
-    let yt_dlp_path = libraries_dir.join(if cfg!(target_os = "windows") { "yt-dlp.exe" } else { "yt-dlp" });
+    let yt_dlp_path = libraries_dir.join(if cfg!(target_os = "windows") {
+        "yt-dlp.exe"
+    } else {
+        "yt-dlp"
+    });
     let ffmpeg_dir = libraries_dir.join("ffmpeg");
 
     if !is_executable_present(&yt_dlp_path) {
         return Err(anyhow::Error::msg("yt-dlp not available"));
     }
 
-    let auto_updater = Arc::new(tiktokdownloader::auto_update::AutoUpdater::new(libraries_dir.clone(), 30));
+    let auto_updater = Arc::new(tiktokdownloader::auto_update::AutoUpdater::new(
+        libraries_dir.clone(),
+        30,
+    ));
     let _ = auto_updater.check_for_updates().await;
 
     let updater_clone = Arc::clone(&auto_updater);
@@ -209,7 +227,11 @@ async fn main() -> Result<(), Error> {
         return Err(e.into());
     }
 
-    let fetcher = Arc::new(YoutubeFetcher::new(yt_dlp_path, output_dir.clone(), ffmpeg_dir.clone())?);
+    let fetcher = Arc::new(YoutubeFetcher::new(
+        yt_dlp_path,
+        output_dir.clone(),
+        ffmpeg_dir.clone(),
+    )?);
 
     // --- Bot Configuration ---
     let reqwest_client = reqwest::Client::builder()
@@ -221,12 +243,25 @@ async fn main() -> Result<(), Error> {
 
     let is_test_mode = env::var("TEST_MODE")
         .unwrap_or_else(|_| "false".to_string())
-        .to_lowercase() == "true";
+        .to_lowercase()
+        == "true";
 
     let (multi_tokens, multi_usernames) = resolve_bot_tokens(is_test_mode);
 
-    let ffprobe_path = libraries_dir.join("ffmpeg").join(if cfg!(target_os = "windows") { "ffprobe.exe" } else { "ffprobe" });
-    let ffmpeg_path = libraries_dir.join("ffmpeg").join(if cfg!(target_os = "windows") { "ffmpeg.exe" } else { "ffmpeg" });
+    let ffprobe_path = libraries_dir
+        .join("ffmpeg")
+        .join(if cfg!(target_os = "windows") {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        });
+    let ffmpeg_path = libraries_dir
+        .join("ffmpeg")
+        .join(if cfg!(target_os = "windows") {
+            "ffmpeg.exe"
+        } else {
+            "ffmpeg"
+        });
 
     // Per-bot acquisition. Single token (or test mode) follows the legacy
     // path byte-for-byte, including the historic session filename; BOT_TOKENS
@@ -239,17 +274,24 @@ async fn main() -> Result<(), Error> {
 
         // Diagnostic check
         match bot.get_me().await {
-            Ok(me) => log::info!("✅ Successfully connected to Telegram as @{}", me.user.username.unwrap_or_default()),
+            Ok(me) => log::info!(
+                "✅ Successfully connected to Telegram as @{}",
+                me.user.username.unwrap_or_default()
+            ),
             Err(e) => {
-                log::error!("❌ Auth Error: {}. Please check your token and TEST_MODE setting.", e);
+                log::error!(
+                    "❌ Auth Error: {}. Please check your token and TEST_MODE setting.",
+                    e
+                );
                 return Err(e.into());
             }
         }
 
-        let mtproto_uploader = match MTProtoUploader::new(&raw_token, ffprobe_path, ffmpeg_path).await {
-            Ok(uploader) => Arc::new(uploader),
-            Err(e) => return Err(anyhow::anyhow!("{}", e)),
-        };
+        let mtproto_uploader =
+            match MTProtoUploader::new(&raw_token, ffprobe_path, ffmpeg_path).await {
+                Ok(uploader) => Arc::new(uploader),
+                Err(e) => return Err(anyhow::anyhow!("{}", e)),
+            };
 
         let bot_id = bot_id_from_token(&raw_token)
             .unwrap_or_else(|| tiktokdownloader::database::PRIMARY_BOT_ID.to_string());
@@ -291,7 +333,9 @@ async fn main() -> Result<(), Error> {
         }
     }
     if configured.is_empty() {
-        return Err(anyhow::anyhow!("No usable bot tokens: set TELOXIDE_TOKEN or BOT_TOKENS"));
+        return Err(anyhow::anyhow!(
+            "No usable bot tokens: set TELOXIDE_TOKEN or BOT_TOKENS"
+        ));
     }
 
     let db_path = tiktokdownloader::database::get_database_path();
@@ -302,20 +346,33 @@ async fn main() -> Result<(), Error> {
     // A failed registration never blocks startup: delivery routing falls back.
     for cfg in &configured {
         if let Err(e) = db_pool.register_bot(&cfg.id, &cfg.username).await {
-            log::error!("Failed to register bot {} (@{}): {}", cfg.id, cfg.username, e);
+            log::error!(
+                "Failed to register bot {} (@{}): {}",
+                cfg.id,
+                cfg.username,
+                e
+            );
         }
     }
 
     // Sync settings from .env to database (only as initial defaults, don't overwrite admin panel values)
     if let Ok(sub_req) = env::var("SUBSCRIPTION_REQUIRED") {
         if db_pool.get_setting("subscription_required").await.is_err() {
-            let val = if sub_req.to_lowercase() == "true" { "true" } else { "false" };
+            let val = if sub_req.to_lowercase() == "true" {
+                "true"
+            } else {
+                "false"
+            };
             let _ = db_pool.set_setting("subscription_required", val).await;
         }
     }
     if let Ok(ads_en) = env::var("ADS_ENABLED") {
         if db_pool.get_setting("ads_enabled").await.is_err() {
-            let val = if ads_en.to_lowercase() == "true" { "true" } else { "false" };
+            let val = if ads_en.to_lowercase() == "true" {
+                "true"
+            } else {
+                "false"
+            };
             let _ = db_pool.set_setting("ads_enabled", val).await;
         }
     }
@@ -323,6 +380,18 @@ async fn main() -> Result<(), Error> {
         log::error!("Failed to seed channels from CHANNEL_IDS: {}", e);
     }
 
+    if let Err(e) = db_pool.seed_admins_from_env().await {
+        log::error!("Failed to seed admins from ADMIN_IDS: {}", e);
+    }
+    match db_pool.list_admins().await {
+        Ok(ids) => tiktokdownloader::handlers::admin::set_admin_cache(ids),
+        Err(e) => {
+            log::error!("Failed to load admin cache: {}", e);
+            tiktokdownloader::handlers::admin::set_admin_cache(
+                tiktokdownloader::handlers::admin::env_admin_ids(),
+            );
+        }
+    }
     let task_manager = Arc::new(tokio::sync::Mutex::new(TaskManager::new(2)));
     let upload_semaphore = Arc::new(tokio::sync::Semaphore::new(2));
 
@@ -426,7 +495,9 @@ async fn main() -> Result<(), Error> {
         let mut dispatcher = Dispatcher::builder(cfg.bot, handler)
             .dependencies(dptree::deps![
                 dialogue::InMemStorage::<BroadcastState>::new(),
-                BotCtx { bot_id: cfg.id.clone() },
+                BotCtx {
+                    bot_id: cfg.id.clone()
+                },
                 bot_directory.clone(),
                 fetcher.clone(),
                 cfg.uploader,

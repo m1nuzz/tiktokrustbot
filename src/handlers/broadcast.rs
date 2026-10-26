@@ -1,14 +1,14 @@
-use teloxide::prelude::*;
-use teloxide::dispatching::dialogue::{InMemStorage, Dialogue};
-use teloxide::types::{ParseMode, ChatId, InlineKeyboardMarkup, InlineKeyboardButton};
+use crate::database::DatabasePool;
+use crate::handlers::admin::{is_admin, is_admin_id};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::database::DatabasePool;
-use crate::handlers::admin::{is_admin, is_admin_id};
+use teloxide::dispatching::dialogue::{Dialogue, InMemStorage};
+use teloxide::prelude::*;
+use teloxide::types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
 use tokio::sync::Semaphore;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 type MyDialogue = Dialogue<BroadcastState, InMemStorage<BroadcastState>>;
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -50,9 +50,23 @@ pub enum BroadcastState {
     #[default]
     Idle,
     WaitingForScope,
-    WaitingForMessage { scope: BroadcastScope },
-    WaitingForConfirmation { message: String, scope: BroadcastScope },
-    WaitingForAddPremiumUserId,
+    WaitingForMessage {
+        scope: BroadcastScope,
+    },
+    WaitingForConfirmation {
+        message: String,
+        scope: BroadcastScope,
+    },
+    WaitingForAddAdmins,
+    WaitingForRemoveAdmins,
+    WaitingForPremiumUsers,
+    WaitingForPremiumDuration {
+        user_ids: Vec<i64>,
+    },
+    WaitingForPremiumCustomDuration {
+        user_ids: Vec<i64>,
+    },
+    WaitingForRemovePremiumUsers,
     WaitingForSetPrice,
     WaitingForSubscriptionChannels,
 }
@@ -79,7 +93,9 @@ pub fn broadcast_now_unix() -> u64 {
 /// Shared flood-wait flag: any worker that hits 429/RetryAfter parks every
 /// other worker until the wait lapses. Stores unix seconds.
 pub fn broadcast_pause_set(pause_until: &AtomicU64, wait_secs: u64) {
-    let until = broadcast_now_unix().saturating_add(wait_secs).saturating_add(1);
+    let until = broadcast_now_unix()
+        .saturating_add(wait_secs)
+        .saturating_add(1);
     // Only move the deadline forward, never backward.
     pause_until.fetch_max(until, Ordering::Relaxed);
 }
@@ -97,11 +113,7 @@ fn scope_keyboard() -> InlineKeyboardMarkup {
     ]])
 }
 
-pub async fn start_broadcast(
-    bot: Bot,
-    dialogue: MyDialogue,
-    msg: Message,
-) -> HandlerResult {
+pub async fn start_broadcast(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerResult {
     if !is_admin(&msg).await {
         bot.send_message(msg.chat.id, "⛔ Admins only.")
             .await
@@ -114,7 +126,8 @@ pub async fn start_broadcast(
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-    dialogue.update(BroadcastState::WaitingForScope)
+    dialogue
+        .update(BroadcastState::WaitingForScope)
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     Ok(())
@@ -122,17 +135,14 @@ pub async fn start_broadcast(
 
 /// Text arriving while the scope picker is open: /cancel aborts, anything
 /// else re-shows the picker (there is no message yet to preview).
-pub async fn handle_scope_text(
-    bot: Bot,
-    dialogue: MyDialogue,
-    msg: Message,
-) -> HandlerResult {
+pub async fn handle_scope_text(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerResult {
     if let Some(text) = msg.text() {
         if text == "/cancel" {
             bot.send_message(msg.chat.id, "❌ Cancelled.")
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            dialogue.exit()
+            dialogue
+                .exit()
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             return Ok(());
@@ -195,7 +205,8 @@ pub async fn handle_scope_selection(
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     }
 
-    dialogue.update(BroadcastState::WaitingForMessage { scope })
+    dialogue
+        .update(BroadcastState::WaitingForMessage { scope })
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     Ok(())
@@ -212,7 +223,8 @@ pub async fn receive_broadcast_message(
             bot.send_message(msg.chat.id, "❌ Cancelled.")
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            dialogue.exit()
+            dialogue
+                .exit()
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             return Ok(());
@@ -229,24 +241,23 @@ pub async fn receive_broadcast_message(
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         // Confirmation buttons
-        let keyboard = InlineKeyboardMarkup::new(vec![
-            vec![
-                InlineKeyboardButton::callback(scope.confirm_label(), BROADCAST_CONFIRM),
-                InlineKeyboardButton::callback("❌ Cancel", BROADCAST_CANCEL),
-            ]
-        ]);
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::callback(scope.confirm_label(), BROADCAST_CONFIRM),
+            InlineKeyboardButton::callback("❌ Cancel", BROADCAST_CANCEL),
+        ]]);
 
         bot.send_message(msg.chat.id, "Send this message?")
             .reply_markup(keyboard)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        dialogue.update(BroadcastState::WaitingForConfirmation {
-            message: text.to_string(),
-            scope,
-        })
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        dialogue
+            .update(BroadcastState::WaitingForConfirmation {
+                message: text.to_string(),
+                scope,
+            })
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     }
 
     Ok(())
@@ -274,7 +285,8 @@ pub async fn handle_broadcast_confirmation(
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-            dialogue.exit()
+            dialogue
+                .exit()
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             return Ok(());
@@ -322,14 +334,16 @@ pub async fn handle_broadcast_confirmation(
                             let Some(send_bot) = bots.get(&bot_id).cloned() else {
                                 log::warn!(
                                     "Broadcast: no connected bot for bot_id {} (user {}), skipping",
-                                    bot_id, user_id
+                                    bot_id,
+                                    user_id
                                 );
                                 failed.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             };
 
-                            let permit = semaphore.clone().acquire_owned().await
-                                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                            let permit = semaphore.clone().acquire_owned().await.map_err(|e| {
+                                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                            })?;
                             let text = message.clone();
                             let sent_c = sent.clone();
                             let failed_c = failed.clone();
@@ -339,7 +353,8 @@ pub async fn handle_broadcast_confirmation(
                                 while broadcast_pause_remaining(&pause_c) > 0 {
                                     sleep(Duration::from_secs(1)).await;
                                 }
-                                match send_bot.send_message(ChatId(user_id), &text)
+                                match send_bot
+                                    .send_message(ChatId(user_id), &text)
                                     .parse_mode(ParseMode::Html)
                                     .await
                                 {
@@ -355,12 +370,20 @@ pub async fn handle_broadcast_confirmation(
                                         match &e {
                                             teloxide_core::errors::RequestError::RetryAfter(d) => {
                                                 let secs = (d.seconds() as u64).max(1);
-                                                log::info!("429 RetryAfter({}s) - pausing all senders", secs);
+                                                log::info!(
+                                                    "429 RetryAfter({}s) - pausing all senders",
+                                                    secs
+                                                );
                                                 broadcast_pause_set(&pause_c, secs.min(300));
                                             }
                                             _ => {
-                                                if let Some(secs) = extract_flood_wait(&e.to_string()) {
-                                                    log::info!("FLOOD_WAIT_{} - pausing all senders", secs);
+                                                if let Some(secs) =
+                                                    extract_flood_wait(&e.to_string())
+                                                {
+                                                    log::info!(
+                                                        "FLOOD_WAIT_{} - pausing all senders",
+                                                        secs
+                                                    );
                                                     broadcast_pause_set(&pause_c, secs.min(300));
                                                 }
                                             }
@@ -396,7 +419,8 @@ pub async fn handle_broadcast_confirmation(
                 }
             }
 
-            dialogue.exit()
+            dialogue
+                .exit()
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         }

@@ -1,9 +1,9 @@
-use rusqlite::{Connection, Result as SqliteResult, params, OptionalExtension};
-use tokio::sync::{Semaphore, Mutex};
-use tokio::time::{timeout, Duration};
-use std::sync::Arc;
 use lru::LruCache;
+use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, params};
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+use tokio::sync::{Mutex, Semaphore};
+use tokio::time::{Duration, timeout};
 
 pub struct DatabasePool {
     db_path: String,
@@ -44,6 +44,32 @@ pub enum ClaimVia {
 /// `bot_id` column defaults to this, and Phase-2 runtime replaces these
 /// uses with the dispatching bot's id (grep PRIMARY_BOT_ID for the list).
 pub const PRIMARY_BOT_ID: &str = "primary";
+
+/// SQLite modifier for a premium duration. Only whitelisted units reach SQL;
+/// weeks are normalised to days because SQLite has no `weeks` modifier.
+/// Returns `(modifier, needs_floor)`.
+fn premium_sql_modifier(amount: i64, unit: &str) -> Result<(String, bool), anyhow::Error> {
+    if amount <= 0 {
+        anyhow::bail!("premium duration must be positive");
+    }
+    let unit = unit.trim().to_ascii_lowercase();
+    let (modifier, needs_floor) = match unit.as_str() {
+        "seconds" => (format!("+{} seconds", amount), false),
+        "minutes" => (format!("+{} minutes", amount), false),
+        "hours" => (format!("+{} hours", amount), false),
+        "days" => (format!("+{} days", amount), false),
+        "weeks" => {
+            let days = amount
+                .checked_mul(7)
+                .ok_or_else(|| anyhow::anyhow!("premium duration overflow"))?;
+            (format!("+{} days", days), false)
+        }
+        "months" => (format!("+{} months", amount), true),
+        "years" => (format!("+{} years", amount), true),
+        _ => anyhow::bail!("unsupported premium duration unit: {}", unit),
+    };
+    Ok((modifier, needs_floor))
+}
 
 pub const SESSION_LEASE_SECS: i64 = 1800;
 
@@ -145,9 +171,7 @@ impl DatabasePool {
             db_path,
             connection_semaphore: Arc::new(Semaphore::new(max_connections)),
             // LRU cache automatically removes least recently used entries when limit reached
-            user_cache: Arc::new(Mutex::new(
-                LruCache::new(NonZeroUsize::new(1000).unwrap())
-            )),
+            user_cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(1000).unwrap()))),
         }
     }
 
@@ -157,30 +181,29 @@ impl DatabasePool {
         F: FnOnce(&Connection) -> SqliteResult<R> + Send + 'static,
         R: Send + 'static,
     {
-        let _permit = timeout(
-            Duration::from_secs(5),
-            self.connection_semaphore.acquire()
-        ).await??;
-        
+        let _permit =
+            timeout(Duration::from_secs(5), self.connection_semaphore.acquire()).await??;
+
         let db_path = self.db_path.clone();
         let result = timeout(
             Duration::from_secs(10),
             tokio::task::spawn_blocking(move || {
                 let conn = Connection::open(&db_path)?;
-                
+
                 // Optimize SQLite for concurrent access
                 conn.execute_batch(
                     "PRAGMA journal_mode = WAL;
                      PRAGMA synchronous = NORMAL;
                      PRAGMA cache_size = 32000;
                      PRAGMA temp_store = MEMORY;
-                     PRAGMA busy_timeout = 5000;"
+                     PRAGMA busy_timeout = 5000;",
                 )?;
-                
+
                 operation(&conn)
-            })
-        ).await?;
-        
+            }),
+        )
+        .await?;
+
         match result {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(e)) => Err(anyhow::anyhow!(e)),
@@ -189,7 +212,11 @@ impl DatabasePool {
     }
 
     /// Get user quality preference with caching
-     pub async fn get_user_quality(&self, bot_id: &str, user_id: i64) -> Result<String, anyhow::Error> {
+    pub async fn get_user_quality(
+        &self,
+        bot_id: &str,
+        user_id: i64,
+    ) -> Result<String, anyhow::Error> {
         let bot_owned = bot_id.to_string();
         let cache_key = (bot_owned.clone(), user_id);
         // Check LRU cache
@@ -198,7 +225,11 @@ impl DatabasePool {
             if let Some(user_info) = cache.get(&cache_key) {
                 // Cache is valid for 5 minutes
                 if user_info.last_updated.elapsed() < Duration::from_secs(300) {
-                    log::info!("Using cached quality preference for user {}: {}", user_id, user_info.quality_preference);
+                    log::info!(
+                        "Using cached quality preference for user {}: {}",
+                        user_id,
+                        user_info.quality_preference
+                    );
                     return Ok(user_info.quality_preference.clone());
                 }
                 log::info!("Cache expired for user {}, removing from cache", user_id);
@@ -209,40 +240,57 @@ impl DatabasePool {
         }
 
         // Load from DB
-        let quality = self.execute_with_timeout(move |conn| {
-            match conn.query_row(
-                "SELECT quality_preference FROM users WHERE bot_id = ?1 AND telegram_id = ?2",
-                params![bot_owned, user_id],
-                |row| Ok(row.get::<_, String>(0)?)
-            ) {
-                Ok(quality) => {
-                    log::info!("Retrieved quality preference from DB for user {}: {}", user_id, quality);
-                    Ok(quality)
-                },
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    log::info!("No quality preference found for user {}, using default", user_id);
-                    Ok("best".to_string()) // Default value
-                },
-                Err(e) => {
-                    log::error!("Error retrieving quality preference for user {} from DB: {}", user_id, e);
-                    Ok("best".to_string()) // Default value
+        let quality = self
+            .execute_with_timeout(move |conn| {
+                match conn.query_row(
+                    "SELECT quality_preference FROM users WHERE bot_id = ?1 AND telegram_id = ?2",
+                    params![bot_owned, user_id],
+                    |row| Ok(row.get::<_, String>(0)?),
+                ) {
+                    Ok(quality) => {
+                        log::info!(
+                            "Retrieved quality preference from DB for user {}: {}",
+                            user_id,
+                            quality
+                        );
+                        Ok(quality)
+                    }
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        log::info!(
+                            "No quality preference found for user {}, using default",
+                            user_id
+                        );
+                        Ok("best".to_string()) // Default value
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Error retrieving quality preference for user {} from DB: {}",
+                            user_id,
+                            e
+                        );
+                        Ok("best".to_string()) // Default value
+                    }
                 }
-            }
-        }).await?;
+            })
+            .await?;
 
         // Update LRU cache (put automatically evicts old entries)
         {
             let mut cache = self.user_cache.lock().await;
-            log::info!("Caching quality preference for user {}: {}", user_id, quality);
+            log::info!(
+                "Caching quality preference for user {}: {}",
+                user_id,
+                quality
+            );
             cache.put(
                 (bot_id.to_string(), user_id),
                 UserInfo {
                     quality_preference: quality.clone(),
                     last_updated: tokio::time::Instant::now(),
-                }
+                },
             );
         }
-        
+
         Ok(quality)
     }
 
@@ -254,45 +302,79 @@ impl DatabasePool {
     }
 
     /// Manual /language override for a user, if set.
-    pub async fn get_user_lang(&self, bot_id: &str, user_id: i64) -> Result<Option<String>, anyhow::Error> {
+    pub async fn get_user_lang(
+        &self,
+        bot_id: &str,
+        user_id: i64,
+    ) -> Result<Option<String>, anyhow::Error> {
         let bot_owned = bot_id.to_string();
         self.execute_with_timeout(move |conn| {
             // Double Option: missing row -> None via `.optional()`, NULL cell
             // (a cleared override) -> None via `FromSql for Option`. Both mean
             // "no manual override", so flatten to one.
-            let lang: Option<Option<String>> = conn.query_row(
-                "SELECT lang FROM users WHERE bot_id = ?1 AND telegram_id = ?2",
-                params![bot_owned, user_id],
-                |row| row.get(0)
-            ).optional()?;
+            let lang: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT lang FROM users WHERE bot_id = ?1 AND telegram_id = ?2",
+                    params![bot_owned, user_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
             Ok(lang.flatten())
-        }).await.map_err(|e| anyhow::anyhow!("Failed to get language for user {}: {}", user_id, e))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get language for user {}: {}", user_id, e))
     }
 
     /// Persist the manual /language override for a user.
-    pub async fn set_user_lang(&self, bot_id: &str, user_id: i64, lang: &str) -> Result<(), anyhow::Error> {
+    pub async fn set_user_lang(
+        &self,
+        bot_id: &str,
+        user_id: i64,
+        lang: &str,
+    ) -> Result<(), anyhow::Error> {
         let bot_owned = bot_id.to_string();
         let lang_owned = lang.to_string();
         self.execute_with_timeout(move |conn| {
-            conn.execute("INSERT OR IGNORE INTO users (bot_id, telegram_id) VALUES (?1, ?2)", params![bot_owned, user_id])?;
-            conn.execute("UPDATE users SET lang = ?1 WHERE bot_id = ?2 AND telegram_id = ?3", params![lang_owned, bot_owned, user_id])?;
+            conn.execute(
+                "INSERT OR IGNORE INTO users (bot_id, telegram_id) VALUES (?1, ?2)",
+                params![bot_owned, user_id],
+            )?;
+            conn.execute(
+                "UPDATE users SET lang = ?1 WHERE bot_id = ?2 AND telegram_id = ?3",
+                params![lang_owned, bot_owned, user_id],
+            )?;
             Ok(())
-        }).await.map_err(|e| anyhow::anyhow!("Failed to set language for user {}: {}", user_id, e))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to set language for user {}: {}", user_id, e))
     }
     /// Drop the manual override so the device tag wins again (auto-detect).
     /// Missing rows are fine: clearing what was never set changes nothing.
     pub async fn clear_user_lang(&self, bot_id: &str, user_id: i64) -> Result<(), anyhow::Error> {
         let bot_owned = bot_id.to_string();
         self.execute_with_timeout(move |conn| {
-            conn.execute("INSERT OR IGNORE INTO users (bot_id, telegram_id) VALUES (?1, ?2)", params![bot_owned, user_id])?;
-            conn.execute("UPDATE users SET lang = NULL WHERE bot_id = ?1 AND telegram_id = ?2", params![bot_owned, user_id])?;
+            conn.execute(
+                "INSERT OR IGNORE INTO users (bot_id, telegram_id) VALUES (?1, ?2)",
+                params![bot_owned, user_id],
+            )?;
+            conn.execute(
+                "UPDATE users SET lang = NULL WHERE bot_id = ?1 AND telegram_id = ?2",
+                params![bot_owned, user_id],
+            )?;
             Ok(())
-        }).await.map_err(|e| anyhow::anyhow!("Failed to clear language for user {}: {}", user_id, e))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to clear language for user {}: {}", user_id, e))
     }
 
     /// Effective locale: the stored /language override wins, else the Telegram
     /// device tag, else English. Never fails.
-    pub async fn get_effective_lang(&self, bot_id: &str, user_id: i64, tg_lang: Option<&str>) -> String {
+    pub async fn get_effective_lang(
+        &self,
+        bot_id: &str,
+        user_id: i64,
+        tg_lang: Option<&str>,
+    ) -> String {
         let stored = self.get_user_lang(bot_id, user_id).await.ok().flatten();
         crate::i18n::resolve_lang(stored.as_deref().or(tg_lang)).to_string()
     }
@@ -304,9 +386,11 @@ impl DatabasePool {
             conn.query_row(
                 "SELECT value FROM settings WHERE key = ?1",
                 params![key_owned],
-                |row| row.get(0)
+                |row| row.get(0),
             )
-        }).await.map_err(|e| anyhow::anyhow!("Failed to get setting {}: {}", key, e))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get setting {}: {}", key, e))
     }
 
     /// Set a setting in the settings table
@@ -319,20 +403,18 @@ impl DatabasePool {
                 params![key_owned, value_owned],
             )?;
             Ok(())
-        }).await.map_err(|e| anyhow::anyhow!("Failed to set setting {}: {}", key, e))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to set setting {}: {}", key, e))
     }
 
     /// All channels the subscription gate checks, in insertion order.
     pub async fn list_channels(&self) -> Result<Vec<(String, Option<String>)>, anyhow::Error> {
         self.execute_with_timeout(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT channel_id, channel_name FROM channels ORDER BY id",
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT channel_id, channel_name FROM channels ORDER BY id")?;
             let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                ))
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
             })?;
             let mut out = Vec::new();
             for row in rows {
@@ -354,9 +436,8 @@ impl DatabasePool {
             let tx = conn.unchecked_transaction()?;
             tx.execute("DELETE FROM channels", [])?;
             {
-                let mut stmt = tx.prepare(
-                    "INSERT INTO channels (channel_id, channel_name) VALUES (?1, ?2)",
-                )?;
+                let mut stmt =
+                    tx.prepare("INSERT INTO channels (channel_id, channel_name) VALUES (?1, ?2)")?;
                 for (id, name) in &channels {
                     stmt.execute(params![id.as_str(), name.as_str()])?;
                 }
@@ -412,19 +493,27 @@ impl DatabasePool {
     /// All known bots, oldest first. The aggregate admin view iterates this.
     pub async fn list_bots(&self) -> Result<Vec<(String, String)>, anyhow::Error> {
         self.execute_with_timeout(|conn| {
-            let mut stmt = conn.prepare("SELECT bot_id, username FROM bots ORDER BY created_at, bot_id")?;
+            let mut stmt =
+                conn.prepare("SELECT bot_id, username FROM bots ORDER BY created_at, bot_id")?;
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);
             }
             Ok(out)
-        }).await.map_err(|e| anyhow::anyhow!("Failed to list bots: {}", e))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to list bots: {}", e))
     }
 
     /// Per-bot setting override. Missing rows fall back to the global
     /// `settings` table, then to the caller default (see resolve below).
-    pub async fn set_bot_setting(&self, bot_id: &str, key: &str, value: &str) -> Result<(), anyhow::Error> {
+    pub async fn set_bot_setting(
+        &self,
+        bot_id: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), anyhow::Error> {
         let bot_owned = bot_id.to_string();
         let key_owned = key.to_string();
         let value_owned = value.to_string();
@@ -434,7 +523,9 @@ impl DatabasePool {
                 params![bot_owned, key_owned, value_owned],
             )?;
             Ok(())
-        }).await.map_err(|e| anyhow::anyhow!("Failed to set setting {} for bot {}: {}", key, bot_id, e))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to set setting {} for bot {}: {}", key, bot_id, e))
     }
 
     /// Effective setting value: per-bot override wins, else the global
@@ -442,17 +533,24 @@ impl DatabasePool {
     pub async fn resolve_bot_setting(&self, bot_id: &str, key: &str, default: &str) -> String {
         let bot_owned = bot_id.to_string();
         let key_owned = key.to_string();
-        let per_bot: Option<String> = self.execute_with_timeout(move |conn| {
-            conn.query_row(
-                "SELECT value FROM bot_settings WHERE bot_id = ?1 AND key = ?2",
-                params![bot_owned, key_owned],
-                |row| row.get(0),
-            ).optional()
-        }).await.ok().flatten();
+        let per_bot: Option<String> = self
+            .execute_with_timeout(move |conn| {
+                conn.query_row(
+                    "SELECT value FROM bot_settings WHERE bot_id = ?1 AND key = ?2",
+                    params![bot_owned, key_owned],
+                    |row| row.get(0),
+                )
+                .optional()
+            })
+            .await
+            .ok()
+            .flatten();
         if let Some(value) = per_bot {
             return value;
         }
-        self.get_setting(key).await.unwrap_or_else(|_| default.to_string())
+        self.get_setting(key)
+            .await
+            .unwrap_or_else(|_| default.to_string())
     }
 
     /// Create a pending download record and return its unique ID (ymid).
@@ -461,8 +559,14 @@ impl DatabasePool {
     /// Create a pending download record and return its unique ID (ymid).
     /// The row starts with a live lease so it is claimable from the first
     /// second, before the client sends its first heartbeat.
-    pub async fn create_pending_download(&self, bot_id: &str, user_id: i64, video_url: &str) -> Result<String, anyhow::Error> {
-        self.create_pending_download_with_batch(bot_id, user_id, video_url, None, None, None).await
+    pub async fn create_pending_download(
+        &self,
+        bot_id: &str,
+        user_id: i64,
+        video_url: &str,
+    ) -> Result<String, anyhow::Error> {
+        self.create_pending_download_with_batch(bot_id, user_id, video_url, None, None, None)
+            .await
     }
 
     /// Like [`create_pending_download`], but stamps the row with its position
@@ -550,7 +654,10 @@ impl DatabasePool {
 
     /// Return `(batch_id, batch_position, batch_total)` for a row that belongs
     /// to a burst of forwarded links. `None` if the row is a single link.
-    pub async fn get_batch_info(&self, id: &str) -> Result<Option<(String, i64, i64)>, anyhow::Error> {
+    pub async fn get_batch_info(
+        &self,
+        id: &str,
+    ) -> Result<Option<(String, i64, i64)>, anyhow::Error> {
         let id_owned = id.to_string();
         self.execute_with_timeout(move |conn| {
             let row: Option<(Option<String>, Option<i64>, Option<i64>)> = conn
@@ -572,7 +679,11 @@ impl DatabasePool {
     /// Whether an earlier row of the same burst is still pending or verified.
     /// `process_video_request` waits on this so the final videos land in order
     /// even when several of them were claimed at once.
-    pub async fn earlier_batch_rows_unfinished(&self, batch_id: &str, position: i64) -> Result<bool, anyhow::Error> {
+    pub async fn earlier_batch_rows_unfinished(
+        &self,
+        batch_id: &str,
+        position: i64,
+    ) -> Result<bool, anyhow::Error> {
         let batch_owned = batch_id.to_string();
         self.execute_with_timeout(move |conn| {
             let count: i64 = conn.query_row(
@@ -646,7 +757,10 @@ impl DatabasePool {
     ///
     /// The whole decision runs in one transaction: two concurrent presses of the
     /// same entry ymid cannot both reuse it.
-    pub async fn resolve_session_ymid(&self, entry_ymid: &str) -> Result<Option<SessionYmid>, anyhow::Error> {
+    pub async fn resolve_session_ymid(
+        &self,
+        entry_ymid: &str,
+    ) -> Result<Option<SessionYmid>, anyhow::Error> {
         let entry_owned = entry_ymid.to_string();
         self.execute_with_timeout(move |conn| {
             let entry: Option<(i64, String, String, Option<String>, Option<i64>, Option<i64>)> = conn
@@ -928,7 +1042,11 @@ impl DatabasePool {
     /// only postbacks whose ymid resolves to that bot's row. Postbacks carry
     /// no bot column themselves, so the join is a LEFT JOIN: unattributed
     /// rows still count in the aggregate, never in a single bot.
-    pub async fn get_postback_stats(&self, bot_id: Option<&str>, days: i64) -> Result<(i64, i64), anyhow::Error> {
+    pub async fn get_postback_stats(
+        &self,
+        bot_id: Option<&str>,
+        days: i64,
+    ) -> Result<(i64, i64), anyhow::Error> {
         let bot_opt: Option<String> = bot_id.map(str::to_string);
         self.execute_with_timeout(move |conn| {
             let since = format!("date('now', '-{} days')", days - 1);
@@ -984,10 +1102,12 @@ impl DatabasePool {
             let user_id: i64 = conn.query_row(
                 "SELECT user_id FROM pending_downloads WHERE id = ?1",
                 params![id_owned],
-                |row| row.get(0)
+                |row| row.get(0),
             )?;
             Ok(user_id)
-        }).await.map_err(|e| anyhow::anyhow!("Ymid {} not found: {}", id, e))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Ymid {} not found: {}", id, e))
     }
 
     /// Owning bot of a session ymid, if the row exists. Unknown ymid is not
@@ -999,21 +1119,31 @@ impl DatabasePool {
                 "SELECT bot_id FROM pending_downloads WHERE id = ?1",
                 params![id_owned],
                 |row| row.get(0),
-            ).optional()
-        }).await.map_err(|e| anyhow::anyhow!("Failed to get bot for ymid {}: {}", id, e))
+            )
+            .optional()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get bot for ymid {}: {}", id, e))
     }
 
     /// Get status for a pending download by ymid
-    pub async fn get_pending_download_status(&self, id: &str) -> Result<Option<String>, anyhow::Error> {
+    pub async fn get_pending_download_status(
+        &self,
+        id: &str,
+    ) -> Result<Option<String>, anyhow::Error> {
         let id_owned = id.to_string();
         self.execute_with_timeout(move |conn| {
-            let status: Option<String> = conn.query_row(
-                "SELECT status FROM pending_downloads WHERE id = ?1",
-                params![id_owned],
-                |row| row.get(0)
-            ).optional()?;
+            let status: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM pending_downloads WHERE id = ?1",
+                    params![id_owned],
+                    |row| row.get(0),
+                )
+                .optional()?;
             Ok(status)
-        }).await.map_err(|e| anyhow::anyhow!("Failed to get status for {}: {}", id, e))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get status for {}: {}", id, e))
     }
 
     /// Push an open session's lease `lease_secs` into the future and return
@@ -1030,7 +1160,11 @@ impl DatabasePool {
     /// close would be refused - exactly the "the video is in the chat on
     /// return" case. Stopping the heartbeat only stops extending; the sweeper
     /// still expires the row once the lease lapses.
-    pub async fn refresh_session_lease(&self, id: &str, lease_secs: i64) -> Result<Option<(String, String)>, anyhow::Error> {
+    pub async fn refresh_session_lease(
+        &self,
+        id: &str,
+        lease_secs: i64,
+    ) -> Result<Option<(String, String)>, anyhow::Error> {
         let id_owned = id.to_string();
         self.execute_with_timeout(move |conn| {
             conn.execute(
@@ -1056,14 +1190,19 @@ impl DatabasePool {
     /// Status and lease deadline of one row in a single read, so a client
     /// never pairs a status from one moment with a lease from another.
     /// The lease is NULL for rows created before the lease column existed.
-    pub async fn get_session_state(&self, id: &str) -> Result<Option<(String, Option<String>)>, anyhow::Error> {
+    pub async fn get_session_state(
+        &self,
+        id: &str,
+    ) -> Result<Option<(String, Option<String>)>, anyhow::Error> {
         let id_owned = id.to_string();
         self.execute_with_timeout(move |conn| {
-            let row: Option<(String, Option<String>)> = conn.query_row(
-                "SELECT status, lease_expires_at FROM pending_downloads WHERE id = ?1",
-                params![id_owned],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional()?;
+            let row: Option<(String, Option<String>)> = conn
+                .query_row(
+                    "SELECT status, lease_expires_at FROM pending_downloads WHERE id = ?1",
+                    params![id_owned],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
             Ok(row)
         })
         .await
@@ -1071,7 +1210,7 @@ impl DatabasePool {
     }
 
     /// Record that a user blocked the bot (MyChatMember -> Banned).
-     pub async fn record_block(&self, bot_id: &str, user_id: i64) -> Result<(), anyhow::Error> {
+    pub async fn record_block(&self, bot_id: &str, user_id: i64) -> Result<(), anyhow::Error> {
         let bot_owned = bot_id.to_string();
         self.execute_with_timeout(move |conn| {
             conn.execute(
@@ -1079,13 +1218,20 @@ impl DatabasePool {
                 params![bot_owned, user_id],
             )?;
             Ok(())
-        }).await.map_err(|e| anyhow::anyhow!("Failed to record block for user {}: {}", user_id, e))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to record block for user {}: {}", user_id, e))
     }
 
     /// Per-day aggregates for the last `days` days, oldest first.
     /// Pass admin ids to exclude admin (test/self) traffic.
     /// `bot_id = None` aggregates every bot; `Some` scopes to one bot.
-    pub async fn get_weekly_stats(&self, bot_id: Option<&str>, days: i64, exclude_admins: &[i64]) -> Result<Vec<WeeklyDayStats>, anyhow::Error> {
+    pub async fn get_weekly_stats(
+        &self,
+        bot_id: Option<&str>,
+        days: i64,
+        exclude_admins: &[i64],
+    ) -> Result<Vec<WeeklyDayStats>, anyhow::Error> {
         let excl_u = admin_filter_sql("telegram_id", exclude_admins);
         let excl_d = admin_filter_sql("user_telegram_id", exclude_admins);
         let bot_opt: Option<String> = bot_id.map(str::to_string);
@@ -1110,8 +1256,16 @@ impl DatabasePool {
                     params![bot_p], |r| r.get(0)).unwrap_or(0);
                 Ok((unique_users, new_users, downloads, blocks))
             }).await?;
-            let date = (chrono::Local::now() - chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
-            out.push(WeeklyDayStats { date, unique_users: day.0, new_users: day.1, downloads: day.2, blocks: day.3 });
+            let date = (chrono::Local::now() - chrono::Duration::days(d))
+                .format("%Y-%m-%d")
+                .to_string();
+            out.push(WeeklyDayStats {
+                date,
+                unique_users: day.0,
+                new_users: day.1,
+                downloads: day.2,
+                blocks: day.3,
+            });
         }
         Ok(out)
     }
@@ -1121,7 +1275,12 @@ impl DatabasePool {
     /// S4 delivered, plus drop-off reasons. Admin traffic excluded via
     /// `exclude_admins` (the funnel diagnoses real users).
     /// `bot_id = None` aggregates every bot; `Some` scopes to one bot.
-    pub async fn get_funnel_stats(&self, bot_id: Option<&str>, days: i64, exclude_admins: &[i64]) -> Result<Vec<FunnelDayStats>, anyhow::Error> {
+    pub async fn get_funnel_stats(
+        &self,
+        bot_id: Option<&str>,
+        days: i64,
+        exclude_admins: &[i64],
+    ) -> Result<Vec<FunnelDayStats>, anyhow::Error> {
         let excl_u = admin_filter_sql("telegram_id", exclude_admins);
         let excl_p = admin_filter_sql("user_id", exclude_admins);
         let excl_d = admin_filter_sql("user_telegram_id", exclude_admins);
@@ -1165,11 +1324,20 @@ impl DatabasePool {
                     params![bot_p], |r| r.get(0)).unwrap_or(0);
                 Ok((started, link_sent, ad_watched, claimed, delivered, expired, failed, delivered_paid, delivered_free))
             }).await?;
-            let date = (chrono::Local::now() - chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
+            let date = (chrono::Local::now() - chrono::Duration::days(d))
+                .format("%Y-%m-%d")
+                .to_string();
             out.push(FunnelDayStats {
-                date, started: day.0, link_sent: day.1, ad_watched: day.2,
-                claimed: day.3, delivered: day.4, expired: day.5, failed: day.6,
-                delivered_paid: day.7, delivered_free: day.8,
+                date,
+                started: day.0,
+                link_sent: day.1,
+                ad_watched: day.2,
+                claimed: day.3,
+                delivered: day.4,
+                expired: day.5,
+                failed: day.6,
+                delivered_paid: day.7,
+                delivered_free: day.8,
             });
         }
         Ok(out)
@@ -1177,16 +1345,19 @@ impl DatabasePool {
 
     /// Fire-and-forget funnel event (button presses, non-link texts, ...).
     /// Never fails the caller: errors are logged and swallowed.
-     pub async fn log_funnel_event(&self, bot_id: &str, user_id: i64, event: &str) {
+    pub async fn log_funnel_event(&self, bot_id: &str, user_id: i64, event: &str) {
         let bot_owned = bot_id.to_string();
         let event_owned = event.to_string();
-        let result: Result<(), anyhow::Error> = self.execute_with_timeout(move |conn| {
-            conn.execute(
+        let result: Result<(), anyhow::Error> = self
+            .execute_with_timeout(move |conn| {
+                conn.execute(
                 "INSERT INTO funnel_events (bot_id, user_telegram_id, event) VALUES (?1, ?2, ?3)",
                 params![bot_owned, user_id, event_owned],
             )?;
-            Ok(())
-        }).await.map_err(|e| anyhow::anyhow!("Failed to log funnel event: {}", e));
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to log funnel event: {}", e));
         if let Err(e) = result {
             log::warn!("Funnel event dropped: {}", e);
         }
@@ -1195,7 +1366,11 @@ impl DatabasePool {
     /// Top /start ref_codes by registrations in the last `days` days.
     /// `None` means a bare t.me link with no payload.
     /// `bot_id = None` aggregates every bot; `Some` scopes to one bot.
-    pub async fn get_ref_stats(&self, bot_id: Option<&str>, days: i64) -> Result<Vec<(Option<String>, i64)>, anyhow::Error> {
+    pub async fn get_ref_stats(
+        &self,
+        bot_id: Option<&str>,
+        days: i64,
+    ) -> Result<Vec<(Option<String>, i64)>, anyhow::Error> {
         let bot_opt: Option<String> = bot_id.map(str::to_string);
         self.execute_with_timeout(move |conn| {
             let since = format!("date('now', '-{} days')", days - 1);
@@ -1223,7 +1398,10 @@ impl DatabasePool {
     /// a download job really began for this row and is what picks the message -
     /// a session that never earned its ad is not a failed download. The row is
     /// never deleted; the funnel and the per-ymid joins depend on it.
-    pub async fn expire_stale_pending(&self, limit: u32) -> Result<Vec<(String, i64, bool)>, anyhow::Error> {
+    pub async fn expire_stale_pending(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<(String, i64, bool)>, anyhow::Error> {
         self.execute_with_timeout(move |conn| {
             let lease_secs = SESSION_LEASE_SECS;
             let candidates: Vec<(String, i64, bool)> = {
@@ -1283,9 +1461,7 @@ impl DatabasePool {
     /// Broadcast recipients across all bots, one row per human, sent from the
     /// bot of their most recent activity. Deterministic on ties (bot_id DESC);
     /// NULL last_active sorts last, so never-active rows lose.
-    pub async fn get_broadcast_recipients_all(
-        &self,
-    ) -> Result<Vec<(i64, String)>, anyhow::Error> {
+    pub async fn get_broadcast_recipients_all(&self) -> Result<Vec<(i64, String)>, anyhow::Error> {
         self.execute_with_timeout(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT u.telegram_id, u.bot_id FROM users u \
@@ -1307,7 +1483,8 @@ impl DatabasePool {
     }
 
     /// Check if user has active premium status **on one bot**.
-    pub async fn is_user_premium(&self, bot_id: &str, user_id: i64) -> bool {        let bot_owned = bot_id.to_string();
+    pub async fn is_user_premium(&self, bot_id: &str, user_id: i64) -> bool {
+        let bot_owned = bot_id.to_string();
         let result = self.execute_with_timeout(move |conn| {
             let is_premium: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM users WHERE bot_id = ?1 AND telegram_id = ?2 AND premium_until > datetime('now'))",
@@ -1320,31 +1497,293 @@ impl DatabasePool {
         result.unwrap_or(false)
     }
 
-    /// Set or extend premium status for user **on one bot**.
-    pub async fn set_user_premium(&self, bot_id: &str, user_id: i64, days: i64) -> Result<(), anyhow::Error> {
-        let bot_owned = bot_id.to_string();
+    /// All admin Telegram IDs ordered by insertion. The lowest `id` is the
+    /// first admin and the only one allowed to add/remove admins.
+    pub async fn list_admins(&self) -> Result<Vec<i64>, anyhow::Error> {
+        self.execute_with_timeout(|conn| {
+            let mut stmt = conn.prepare("SELECT admin_telegram_id FROM admins ORDER BY id")?;
+            let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row?);
+            }
+            Ok(ids)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to list admins: {}", e))
+    }
+
+    /// First admin = lowest `admins.id`. Only this Telegram ID may change the
+    /// admin list or toggle the premium-grant policy.
+    pub async fn get_first_admin(&self) -> Result<Option<i64>, anyhow::Error> {
+        self.execute_with_timeout(|conn| {
+            conn.query_row(
+                "SELECT admin_telegram_id FROM admins ORDER BY id LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get first admin: {}", e))
+    }
+
+    /// Insert admins, ignoring duplicates. Returns the number actually added.
+    pub async fn add_admins(&self, ids: &[i64]) -> Result<usize, anyhow::Error> {
+        let ids = ids.to_vec();
         self.execute_with_timeout(move |conn| {
-            conn.execute(
-                "INSERT INTO users (bot_id, telegram_id, premium_until) 
-                 VALUES (?1, ?2, datetime('now', '+' || ?3 || ' days'))
-                 ON CONFLICT(bot_id, telegram_id) DO UPDATE SET 
-                 premium_until = datetime(MAX(COALESCE(premium_until, datetime('now')), datetime('now')), '+' || ?3 || ' days')",
-                params![bot_owned, user_id, days],
-            )?;
-            Ok(())
-        }).await.map_err(|e| anyhow::anyhow!("Failed to set premium for user {} on bot {}: {}", user_id, bot_id, e))
+            let tx = conn.unchecked_transaction()?;
+            let mut inserted = 0usize;
+            for id in ids {
+                inserted += tx.execute(
+                    "INSERT OR IGNORE INTO admins (admin_telegram_id) VALUES (?1)",
+                    params![id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(inserted)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to add admins: {}", e))
+    }
+
+    /// Remove admins, refusing to leave the table empty. The check and delete
+    /// share one transaction, so two concurrent removals cannot both pass.
+    pub async fn remove_admins(&self, ids: &[i64]) -> Result<usize, anyhow::Error> {
+        let ids = ids.to_vec();
+        self.execute_with_timeout(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let before: i64 = tx.query_row("SELECT COUNT(*) FROM admins", [], |row| row.get(0))?;
+            let mut removed = 0usize;
+            for id in ids {
+                removed += tx.execute(
+                    "DELETE FROM admins WHERE admin_telegram_id = ?1",
+                    params![id],
+                )?;
+            }
+            let after: i64 = tx.query_row("SELECT COUNT(*) FROM admins", [], |row| row.get(0))?;
+            if before > 0 && after == 0 {
+                tx.rollback()?;
+                return Err(rusqlite::Error::InvalidParameterName(
+                    "cannot remove last admin".to_string(),
+                ));
+            }
+            tx.commit()?;
+            Ok(removed)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to remove admins: {}", e))
+    }
+
+    /// Seed the admins table from ADMIN_IDS only when it is empty. Once the
+    /// table has rows, the env is ignored and the DB is the source of truth.
+    pub async fn seed_admins_from_env(&self) -> Result<(), anyhow::Error> {
+        if !self.list_admins().await?.is_empty() {
+            return Ok(());
+        }
+
+        let raw = std::env::var("ADMIN_IDS").unwrap_or_default();
+        let mut ids: Vec<i64> = raw
+            .split(',')
+            .filter_map(|s| s.trim().parse::<i64>().ok())
+            .filter(|id| *id > 0)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+
+        if ids.is_empty() {
+            log::warn!("admins table is empty and ADMIN_IDS is unset; nobody has admin access");
+            return Ok(());
+        }
+
+        let added = self.add_admins(&ids).await?;
+        log::info!("Seeded {} admin(s) from ADMIN_IDS", added);
+        Ok(())
+    }
+
+    /// Set or extend premium for many users in one transaction. `unit` is one
+    /// of seconds/minutes/hours/days/weeks/months/years; weeks become days and
+    /// months/years use SQLite `floor`. When `granted_by` is set, an audit row
+    /// is written for every user.
+    pub async fn set_users_premium_duration(
+        &self,
+        bot_id: &str,
+        user_ids: &[i64],
+        amount: i64,
+        unit: &str,
+        granted_by: Option<i64>,
+    ) -> Result<usize, anyhow::Error> {
+        if user_ids.is_empty() {
+            return Ok(0);
+        }
+        let (modifier, needs_floor) = premium_sql_modifier(amount, unit)?;
+        let bot_owned = bot_id.to_string();
+        let unit_owned = unit.to_string();
+        let ids = user_ids.to_vec();
+
+        self.execute_with_timeout(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let sql = if needs_floor {
+                "INSERT INTO users (bot_id, telegram_id, premium_until)
+                 VALUES (?1, ?2, datetime('now', ?3))
+                 ON CONFLICT(bot_id, telegram_id) DO UPDATE SET
+                 premium_until = datetime(MAX(COALESCE(premium_until, datetime('now')), datetime('now')), ?3, 'floor')"
+            } else {
+                "INSERT INTO users (bot_id, telegram_id, premium_until)
+                 VALUES (?1, ?2, datetime('now', ?3))
+                 ON CONFLICT(bot_id, telegram_id) DO UPDATE SET
+                 premium_until = datetime(MAX(COALESCE(premium_until, datetime('now')), datetime('now')), ?3)"
+            };
+
+            let mut count = 0usize;
+            for user_id in ids {
+                tx.execute(sql, params![bot_owned.as_str(), user_id, modifier])?;
+                let premium_until: String = tx.query_row(
+                    "SELECT premium_until FROM users WHERE bot_id = ?1 AND telegram_id = ?2",
+                    params![bot_owned.as_str(), user_id],
+                    |row| row.get(0),
+                )?;
+
+                if let Some(admin_id) = granted_by {
+                    tx.execute(
+                        "INSERT INTO premium_grants
+                         (bot_id, telegram_id, granted_by, amount, unit, premium_until_after)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            bot_owned.as_str(),
+                            user_id,
+                            admin_id,
+                            amount,
+                            unit_owned.as_str(),
+                            premium_until
+                        ],
+                    )?;
+                }
+                count += 1;
+            }
+            tx.commit()?;
+            Ok(count)
+        }).await.map_err(|e| anyhow::anyhow!(
+            "Failed to set premium for {} user(s) on bot {}: {}",
+            user_ids.len(),
+            bot_id,
+            e
+        ))
+    }
+
+    /// Remove premium from many users by setting `premium_until = NULL`.
+    /// Returns the number of rows that actually had a non-NULL value.
+    pub async fn remove_users_premium(
+        &self,
+        bot_id: &str,
+        user_ids: &[i64],
+    ) -> Result<usize, anyhow::Error> {
+        let bot_owned = bot_id.to_string();
+        let ids = user_ids.to_vec();
+        self.execute_with_timeout(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut removed = 0usize;
+            for user_id in ids {
+                removed += tx.execute(
+                    "UPDATE users SET premium_until = NULL
+                     WHERE bot_id = ?1 AND telegram_id = ?2 AND premium_until IS NOT NULL",
+                    params![bot_owned.as_str(), user_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(removed)
+        })
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to remove premium from {} user(s) on bot {}: {}",
+                user_ids.len(),
+                bot_id,
+                e
+            )
+        })
+    }
+
+    /// Active premium users whose latest grant came from an admin, grouped by
+    /// the granting admin in the query. Returns `(rows, total)` where each row
+    /// is `(granted_by, telegram_id, premium_until, granted_at)`.
+    pub async fn get_admin_premium_grants(
+        &self,
+        bot_id: &str,
+        limit: i64,
+    ) -> Result<(Vec<(i64, i64, String, String)>, i64), anyhow::Error> {
+        let bot_owned = bot_id.to_string();
+        let limit = limit.max(1);
+        self.execute_with_timeout(move |conn| {
+            let count_sql = "SELECT COUNT(*)
+                 FROM users u
+                 JOIN premium_grants g ON g.id = (
+                     SELECT pg.id FROM premium_grants pg
+                     WHERE pg.bot_id = u.bot_id AND pg.telegram_id = u.telegram_id
+                     ORDER BY pg.id DESC LIMIT 1
+                 )
+                 WHERE u.bot_id = ?1
+                   AND u.premium_until > datetime('now')
+                   AND g.granted_by IS NOT NULL";
+            let total: i64 =
+                conn.query_row(count_sql, params![bot_owned.as_str()], |row| row.get(0))?;
+
+            let select_sql = "SELECT g.granted_by, u.telegram_id, u.premium_until, g.granted_at
+                 FROM users u
+                 JOIN premium_grants g ON g.id = (
+                     SELECT pg.id FROM premium_grants pg
+                     WHERE pg.bot_id = u.bot_id AND pg.telegram_id = u.telegram_id
+                     ORDER BY pg.id DESC LIMIT 1
+                 )
+                 WHERE u.bot_id = ?1
+                   AND u.premium_until > datetime('now')
+                   AND g.granted_by IS NOT NULL
+                 ORDER BY g.granted_by ASC, u.premium_until DESC
+                 LIMIT ?2";
+            let mut stmt = conn.prepare(select_sql)?;
+            let rows = stmt.query_map(params![bot_owned.as_str(), limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut grants = Vec::new();
+            for row in rows {
+                grants.push(row?);
+            }
+            Ok((grants, total))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to query admin premium grants: {}", e))
+    }
+
+    /// Set or extend premium status for user **on one bot**.
+    pub async fn set_user_premium(
+        &self,
+        bot_id: &str,
+        user_id: i64,
+        days: i64,
+    ) -> Result<(), anyhow::Error> {
+        self.set_users_premium_duration(bot_id, &[user_id], days, "days", None)
+            .await
+            .map(|_| ())
     }
 
     /// Get list of users with active premium status. `Some(bot)` scopes to
     /// one bot; `None` lists every bot (the aggregate admin view).
-    pub async fn get_premium_users(&self, bot_id: Option<&str>) -> Result<Vec<(i64, String, String)>, anyhow::Error> {
+    pub async fn get_premium_users(
+        &self,
+        bot_id: Option<&str>,
+    ) -> Result<Vec<(i64, String, String)>, anyhow::Error> {
         let bot_opt: Option<String> = bot_id.map(str::to_string);
         self.execute_with_timeout(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT telegram_id, premium_until, COALESCE(last_active, 'N/A')
                  FROM users 
                  WHERE (?1 IS NULL OR bot_id = ?1) AND premium_until > datetime('now')
-                 ORDER BY premium_until DESC"
+                 ORDER BY premium_until DESC",
             )?;
             let users_iter = stmt.query_map(params![bot_opt], |row| {
                 Ok((
@@ -1358,11 +1797,19 @@ impl DatabasePool {
                 users.push(user_result?);
             }
             Ok(users)
-        }).await.map_err(|e| anyhow::anyhow!("Failed to query premium users: {}", e))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to query premium users: {}", e))
     }
 
     /// Log a successful payment
-    pub async fn log_payment(&self, bot_id: &str, user_id: i64, amount: i64, payload: &str) -> Result<(), anyhow::Error> {
+    pub async fn log_payment(
+        &self,
+        bot_id: &str,
+        user_id: i64,
+        amount: i64,
+        payload: &str,
+    ) -> Result<(), anyhow::Error> {
         let bot_owned = bot_id.to_string();
         let payload = payload.to_string();
         self.execute_with_timeout(move |conn| {
@@ -1371,11 +1818,19 @@ impl DatabasePool {
                 params![bot_owned, user_id, amount, payload],
             )?;
             Ok(())
-        }).await.map_err(|e| anyhow::anyhow!("Failed to log payment: {}", e))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to log payment: {}", e))
     }
 
     /// Log an invoice sent
-    pub async fn log_invoice(&self, bot_id: &str, user_id: i64, amount: i64, payload: &str) -> Result<(), anyhow::Error> {
+    pub async fn log_invoice(
+        &self,
+        bot_id: &str,
+        user_id: i64,
+        amount: i64,
+        payload: &str,
+    ) -> Result<(), anyhow::Error> {
         let bot_owned = bot_id.to_string();
         let payload = payload.to_string();
         self.execute_with_timeout(move |conn| {
@@ -1384,14 +1839,20 @@ impl DatabasePool {
                 params![bot_owned, user_id, amount, payload],
             )?;
             Ok(())
-        }).await.map_err(|e| anyhow::anyhow!("Failed to log invoice: {}", e))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to log invoice: {}", e))
     }
 
     /// Get rich daily statistics
     /// Rich daily stats. Pass admin ids in `exclude_admins` to get the same
     /// numbers without admin (test/self) traffic; empty slice = everyone.
     /// `bot_id = None` aggregates every bot; `Some` scopes to one bot.
-    pub async fn get_rich_daily_stats(&self, bot_id: Option<&str>, exclude_admins: &[i64]) -> Result<RichDailyStats, anyhow::Error> {
+    pub async fn get_rich_daily_stats(
+        &self,
+        bot_id: Option<&str>,
+        exclude_admins: &[i64],
+    ) -> Result<RichDailyStats, anyhow::Error> {
         let excl_u = admin_filter_sql("telegram_id", exclude_admins);
         let excl_d = admin_filter_sql("user_telegram_id", exclude_admins);
         let excl_p = admin_filter_sql("user_id", exclude_admins);
@@ -1402,11 +1863,11 @@ impl DatabasePool {
             let unique_users: i64 = conn.query_row(
                 &format!("SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = date('now'){excl_u} AND (?1 IS NULL OR bot_id = ?1)"),
                 params![bot_opt], |r| r.get(0)).unwrap_or(0);
-            
+
             let yesterday_users: i64 = conn.query_row(
                 &format!("SELECT COUNT(DISTINCT telegram_id) FROM users WHERE date(last_active) = date('now', '-1 day'){excl_u} AND (?1 IS NULL OR bot_id = ?1)"),
                 params![bot_opt], |r| r.get(0)).unwrap_or(0);
-            
+
             let unique_downloaders: i64 = conn.query_row(
                 &format!("SELECT COUNT(DISTINCT user_telegram_id) FROM downloads WHERE date(download_date) = date('now'){excl_d} AND (?1 IS NULL OR bot_id = ?1)"),
                 params![bot_opt], |r| r.get(0)).unwrap_or(0);
@@ -1512,6 +1973,23 @@ pub(crate) async fn setup_test_db() -> (DatabasePool, tempfile::NamedTempFile) {
         )?;
         conn.execute(
             "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE admins (id INTEGER PRIMARY KEY, admin_telegram_id BIGINT UNIQUE NOT NULL)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE premium_grants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id TEXT NOT NULL,
+                telegram_id BIGINT NOT NULL,
+                granted_by BIGINT NOT NULL,
+                amount INTEGER NOT NULL,
+                unit TEXT NOT NULL,
+                granted_at TEXT NOT NULL DEFAULT (datetime('now')),
+                premium_until_after TEXT NOT NULL
+            )",
             (),
         )?;
         conn.execute(
@@ -1624,11 +2102,11 @@ mod tests {
     #[tokio::test]
     async fn test_settings_get_set() {
         let (pool, _file) = setup_test_db().await;
-        
+
         pool.set_setting("test_key", "test_value").await.unwrap();
         let value = pool.get_setting("test_key").await.unwrap();
         assert_eq!(value, "test_value");
-        
+
         pool.set_setting("test_key", "new_value").await.unwrap();
         let value = pool.get_setting("test_key").await.unwrap();
         assert_eq!(value, "new_value");
@@ -1640,18 +2118,36 @@ mod tests {
         let user_id = 555123456i64;
 
         // No override yet: device tag wins, missing tag means English.
-        assert_eq!(pool.get_effective_lang("primary", user_id, Some("ru")).await, "ru");
-        assert_eq!(pool.get_effective_lang("primary", user_id, None).await, "en");
+        assert_eq!(
+            pool.get_effective_lang("primary", user_id, Some("ru"))
+                .await,
+            "ru"
+        );
+        assert_eq!(
+            pool.get_effective_lang("primary", user_id, None).await,
+            "en"
+        );
 
         // Persist override: it wins over the device tag.
         pool.set_user_lang("primary", user_id, "uk").await.unwrap();
-        assert_eq!(pool.get_user_lang("primary", user_id).await.unwrap(), Some("uk".to_string()));
-        assert_eq!(pool.get_effective_lang("primary", user_id, Some("ru")).await, "uk");
+        assert_eq!(
+            pool.get_user_lang("primary", user_id).await.unwrap(),
+            Some("uk".to_string())
+        );
+        assert_eq!(
+            pool.get_effective_lang("primary", user_id, Some("ru"))
+                .await,
+            "uk"
+        );
 
         // Clearing restores device detection, even for a user that never set one.
         pool.clear_user_lang("primary", user_id).await.unwrap();
         assert_eq!(pool.get_user_lang("primary", user_id).await.unwrap(), None);
-        assert_eq!(pool.get_effective_lang("primary", user_id, Some("ru")).await, "ru");
+        assert_eq!(
+            pool.get_effective_lang("primary", user_id, Some("ru"))
+                .await,
+            "ru"
+        );
         pool.clear_user_lang("primary", 999888777).await.unwrap();
     }
 
@@ -1662,14 +2158,26 @@ mod tests {
 
         // Same human, two bots: overrides and quality never cross.
         pool.set_user_lang("aaa", user_id, "uk").await.unwrap();
-        assert_eq!(pool.get_user_lang("aaa", user_id).await.unwrap(), Some("uk".to_string()));
+        assert_eq!(
+            pool.get_user_lang("aaa", user_id).await.unwrap(),
+            Some("uk".to_string())
+        );
         assert_eq!(pool.get_user_lang("bbb", user_id).await.unwrap(), None);
-        assert_eq!(pool.get_effective_lang("bbb", user_id, Some("ru")).await, "ru");
-        assert_eq!(pool.get_effective_lang("aaa", user_id, Some("ru")).await, "uk");
+        assert_eq!(
+            pool.get_effective_lang("bbb", user_id, Some("ru")).await,
+            "ru"
+        );
+        assert_eq!(
+            pool.get_effective_lang("aaa", user_id, Some("ru")).await,
+            "uk"
+        );
 
         // Clearing on one bot leaves the other bot's override alone.
         pool.clear_user_lang("bbb", user_id).await.unwrap();
-        assert_eq!(pool.get_user_lang("aaa", user_id).await.unwrap(), Some("uk".to_string()));
+        assert_eq!(
+            pool.get_user_lang("aaa", user_id).await.unwrap(),
+            Some("uk".to_string())
+        );
 
         // Quality reads are per-bot too (cache key includes the bot).
         // Both rows exist by now (the lang writes above created them)
@@ -1713,38 +2221,57 @@ mod tests {
             conn.execute("INSERT INTO downloads (user_telegram_id, video_url) VALUES (42, 'http://v')", ())?;
             Ok(())
         }).await.unwrap();
-        let bots: Vec<String> = pool.execute_with_timeout(|conn| {
-            let mut out = Vec::new();
-            for (table, cond) in [
-                ("users", "telegram_id = 42"),
-                ("pending_downloads", "id = 'y1'"),
-                ("funnel_events", "user_telegram_id = 42"),
-                ("blocks", "telegram_id = 42"),
-                ("downloads", "user_telegram_id = 42"),
-            ] {
-                let b: String = conn.query_row(
-                    &format!("SELECT bot_id FROM {table} WHERE {cond}"),
-                    [],
-                    |row| row.get(0),
-                )?;
-                out.push(b);
-            }
-            Ok(out)
-        }).await.unwrap();
-        assert!(bots.iter().all(|b| b == "primary"), "every legacy write lands on primary: {bots:?}");
+        let bots: Vec<String> = pool
+            .execute_with_timeout(|conn| {
+                let mut out = Vec::new();
+                for (table, cond) in [
+                    ("users", "telegram_id = 42"),
+                    ("pending_downloads", "id = 'y1'"),
+                    ("funnel_events", "user_telegram_id = 42"),
+                    ("blocks", "telegram_id = 42"),
+                    ("downloads", "user_telegram_id = 42"),
+                ] {
+                    let b: String = conn.query_row(
+                        &format!("SELECT bot_id FROM {table} WHERE {cond}"),
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    out.push(b);
+                }
+                Ok(out)
+            })
+            .await
+            .unwrap();
+        assert!(
+            bots.iter().all(|b| b == "primary"),
+            "every legacy write lands on primary: {bots:?}"
+        );
     }
 
     #[tokio::test]
     async fn same_user_coexists_on_two_bots_but_not_twice_on_one() {
         let (pool, _file) = setup_test_db().await;
         pool.execute_with_timeout(|conn| {
-            conn.execute("INSERT INTO users (telegram_id, bot_id) VALUES (42, 'aaa')", ())?;
-            conn.execute("INSERT INTO users (telegram_id, bot_id) VALUES (42, 'bbb')", ())?;
+            conn.execute(
+                "INSERT INTO users (telegram_id, bot_id) VALUES (42, 'aaa')",
+                (),
+            )?;
+            conn.execute(
+                "INSERT INTO users (telegram_id, bot_id) VALUES (42, 'bbb')",
+                (),
+            )?;
             Ok(())
-        }).await.unwrap();
-        let dup = pool.execute_with_timeout(|conn| {
-            conn.execute("INSERT INTO users (telegram_id, bot_id) VALUES (42, 'aaa')", ())
-        }).await;
+        })
+        .await
+        .unwrap();
+        let dup = pool
+            .execute_with_timeout(|conn| {
+                conn.execute(
+                    "INSERT INTO users (telegram_id, bot_id) VALUES (42, 'aaa')",
+                    (),
+                )
+            })
+            .await;
         assert!(dup.is_err(), "same (bot, user) twice must be rejected");
     }
 
@@ -1810,7 +2337,10 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_extends_the_lease_and_the_sweeper_leaves_the_row_alone() {
         let (pool, _file) = setup_test_db().await;
-        let ymid = pool.create_pending_download("primary", 42, "http://v").await.unwrap();
+        let ymid = pool
+            .create_pending_download("primary", 42, "http://v")
+            .await
+            .unwrap();
         assert_eq!(lease_span_secs(&pool, &ymid).await, SESSION_LEASE_SECS);
 
         // Pretend the last heartbeat was a while ago, so the deadline is close.
@@ -1861,7 +2391,10 @@ mod tests {
 
         let (status, lease) = pool.get_session_state("lapsed").await.unwrap().unwrap();
         assert_eq!(status, "expired");
-        assert!(lease.is_some(), "the row itself must survive, not be deleted");
+        assert!(
+            lease.is_some(),
+            "the row itself must survive, not be deleted"
+        );
     }
 
     /// Stale-state probe: a heartbeat for a row that is already delivered is a
@@ -1896,11 +2429,15 @@ mod tests {
         let (status, deadline_after) = pool.get_session_state("done").await.unwrap().unwrap();
         assert_eq!(status, "completed");
         assert_eq!(
-            deadline_after,
-            deadline_before,
+            deadline_after, deadline_before,
             "the deadline of a delivered row must be untouched"
         );
-        assert!(pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap().is_empty());
+        assert!(
+            pool.expire_stale_pending(EXPIRY_BATCH_LIMIT)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The ceiling holds: no amount of pinging can push a row's lease past
@@ -1952,7 +2489,12 @@ mod tests {
                 ymid
             );
         }
-        assert!(pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap().is_empty());
+        assert!(
+            pool.expire_stale_pending(EXPIRY_BATCH_LIMIT)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The message split depends on this column and nothing else: a row whose
@@ -2015,7 +2557,10 @@ mod tests {
         let second = pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap();
         assert_eq!(second.len(), 5, "the remainder goes out on the next tick");
         assert!(
-            pool.expire_stale_pending(EXPIRY_BATCH_LIMIT).await.unwrap().is_empty()
+            pool.expire_stale_pending(EXPIRY_BATCH_LIMIT)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -2042,9 +2587,16 @@ mod tests {
             Ok(())
         }).await.unwrap();
 
-        assert_eq!(pool.mark_pending_failed("claimed-undelivered").await.unwrap(), 1);
         assert_eq!(
-            pool.get_pending_download_status("claimed-undelivered").await.unwrap(),
+            pool.mark_pending_failed("claimed-undelivered")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            pool.get_pending_download_status("claimed-undelivered")
+                .await
+                .unwrap(),
             Some("failed".to_string()),
             "a claimed-but-undelivered row must become visible as failed"
         );
@@ -2116,10 +2668,7 @@ mod tests {
         // silent starter for user 3. User 999 is admin noise.
         for u in [1i64, 2, 3, 999] {
             pool.execute_with_timeout(move |conn| {
-                conn.execute(
-                    "INSERT INTO users (telegram_id) VALUES (?1)",
-                    params![u],
-                )?;
+                conn.execute("INSERT INTO users (telegram_id) VALUES (?1)", params![u])?;
                 Ok(())
             })
             .await
@@ -2185,7 +2734,8 @@ mod tests {
         assert_eq!(clean.delivered_free, 0);
 
         // Delivery reasons split paid vs free giveaways.
-        pool.log_funnel_event("primary", 1, "delivered_valued").await;
+        pool.log_funnel_event("primary", 1, "delivered_valued")
+            .await;
         pool.log_funnel_event("primary", 2, "delivered_timer").await;
         pool.log_funnel_event("botX", 3, "delivered_free").await;
         let split = &pool.get_funnel_stats(None, 7, &[999]).await.unwrap()[6];
@@ -2199,20 +2749,15 @@ mod tests {
     #[tokio::test]
     async fn rich_daily_stats_counts_free_deliveries_per_bot() {
         let (pool, _file) = setup_test_db().await;
-        pool
-            .log_funnel_event("botA", 11, "delivered_free")
-            .await;
-        pool
-            .log_funnel_event("botA", 12, "delivered_free")
-            .await;
-        pool
-            .log_funnel_event("botB", 13, "delivered_free")
-            .await;
-        pool
-            .log_funnel_event("botA", 999, "delivered_free")
-            .await;
+        pool.log_funnel_event("botA", 11, "delivered_free").await;
+        pool.log_funnel_event("botA", 12, "delivered_free").await;
+        pool.log_funnel_event("botB", 13, "delivered_free").await;
+        pool.log_funnel_event("botA", 999, "delivered_free").await;
 
-        let a = pool.get_rich_daily_stats(Some("botA"), &[999]).await.unwrap();
+        let a = pool
+            .get_rich_daily_stats(Some("botA"), &[999])
+            .await
+            .unwrap();
         assert_eq!(a.free_deliveries, 2);
         let b = pool.get_rich_daily_stats(Some("botB"), &[]).await.unwrap();
         assert_eq!(b.free_deliveries, 1);
@@ -2263,11 +2808,15 @@ mod tests {
 
         // Set initial premium
         pool.set_user_premium("aaa", user_id, 30).await.unwrap();
-        let first_expiry = pool.get_premium_users(Some("aaa")).await.unwrap()[0].1.clone();
+        let first_expiry = pool.get_premium_users(Some("aaa")).await.unwrap()[0]
+            .1
+            .clone();
 
         // Extend premium
         pool.set_user_premium("aaa", user_id, 30).await.unwrap();
-        let second_expiry = pool.get_premium_users(Some("aaa")).await.unwrap()[0].1.clone();
+        let second_expiry = pool.get_premium_users(Some("aaa")).await.unwrap()[0]
+            .1
+            .clone();
 
         // Second expiry should be later than first
         assert!(second_expiry > first_expiry);
@@ -2276,10 +2825,10 @@ mod tests {
     #[tokio::test]
     async fn test_get_premium_users_filtering() {
         let (pool, _file) = setup_test_db().await;
-        
+
         // Add active premium user
         pool.set_user_premium("aaa", 1, 30).await.unwrap();
-        
+
         // Add expired premium user
         pool.execute_with_timeout(|conn| {
             conn.execute(
@@ -2414,7 +2963,9 @@ mod tests {
         .await;
         assert!(pool.claim_if_ad_presented("gate-click-only").await.is_err());
         assert_eq!(
-            pool.get_pending_download_status("gate-click-only").await.unwrap(),
+            pool.get_pending_download_status("gate-click-only")
+                .await
+                .unwrap(),
             Some("verified".to_string())
         );
     }
@@ -2548,7 +3099,9 @@ mod tests {
             0
         );
         assert_eq!(
-            pool.get_pending_download_status("no-such-ymid").await.unwrap(),
+            pool.get_pending_download_status("no-such-ymid")
+                .await
+                .unwrap(),
             None
         );
     }
@@ -2560,7 +3113,10 @@ mod tests {
     #[tokio::test]
     async fn session_state_reports_status_and_deadline_in_one_read() {
         let (pool, _file) = setup_test_db().await;
-        let live = pool.create_pending_download("primary", 11, "http://v").await.unwrap();
+        let live = pool
+            .create_pending_download("primary", 11, "http://v")
+            .await
+            .unwrap();
         pool.execute_with_timeout(|conn| {
             // A row from before the lease column existed: the status is real,
             // the deadline simply does not exist yet.
@@ -2580,8 +3136,11 @@ mod tests {
             "a row created by the current build must carry a deadline"
         );
 
-        let (legacy_status, legacy_deadline) =
-            pool.get_session_state("pre-lease-row").await.unwrap().unwrap();
+        let (legacy_status, legacy_deadline) = pool
+            .get_session_state("pre-lease-row")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(legacy_status, "pending");
         assert!(
             legacy_deadline.is_none(),
@@ -2598,18 +3157,20 @@ mod tests {
         );
 
         // Positive control: the heartbeat is what fills that gap in.
-        assert!(pool
-            .refresh_session_lease("pre-lease-row", SESSION_LEASE_SECS)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(pool
-            .get_session_state("pre-lease-row")
-            .await
-            .unwrap()
-            .unwrap()
-            .1
-            .is_some());
+        assert!(
+            pool.refresh_session_lease("pre-lease-row", SESSION_LEASE_SECS)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            pool.get_session_state("pre-lease-row")
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .is_some()
+        );
     }
 
     /// The failure message hangs off this one column, so it is written once and
@@ -2619,7 +3180,10 @@ mod tests {
     #[tokio::test]
     async fn job_start_marker_is_written_once_and_is_row_scoped() {
         let (pool, _file) = setup_test_db().await;
-        let ymid = pool.create_pending_download("primary", 21, "http://v").await.unwrap();
+        let ymid = pool
+            .create_pending_download("primary", 21, "http://v")
+            .await
+            .unwrap();
 
         assert_eq!(pool.mark_job_started("no-such-ymid").await.unwrap(), 0);
         assert_eq!(
@@ -2700,7 +3264,10 @@ mod tests {
     #[tokio::test]
     async fn a_second_press_inside_the_postback_lag_window_mints_a_new_ymid() {
         let (pool, _file) = setup_test_db().await;
-        let entry = pool.create_pending_download("primary", 31, "http://v").await.unwrap();
+        let entry = pool
+            .create_pending_download("primary", 31, "http://v")
+            .await
+            .unwrap();
 
         // The ad was requested, but no impression postback has landed yet - the
         // exact window in which an impression-based check would wrongly reuse.
@@ -2714,9 +3281,18 @@ mod tests {
         // Even once the impression journal has caught up, the request-time
         // marker keeps the ymid spent: the two signals are independent.
         pool.mark_ad_requested(&rotated.ymid).await.unwrap();
-        pool.log_postback(&rotated.ymid, Some("impression"), "valued", None, None, None, None, None)
-            .await
-            .unwrap();
+        pool.log_postback(
+            &rotated.ymid,
+            Some("impression"),
+            "valued",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let again = pool
             .resolve_session_ymid(&rotated.ymid)
             .await
@@ -2731,7 +3307,10 @@ mod tests {
     #[tokio::test]
     async fn rotating_a_live_unused_session_is_a_no_op() {
         let (pool, _file) = setup_test_db().await;
-        let entry = pool.create_pending_download("primary", 32, "http://v").await.unwrap();
+        let entry = pool
+            .create_pending_download("primary", 32, "http://v")
+            .await
+            .unwrap();
         let before = user_rows(&pool, 32).await;
 
         let resolved = pool.resolve_session_ymid(&entry).await.unwrap().unwrap();
@@ -2749,13 +3328,19 @@ mod tests {
     async fn a_spent_entry_ymid_mints_a_row_for_the_same_user_and_video() {
         let (pool, _file) = setup_test_db().await;
         pool.set_user_lang("primary", 33, "uk").await.unwrap();
-        let entry = pool.create_pending_download("primary", 33, "http://the-video").await.unwrap();
+        let entry = pool
+            .create_pending_download("primary", 33, "http://the-video")
+            .await
+            .unwrap();
         pool.mark_ad_requested(&entry).await.unwrap();
 
         let rotated = pool.resolve_session_ymid(&entry).await.unwrap().unwrap();
         assert!(!rotated.reused);
         assert_eq!(pool.get_user_id_by_ymid(&rotated.ymid).await.unwrap(), 33);
-        assert_eq!(entry_ymid_of(&pool, &rotated.ymid).await, Some(entry.clone()));
+        assert_eq!(
+            entry_ymid_of(&pool, &rotated.ymid).await,
+            Some(entry.clone())
+        );
 
         let (minted_user, minted_url): (i64, String) = pool
             .execute_with_timeout({
@@ -2847,11 +3432,12 @@ mod tests {
     #[tokio::test]
     async fn resolving_an_unknown_entry_ymid_yields_nothing() {
         let (pool, _file) = setup_test_db().await;
-        assert!(pool
-            .resolve_session_ymid("never-existed")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            pool.resolve_session_ymid("never-existed")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     async fn ad_requested_at(pool: &DatabasePool, ymid: &str) -> Option<String> {
@@ -2872,7 +3458,10 @@ mod tests {
     #[tokio::test]
     async fn the_ad_requested_beacon_stamps_the_marker_once() {
         let (pool, _file) = setup_test_db().await;
-        let ymid = pool.create_pending_download("primary", 35, "http://v").await.unwrap();
+        let ymid = pool
+            .create_pending_download("primary", 35, "http://v")
+            .await
+            .unwrap();
 
         // Nothing is stamped before the client asks for an ad.
         assert!(ad_requested_at(&pool, &ymid).await.is_none());
@@ -2892,5 +3481,84 @@ mod tests {
             first,
             "first write wins"
         );
+    }
+
+    #[tokio::test]
+    async fn test_admin_crud_and_last_admin_guard() {
+        let (pool, _file) = setup_test_db().await;
+        pool.add_admins(&[10, 20]).await.unwrap();
+        assert_eq!(pool.list_admins().await.unwrap(), vec![10, 20]);
+        assert_eq!(pool.get_first_admin().await.unwrap(), Some(10));
+
+        assert_eq!(pool.remove_admins(&[20]).await.unwrap(), 1);
+        assert_eq!(pool.list_admins().await.unwrap(), vec![10]);
+
+        let err = pool.remove_admins(&[10]).await.unwrap_err();
+        assert!(err.to_string().contains("cannot remove last admin"));
+        assert_eq!(pool.list_admins().await.unwrap(), vec![10]);
+
+        unsafe {
+            std::env::set_var("ADMIN_IDS", "999");
+        }
+        pool.seed_admins_from_env().await.unwrap();
+        assert_eq!(pool.list_admins().await.unwrap(), vec![10]);
+        unsafe {
+            std::env::remove_var("ADMIN_IDS");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_premium_duration_grant_extend_remove_and_audit() {
+        let (pool, _file) = setup_test_db().await;
+
+        pool.set_users_premium_duration("aaa", &[1, 2], 1, "hours", Some(99))
+            .await
+            .unwrap();
+        assert_eq!(pool.get_premium_users(Some("aaa")).await.unwrap().len(), 2);
+
+        let before = pool
+            .get_premium_users(Some("aaa"))
+            .await
+            .unwrap()
+            .iter()
+            .find(|(id, _, _)| *id == 1)
+            .unwrap()
+            .1
+            .clone();
+        pool.set_users_premium_duration("aaa", &[1], 1, "days", Some(99))
+            .await
+            .unwrap();
+        let after = pool
+            .get_premium_users(Some("aaa"))
+            .await
+            .unwrap()
+            .iter()
+            .find(|(id, _, _)| *id == 1)
+            .unwrap()
+            .1
+            .clone();
+        assert!(after > before);
+
+        pool.set_users_premium_duration("aaa", &[3], 1, "months", None)
+            .await
+            .unwrap();
+        assert!(pool.is_user_premium("aaa", 3).await);
+
+        let (grants, total) = pool.get_admin_premium_grants("aaa", 10).await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(grants.len(), 2);
+
+        assert_eq!(
+            pool.remove_users_premium("aaa", &[1, 2, 3]).await.unwrap(),
+            3
+        );
+        assert!(
+            pool.get_premium_users(Some("aaa"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let (_, total_after) = pool.get_admin_premium_grants("aaa", 10).await.unwrap();
+        assert_eq!(total_after, 0);
     }
 }

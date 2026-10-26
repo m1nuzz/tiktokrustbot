@@ -11,15 +11,23 @@ pub fn get_database_path() -> String {
     let mut path = env::current_exe().expect("Failed to get current exe path");
     path.pop(); // Remove the executable name, leaving the directory.
     path.push("tiktok_downloader.db"); // Add the db file name.
-    path.to_str().expect("Failed to construct database path").to_string()
+    path.to_str()
+        .expect("Failed to construct database path")
+        .to_string()
 }
 
 #[cfg(test)]
 fn update_user_activity(user_id: i64) -> Result<()> {
     let db_path = get_database_path();
     let conn = Connection::open(db_path)?;
-    conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?1)", [user_id])?;
-    conn.execute("UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE telegram_id = ?1", [user_id])?;
+    conn.execute(
+        "INSERT OR IGNORE INTO users (telegram_id) VALUES (?1)",
+        [user_id],
+    )?;
+    conn.execute(
+        "UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE telegram_id = ?1",
+        [user_id],
+    )?;
     Ok(())
 }
 
@@ -29,7 +37,10 @@ fn log_download(telegram_id: i64, video_url: &str) -> Result<()> {
     let conn = Connection::open(db_path)?;
     // Update user activity first (to ensure the user exists in the database)
     update_user_activity(telegram_id)?;
-    conn.execute("INSERT INTO downloads (user_telegram_id, video_url) VALUES (?1, ?2)", (telegram_id, video_url))?;
+    conn.execute(
+        "INSERT INTO downloads (user_telegram_id, video_url) VALUES (?1, ?2)",
+        (telegram_id, video_url),
+    )?;
     Ok(())
 }
 
@@ -70,9 +81,24 @@ pub fn init_database() -> Result<()> {
     // SQLite refuses ADD COLUMN with a volatile default on non-empty tables
     // ("Cannot add a column with non-constant default"); the backfill below
     // fills real values. Fresh DBs still get CURRENT_TIMESTAMP via CREATE.
-    ensure_column(&conn, "users", "last_active", "last_active DATETIME DEFAULT CURRENT_TIMESTAMP")?;
-    ensure_column(&conn, "users", "created_at", "created_at DATETIME DEFAULT NULL")?;
-    ensure_column(&conn, "users", "quality_preference", "quality_preference TEXT DEFAULT 'h264'")?;
+    ensure_column(
+        &conn,
+        "users",
+        "last_active",
+        "last_active DATETIME DEFAULT CURRENT_TIMESTAMP",
+    )?;
+    ensure_column(
+        &conn,
+        "users",
+        "created_at",
+        "created_at DATETIME DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "users",
+        "quality_preference",
+        "quality_preference TEXT DEFAULT 'h264'",
+    )?;
     ensure_column(&conn, "users", "premium_until", "premium_until DATETIME")?;
     ensure_column(&conn, "users", "lang", "lang TEXT DEFAULT NULL")?;
     ensure_column(&conn, "users", "ref_code", "ref_code TEXT DEFAULT NULL")?;
@@ -119,38 +145,37 @@ pub fn init_database() -> Result<()> {
         "CREATE TABLE IF NOT EXISTS downloads (id INTEGER PRIMARY KEY, user_telegram_id BIGINT, video_url TEXT NOT NULL, download_date DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
     )?;
-    
+
     // Check if the old format table exists
     let has_old_format: bool = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='downloads' AND sql LIKE '%user_id INTEGER%'",
         (),
         |row| row.get(0)
     ).unwrap_or(0) > 0;
-    
+
     if has_old_format {
         // Check if we need to migrate (if there's data in the old format)
-        let has_data: bool = conn.query_row(
-            "SELECT COUNT(*) FROM downloads",
-            (),
-            |row| row.get(0)
-        ).unwrap_or(0) > 0;
-        
+        let has_data: bool = conn
+            .query_row("SELECT COUNT(*) FROM downloads", (), |row| row.get(0))
+            .unwrap_or(0)
+            > 0;
+
         if has_data {
             // Create a temporary table with the new structure
             conn.execute(
                 "CREATE TEMPORARY TABLE downloads_migrated AS SELECT d.id, u.telegram_id as user_telegram_id, d.video_url, d.download_date FROM downloads d JOIN users u ON d.user_id = u.id",
                 (),
             )?;
-            
+
             // Drop the old table
             conn.execute("DROP TABLE downloads", ())?;
-            
+
             // Recreate with new format
             conn.execute(
                 "CREATE TABLE downloads (id INTEGER PRIMARY KEY, user_telegram_id BIGINT, video_url TEXT NOT NULL, download_date DATETIME DEFAULT CURRENT_TIMESTAMP)",
                 (),
             )?;
-            
+
             // Copy data from temporary table
             conn.execute(
                 "INSERT INTO downloads (id, user_telegram_id, video_url, download_date) SELECT id, user_telegram_id, video_url, download_date FROM downloads_migrated",
@@ -165,9 +190,38 @@ pub fn init_database() -> Result<()> {
             )?;
         }
     }
-    ensure_column(&conn, "downloads", "bot_id", "bot_id TEXT NOT NULL DEFAULT 'primary'")?;
+    ensure_column(
+        &conn,
+        "downloads",
+        "bot_id",
+        "bot_id TEXT NOT NULL DEFAULT 'primary'",
+    )?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY, admin_telegram_id BIGINT UNIQUE NOT NULL)",
+        (),
+    )?;
+    // Audit trail for admin-issued premium grants. `users.premium_until`
+    // remains the source of truth for active premium; this table only records
+    // who granted what, so the admin panel can show it.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS premium_grants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id TEXT NOT NULL,
+            telegram_id BIGINT NOT NULL,
+            granted_by BIGINT NOT NULL,
+            amount INTEGER NOT NULL,
+            unit TEXT NOT NULL,
+            granted_at TEXT NOT NULL DEFAULT (datetime('now')),
+            premium_until_after TEXT NOT NULL
+        )",
+        (),
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_premium_grants_bot_user ON premium_grants(bot_id, telegram_id)",
+        (),
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_premium_grants_bot_admin ON premium_grants(bot_id, granted_by)",
         (),
     )?;
     conn.execute(
@@ -184,31 +238,76 @@ pub fn init_database() -> Result<()> {
     )?;
     // Column ensure + retirement run after the CREATE above so fresh
     // databases (where the table does not exist yet) don't error.
-    ensure_column(&conn, "pending_downloads", "notified_at", "notified_at DATETIME DEFAULT NULL")?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "notified_at",
+        "notified_at DATETIME DEFAULT NULL",
+    )?;
     // Heartbeat-extended lease: the deadline a client heartbeat pushes
     // forward while the mini-app is open, and the record that a download job
     // really started. Both are what let the sweeper expire a lapsed session
     // instead of a session the user is still sitting on, and what lets it tell
     // "never earned the ad" from "the download failed".
-    ensure_column(&conn, "pending_downloads", "lease_expires_at", "lease_expires_at DATETIME DEFAULT NULL")?;
-    ensure_column(&conn, "pending_downloads", "job_started_at", "job_started_at DATETIME DEFAULT NULL")?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "lease_expires_at",
+        "lease_expires_at DATETIME DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "job_started_at",
+        "job_started_at DATETIME DEFAULT NULL",
+    )?;
     // One ymid per ad event. `ad_requested_at` is stamped the moment the client
     // asks for an ad and is what marks a ymid as spent: the impression postback
     // lags the ad by seconds, so an impression-based test would let a second
     // press reuse a ymid that already carried an ad. `entry_ymid` records which
     // bot-button ymid a freshly minted session came from, so a press can be
     // joined to the session that served it.
-    ensure_column(&conn, "pending_downloads", "entry_ymid", "entry_ymid TEXT DEFAULT NULL")?;
-    ensure_column(&conn, "pending_downloads", "ad_requested_at", "ad_requested_at DATETIME DEFAULT NULL")?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "entry_ymid",
+        "entry_ymid TEXT DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "ad_requested_at",
+        "ad_requested_at DATETIME DEFAULT NULL",
+    )?;
     // Burst ordering metadata: which burst a row belongs to and its 1-based
     // position inside it. NULL for single-link rows.
-    ensure_column(&conn, "pending_downloads", "batch_id", "batch_id TEXT DEFAULT NULL")?;
-    ensure_column(&conn, "pending_downloads", "batch_position", "batch_position INTEGER DEFAULT NULL")?;
-    ensure_column(&conn, "pending_downloads", "batch_total", "batch_total INTEGER DEFAULT NULL")?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "batch_id",
+        "batch_id TEXT DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "batch_position",
+        "batch_position INTEGER DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "batch_total",
+        "batch_total INTEGER DEFAULT NULL",
+    )?;
     // Owning bot for delivery routing, sweeper notifications and per-bot
     // stats. DEFAULT keeps old INSERTs (which predate multi-bot) working and
     // attributes legacy rows to 'primary'.
-    ensure_column(&conn, "pending_downloads", "bot_id", "bot_id TEXT NOT NULL DEFAULT 'primary'")?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "bot_id",
+        "bot_id TEXT NOT NULL DEFAULT 'primary'",
+    )?;
     // Silently retire download requests abandoned before this startup (the
     // user never finished watching the ad). They are marked notified so the
     // expiry sweeper never messages them; only new rows get notified. The
@@ -230,25 +329,50 @@ pub fn init_database() -> Result<()> {
         "CREATE TABLE IF NOT EXISTS blocks (id INTEGER PRIMARY KEY, telegram_id BIGINT NOT NULL, blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
     )?;
-    ensure_column(&conn, "blocks", "bot_id", "bot_id TEXT NOT NULL DEFAULT 'primary'")?;
+    ensure_column(
+        &conn,
+        "blocks",
+        "bot_id",
+        "bot_id TEXT NOT NULL DEFAULT 'primary'",
+    )?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS funnel_events (id INTEGER PRIMARY KEY, user_telegram_id BIGINT NOT NULL, event TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
     )?;
-    ensure_column(&conn, "funnel_events", "bot_id", "bot_id TEXT NOT NULL DEFAULT 'primary'")?;
+    ensure_column(
+        &conn,
+        "funnel_events",
+        "bot_id",
+        "bot_id TEXT NOT NULL DEFAULT 'primary'",
+    )?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS monetag_postbacks (id INTEGER PRIMARY KEY, ymid TEXT NOT NULL, event_type TEXT DEFAULT NULL, reward_event_type TEXT NOT NULL, estimated_price REAL DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
     )?;
     // Placement attribution for postback revenue (which SDK call earned it).
     // Runs after the CREATE above so fresh databases don't error.
-    ensure_column(&conn, "monetag_postbacks", "request_var", "request_var TEXT DEFAULT NULL")?;
-    ensure_column(&conn, "monetag_postbacks", "sub_zone_id", "sub_zone_id TEXT DEFAULT NULL")?;
+    ensure_column(
+        &conn,
+        "monetag_postbacks",
+        "request_var",
+        "request_var TEXT DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "monetag_postbacks",
+        "sub_zone_id",
+        "sub_zone_id TEXT DEFAULT NULL",
+    )?;
     // Monetag documents zone_id and telegram_id as postback macros; both were
     // being dropped, so a postback attributed to another zone was
     // indistinguishable from a normal one. Also after the CREATE: ALTER TABLE on
     // a table that does not exist yet fails outright.
-    ensure_column(&conn, "monetag_postbacks", "zone_id", "zone_id TEXT DEFAULT NULL")?;
+    ensure_column(
+        &conn,
+        "monetag_postbacks",
+        "zone_id",
+        "zone_id TEXT DEFAULT NULL",
+    )?;
     ensure_column(
         &conn,
         "monetag_postbacks",
@@ -266,33 +390,100 @@ pub fn init_database() -> Result<()> {
         "CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY, user_id BIGINT NOT NULL, amount INTEGER NOT NULL, payload TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
     )?;
-    ensure_column(&conn, "payments", "bot_id", "bot_id TEXT NOT NULL DEFAULT 'primary'")?;
+    ensure_column(
+        &conn,
+        "payments",
+        "bot_id",
+        "bot_id TEXT NOT NULL DEFAULT 'primary'",
+    )?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS invoices (id INTEGER PRIMARY KEY, user_id BIGINT NOT NULL, amount INTEGER NOT NULL, payload TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)",
         (),
     )?;
-    ensure_column(&conn, "invoices", "bot_id", "bot_id TEXT NOT NULL DEFAULT 'primary'")?;
-    
+    ensure_column(
+        &conn,
+        "invoices",
+        "bot_id",
+        "bot_id TEXT NOT NULL DEFAULT 'primary'",
+    )?;
+
     // Add indexes for performance
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_date ON downloads(download_date)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_date ON pending_downloads(created_at)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_downloads(status)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_user_id ON pending_downloads(user_id)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_bot ON pending_downloads(bot_id, created_at)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_funnel_bot ON funnel_events(bot_id, created_at)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_bot ON payments(bot_id, timestamp)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_bot ON invoices(bot_id, timestamp)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_bot ON downloads(bot_id, download_date)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_bot ON blocks(bot_id, blocked_at)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(timestamp)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(timestamp)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_date ON blocks(blocked_at)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_funnel_event ON funnel_events(event, created_at)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_funnel_user ON funnel_events(user_telegram_id)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_postback_ymid ON monetag_postbacks(ymid, created_at)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_mini_app_event ON mini_app_events(event, created_at)", ());
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_mini_app_ymid ON mini_app_events(ymid, created_at)", ());
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_downloads_date ON downloads(download_date)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_date ON pending_downloads(created_at)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_downloads(status)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_user_id ON pending_downloads(user_id)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_bot ON pending_downloads(bot_id, created_at)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_funnel_bot ON funnel_events(bot_id, created_at)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_payments_bot ON payments(bot_id, timestamp)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_invoices_bot ON invoices(bot_id, timestamp)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_downloads_bot ON downloads(bot_id, download_date)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_blocks_bot ON blocks(bot_id, blocked_at)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(timestamp)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(timestamp)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_blocks_date ON blocks(blocked_at)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_funnel_event ON funnel_events(event, created_at)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_funnel_user ON funnel_events(user_telegram_id)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_postback_ymid ON monetag_postbacks(ymid, created_at)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mini_app_event ON mini_app_events(event, created_at)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mini_app_ymid ON mini_app_events(ymid, created_at)",
+        (),
+    );
 
     conn.execute(
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('subscription_required', 'true')",
@@ -329,14 +520,12 @@ pub fn init_database() -> Result<()> {
     Ok(())
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
-    use std::env;
     use serial_test::serial;
+    use std::env;
+    use tempfile::TempDir;
 
     #[test]
     #[serial]
@@ -344,30 +533,32 @@ mod tests {
         // Create a temporary database for testing
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        
+
         unsafe {
             env::set_var("DATABASE_PATH", db_path.to_str().unwrap());
         }
-        
+
         // Initialize the database
         let result = init_database();
         assert!(result.is_ok());
-        
+
         // Verify that the tables were created
         let conn = Connection::open(&db_path).unwrap();
-        let table_count: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'", 
-            [], 
-            |row| row.get(0)
-        ).unwrap();
-        
+        let table_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
         // There should be at least 5 tables: users, downloads, admins, channels, settings
         assert!(table_count >= 5);
         unsafe {
             env::remove_var("DATABASE_PATH");
         }
     }
-    
+
     #[test]
     #[serial]
     fn test_user_activity_update() {
@@ -377,30 +568,32 @@ mod tests {
         unsafe {
             env::set_var("DATABASE_PATH", db_path.to_str().unwrap());
         }
-        
+
         // Initialize the database
         init_database().unwrap();
-        
+
         // Test updating user activity
         let user_id = 123456;
         let result = update_user_activity(user_id);
         assert!(result.is_ok());
-        
+
         // Verify the user exists in the database - use the same environment variable
         let db_path_from_env = env::var("DATABASE_PATH").unwrap();
         let conn = Connection::open(&db_path_from_env).unwrap();
-        let count: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM users WHERE telegram_id = ?1",
-            [user_id],
-            |row| row.get(0)
-        ).unwrap();
-        
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM users WHERE telegram_id = ?1",
+                [user_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
         assert_eq!(count, 1);
         unsafe {
             env::remove_var("DATABASE_PATH");
         }
     }
-    
+
     #[test]
     #[serial]
     fn test_download_logging() {
@@ -410,25 +603,27 @@ mod tests {
         unsafe {
             env::set_var("DATABASE_PATH", db_path.to_str().unwrap());
         }
-        
+
         // Initialize the database
         init_database().unwrap();
-        
+
         // Test logging a download
         let user_id = 123456;
         let video_url = "https://example.com/video.mp4";
         let result = log_download(user_id, video_url);
         assert!(result.is_ok());
-        
+
         // Verify the download was logged - use the same environment variable
         let db_path_from_env = env::var("DATABASE_PATH").unwrap();
         let conn = Connection::open(&db_path_from_env).unwrap();
-        let count: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM downloads WHERE user_telegram_id = ?1 AND video_url = ?2",
-            (user_id, video_url),
-            |row| row.get(0)
-        ).unwrap();
-        
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM downloads WHERE user_telegram_id = ?1 AND video_url = ?2",
+                (user_id, video_url),
+                |row| row.get(0),
+            )
+            .unwrap();
+
         assert_eq!(count, 1);
         unsafe {
             env::remove_var("DATABASE_PATH");
@@ -445,7 +640,8 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_migration_adds_missing_columns() {        // Simulate a legacy DB that predates created_at/lang/ref_code.
+    fn test_migration_adds_missing_columns() {
+        // Simulate a legacy DB that predates created_at/lang/ref_code.
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
         unsafe {
@@ -464,15 +660,27 @@ mod tests {
 
         let conn = Connection::open(&db_path).unwrap();
         let cols = user_columns(&conn);
-        for expected in ["created_at", "lang", "ref_code", "last_active", "quality_preference", "premium_until"] {
-            assert!(cols.contains(&expected.to_string()), "missing column {expected}");
+        for expected in [
+            "created_at",
+            "lang",
+            "ref_code",
+            "last_active",
+            "quality_preference",
+            "premium_until",
+        ] {
+            assert!(
+                cols.contains(&expected.to_string()),
+                "missing column {expected}"
+            );
         }
         // blocks table must exist too.
-        let blocks: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='blocks'",
-            [],
-            |row| row.get(0)
-        ).unwrap();
+        let blocks: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='blocks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(blocks, 1);
         unsafe {
             env::remove_var("DATABASE_PATH");
@@ -507,22 +715,44 @@ mod tests {
 
         let conn = Connection::open(&db_path).unwrap();
         // Data survived with columns intact.
-        let kept: i32 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
+        let kept: i32 = conn
+            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(kept, 2);
-        let lang: String = conn.query_row(
-            "SELECT lang FROM users WHERE telegram_id = 11", [], |r| r.get(0)).unwrap();
+        let lang: String = conn
+            .query_row("SELECT lang FROM users WHERE telegram_id = 11", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(lang, "uk");
         // Legacy rows attribute to 'primary'.
-        let primary: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM users WHERE bot_id = 'primary'", [], |r| r.get(0)).unwrap();
+        let primary: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM users WHERE bot_id = 'primary'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(primary, 2);
         // Same human on a second bot coexists; twice on one bot is rejected.
-        conn.execute("INSERT INTO users (telegram_id, bot_id) VALUES (11, 'second')", []).unwrap();
-        let dup = conn.execute("INSERT INTO users (telegram_id, bot_id) VALUES (11, 'primary')", []);
+        conn.execute(
+            "INSERT INTO users (telegram_id, bot_id) VALUES (11, 'second')",
+            [],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO users (telegram_id, bot_id) VALUES (11, 'primary')",
+            [],
+        );
         assert!(dup.is_err(), "same (bot, user) twice must be rejected");
         // Registry + per-bot settings tables exist with the legacy seed.
-        let seeded: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM bots WHERE bot_id = 'primary'", [], |r| r.get(0)).unwrap();
+        let seeded: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bots WHERE bot_id = 'primary'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(seeded, 1);
         unsafe {
             env::remove_var("DATABASE_PATH");
@@ -558,14 +788,29 @@ mod tests {
         init_database().unwrap();
 
         let conn = Connection::open(&db_path).unwrap();
-        let filled: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM users WHERE created_at IS NOT NULL", [], |r| r.get(0)).unwrap();
+        let filled: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM users WHERE created_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(filled, 2);
         // Backfilled from last_active, not from "now".
-        let old: String = conn.query_row(
-            "SELECT created_at FROM users WHERE telegram_id = 1", [], |r| r.get(0)).unwrap();
-        let active: String = conn.query_row(
-            "SELECT last_active FROM users WHERE telegram_id = 1", [], |r| r.get(0)).unwrap();
+        let old: String = conn
+            .query_row(
+                "SELECT created_at FROM users WHERE telegram_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let active: String = conn
+            .query_row(
+                "SELECT last_active FROM users WHERE telegram_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(old, active);
         unsafe {
             env::remove_var("DATABASE_PATH");
@@ -598,19 +843,40 @@ mod tests {
         }
 
         // Snapshot the healthy row before the second migration run.
-        let healthy_before: String = Connection::open(&db_path).unwrap().query_row(
-            "SELECT created_at FROM users WHERE telegram_id = 1", [], |r| r.get(0)).unwrap();
+        let healthy_before: String = Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT created_at FROM users WHERE telegram_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
 
         // Re-running init must fix only the broken row (idempotent).
         init_database().unwrap();
 
         let conn = Connection::open(&db_path).unwrap();
-        let healthy: String = conn.query_row(
-            "SELECT created_at FROM users WHERE telegram_id = 1", [], |r| r.get(0)).unwrap();
-        let fixed: String = conn.query_row(
-            "SELECT created_at FROM users WHERE telegram_id = 2", [], |r| r.get(0)).unwrap();
-        let fixed_active: String = conn.query_row(
-            "SELECT last_active FROM users WHERE telegram_id = 2", [], |r| r.get(0)).unwrap();
+        let healthy: String = conn
+            .query_row(
+                "SELECT created_at FROM users WHERE telegram_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let fixed: String = conn
+            .query_row(
+                "SELECT created_at FROM users WHERE telegram_id = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let fixed_active: String = conn
+            .query_row(
+                "SELECT last_active FROM users WHERE telegram_id = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         // Broken row repaired to its last_active ...
         assert_eq!(fixed, fixed_active);
         // ... while the healthy row is untouched.
@@ -646,12 +912,27 @@ mod tests {
         init_database().unwrap();
 
         let conn = Connection::open(&db_path).unwrap();
-        let stale_status: String = conn.query_row(
-            "SELECT status FROM pending_downloads WHERE id = 'stale'", [], |r| r.get(0)).unwrap();
-        let stale_notified: Option<String> = conn.query_row(
-            "SELECT notified_at FROM pending_downloads WHERE id = 'stale'", [], |r| r.get(0)).unwrap();
-        let fresh_status: String = conn.query_row(
-            "SELECT status FROM pending_downloads WHERE id = 'fresh'", [], |r| r.get(0)).unwrap();
+        let stale_status: String = conn
+            .query_row(
+                "SELECT status FROM pending_downloads WHERE id = 'stale'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let stale_notified: Option<String> = conn
+            .query_row(
+                "SELECT notified_at FROM pending_downloads WHERE id = 'stale'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let fresh_status: String = conn
+            .query_row(
+                "SELECT status FROM pending_downloads WHERE id = 'fresh'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(stale_status, "expired");
         assert!(stale_notified.is_some());
         assert_eq!(fresh_status, "pending");

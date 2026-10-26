@@ -9,10 +9,10 @@ use tokio::time::Instant;
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
+use crate::BotCtx;
 use crate::database::DatabasePool;
 use crate::handlers::admin::{is_admin, is_admin_id};
 use crate::handlers::subscription::check_subscription;
-use crate::BotCtx;
 use crate::handlers::ui::is_menu_button;
 use crate::i18n::{self, MsgKey};
 use crate::mtproto_uploader::MTProtoUploader;
@@ -160,7 +160,6 @@ fn is_youtube_url(url: &str) -> bool {
     url.contains("youtube.com/") || url.contains("youtu.be/")
 }
 
-
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes per download attempt
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes per upload attempt
 /// Wall-clock ceiling for one download+upload job. It must end strictly
@@ -289,8 +288,12 @@ async fn fail_request(
 fn extract_url_from_text(text: &str) -> Option<String> {
     // Regex for searching TikTok, Instagram or YouTube URL
     let tiktok_re = Regex::new(r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/[^\s]+").unwrap();
-    let instagram_re = Regex::new(r"https?://(?:www\.)?instagram\.com/(?:reels?|p|tv)/[^\s]+").unwrap();
-    let youtube_re = Regex::new(r"https?://(?:www\.)?(?:youtube\.com/shorts/|youtube\.com/watch\?v=|youtu\.be/)[^\s]+").unwrap();
+    let instagram_re =
+        Regex::new(r"https?://(?:www\.)?instagram\.com/(?:reels?|p|tv)/[^\s]+").unwrap();
+    let youtube_re = Regex::new(
+        r"https?://(?:www\.)?(?:youtube\.com/shorts/|youtube\.com/watch\?v=|youtu\.be/)[^\s]+",
+    )
+    .unwrap();
 
     if let Some(mat) = tiktok_re.find(text) {
         Some(mat.as_str().to_string())
@@ -308,11 +311,28 @@ fn extract_url_from_text(text: &str) -> Option<String> {
 /// `admin_ads_enabled` (or TEST_MODE) forces ads for admins to test.
 /// Used by both the bot handler and the mini-app status endpoint so they
 /// can never disagree with each other.
-pub async fn ads_enabled_for(db_pool: &DatabasePool, bot_id: &str, user_id: i64, is_user_admin: bool) -> bool {
-    let module_enabled = std::env::var("MONETAG_MODULE_ENABLED").map(|v| v.to_lowercase() == "true").unwrap_or(true);
-    let global_ads = db_pool.get_setting("ads_enabled").await.map(|val| val == "true").unwrap_or(true);
-    let is_test_mode = std::env::var("TEST_MODE").map(|v| v.to_lowercase() == "true").unwrap_or(false);
-    let admin_ads = db_pool.get_setting("admin_ads_enabled").await.map(|val| val == "true").unwrap_or(false);
+pub async fn ads_enabled_for(
+    db_pool: &DatabasePool,
+    bot_id: &str,
+    user_id: i64,
+    is_user_admin: bool,
+) -> bool {
+    let module_enabled = std::env::var("MONETAG_MODULE_ENABLED")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(true);
+    let global_ads = db_pool
+        .get_setting("ads_enabled")
+        .await
+        .map(|val| val == "true")
+        .unwrap_or(true);
+    let is_test_mode = std::env::var("TEST_MODE")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+    let admin_ads = db_pool
+        .get_setting("admin_ads_enabled")
+        .await
+        .map(|val| val == "true")
+        .unwrap_or(false);
 
     if is_user_admin && (admin_ads || is_test_mode) {
         log::info!("Ads enabled for admin (forced by setting or test mode)");
@@ -369,17 +389,27 @@ pub async fn link_handler(
     // Effective locale: manual /language override wins, else Telegram tag.
     // Computed before URL parsing: the guide reply below needs it too.
     let tg_lang = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
-    let lang = db_pool.get_effective_lang(bot_id, user_id as i64, tg_lang).await;
+    let lang = db_pool
+        .get_effective_lang(bot_id, user_id as i64, tg_lang)
+        .await;
 
     let url = match extract_url_from_text(text) {
         Some(url) => {
-            db_pool.log_funnel_event(bot_id, user_id as i64, "link_received").await;
+            db_pool
+                .log_funnel_event(bot_id, user_id as i64, "link_received")
+                .await;
             url
         }
         None => {
             // Not a link: guide the user instead of staying silent.
-            db_pool.log_funnel_event(bot_id, user_id as i64, "text_no_link").await;
-            bot.send_message(msg.chat.id, i18n::t(MsgKey::SendLinkGuide, Some(lang.as_str()))).await?;
+            db_pool
+                .log_funnel_event(bot_id, user_id as i64, "text_no_link")
+                .await;
+            bot.send_message(
+                msg.chat.id,
+                i18n::t(MsgKey::SendLinkGuide, Some(lang.as_str())),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -406,7 +436,11 @@ pub async fn link_handler(
     let _url_processing_guard = match UrlProcessingGuard::try_acquire(&url) {
         Some(guard) => guard,
         None => {
-            bot.send_message(msg.chat.id, i18n::t(MsgKey::AlreadyProcessing, Some(lang.as_str()))).await?;
+            bot.send_message(
+                msg.chat.id,
+                i18n::t(MsgKey::AlreadyProcessing, Some(lang.as_str())),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -450,16 +484,24 @@ pub async fn link_handler(
                 .iter()
                 .rev()
                 .take(8)
-                .map(|h| vec![InlineKeyboardButton::callback(format!("{}p", h), format!("ytq|{}|{}", key, h))])
+                .map(|h| {
+                    vec![InlineKeyboardButton::callback(
+                        format!("{}p", h),
+                        format!("ytq|{}|{}", key, h),
+                    )]
+                })
                 .collect();
             rows.push(vec![InlineKeyboardButton::callback(
                 i18n::t(MsgKey::YtAudioOnly, Some(lang.as_str())),
                 format!("yta|{}", key),
             )]);
 
-            bot.send_message(msg.chat.id, i18n::t(MsgKey::YtQualityPick, Some(lang.as_str())))
-                .reply_markup(InlineKeyboardMarkup::new(rows))
-                .await?;
+            bot.send_message(
+                msg.chat.id,
+                i18n::t(MsgKey::YtQualityPick, Some(lang.as_str())),
+            )
+            .reply_markup(InlineKeyboardMarkup::new(rows))
+            .await?;
             return Ok(());
         }
         // Probe failed (private/live streams etc.): default download flow.
@@ -472,18 +514,25 @@ pub async fn link_handler(
         let webapp_url = std::env::var("WEBAPP_URL").unwrap_or_default();
         if !webapp_url.is_empty() {
             if let Ok(url_obj) = webapp_url.parse::<reqwest::Url>() {
-                let ymid = match db_pool.create_pending_download_with_batch(
-                    bot_id,
-                    user_id as i64,
-                    &url,
-                    batch.as_ref().map(|b| b.id.as_str()),
-                    batch.as_ref().map(|b| b.position),
-                    batch.as_ref().map(|b| b.total),
-                ).await {
+                let ymid = match db_pool
+                    .create_pending_download_with_batch(
+                        bot_id,
+                        user_id as i64,
+                        &url,
+                        batch.as_ref().map(|b| b.id.as_str()),
+                        batch.as_ref().map(|b| b.position),
+                        batch.as_ref().map(|b| b.total),
+                    )
+                    .await
+                {
                     Ok(id) => id,
                     Err(e) => {
                         log::error!("Failed to create pending download: {}", e);
-                        bot.send_message(msg.chat.id, i18n::t(MsgKey::ErrorInitDownload, Some(lang.as_str()))).await?;
+                        bot.send_message(
+                            msg.chat.id,
+                            i18n::t(MsgKey::ErrorInitDownload, Some(lang.as_str())),
+                        )
+                        .await?;
                         return Ok(());
                     }
                 };
@@ -499,7 +548,10 @@ pub async fn link_handler(
                 let choice_text = i18n::t(MsgKey::ChoiceText, Some(lang.as_str()));
 
                 let mut rows = vec![
-                    vec![InlineKeyboardButton::web_app(ad_btn_text, WebAppInfo { url: final_url })],
+                    vec![InlineKeyboardButton::web_app(
+                        ad_btn_text,
+                        WebAppInfo { url: final_url },
+                    )],
                     vec![InlineKeyboardButton::callback(prem_btn_text, "buy_premium")],
                 ];
                 if batch.is_some() {
@@ -512,7 +564,12 @@ pub async fn link_handler(
                 let message_text = match &batch {
                     Some(info) => format!(
                         "{}\n\n{}",
-                        batch_text(MsgKey::BatchProgress, Some(lang.as_str()), info.position, info.total),
+                        batch_text(
+                            MsgKey::BatchProgress,
+                            Some(lang.as_str()),
+                            info.position,
+                            info.total
+                        ),
                         choice_text
                     ),
                     None => choice_text.to_string(),
@@ -530,7 +587,8 @@ pub async fn link_handler(
                     None
                 };
 
-                let sent = match bot.send_message(msg.chat.id, message_text)
+                let sent = match bot
+                    .send_message(msg.chat.id, message_text)
                     .reply_markup(InlineKeyboardMarkup::new(rows))
                     .await
                 {
@@ -560,13 +618,11 @@ pub async fn link_handler(
                         BatchOutcome::Skipped => MsgKey::BatchSkipped,
                         BatchOutcome::Failed => MsgKey::BatchFailed,
                     };
-                    let status_text = batch_text(
-                        status_key,
-                        Some(lang.as_str()),
-                        info.position,
-                        info.total,
-                    );
-                    let _ = bot.edit_message_text(sent.chat.id, sent.id, status_text).await;
+                    let status_text =
+                        batch_text(status_key, Some(lang.as_str()), info.position, info.total);
+                    let _ = bot
+                        .edit_message_text(sent.chat.id, sent.id, status_text)
+                        .await;
                     // Remove the ad/premium/skip buttons from the finished item.
                     let _ = bot.edit_message_reply_markup(sent.chat.id, sent.id).await;
                 }
@@ -587,12 +643,16 @@ pub async fn link_handler(
         db_pool,
         task_manager,
         upload_semaphore,
-        msg.chat.username().map(|s| s.to_string()).or_else(|| msg.from.as_ref().and_then(|u| u.username.clone())),
+        msg.chat
+            .username()
+            .map(|s| s.to_string())
+            .or_else(|| msg.from.as_ref().and_then(|u| u.username.clone())),
         msg.chat.id,
         Some(lang),
         None,
         None,
-    ).await
+    )
+    .await
 }
 
 /// Handle the per-item "Skip this video" button. Only a still-pending row can
@@ -745,7 +805,11 @@ pub async fn process_video_request(
     if let Some(ymid) = ymid.as_deref() {
         if let Ok(Some((batch_id, position, _total))) = db_pool.get_batch_info(ymid).await {
             let deadline = std::time::Instant::now() + Duration::from_secs(1800);
-            while db_pool.earlier_batch_rows_unfinished(&batch_id, position).await.unwrap_or(false) {
+            while db_pool
+                .earlier_batch_rows_unfinished(&batch_id, position)
+                .await
+                .unwrap_or(false)
+            {
                 if std::time::Instant::now() >= deadline {
                     break;
                 }
@@ -758,24 +822,27 @@ pub async fn process_video_request(
     // numeric height ("1080") or "audio" instead of the stored default.
     let quality_preference = match quality_override {
         Some(q) => q,
-        None => db_pool.get_user_quality(bot_id, user_id).await.unwrap_or_else(|_| "best".to_string()),
+        None => db_pool
+            .get_user_quality(bot_id, user_id)
+            .await
+            .unwrap_or_else(|_| "best".to_string()),
     };
     let fingerprint = crate::handlers::fingerprint::get_current_fingerprint(db_pool.clone()).await;
     let is_audio = quality_preference == "audio";
 
     // Acquire upload permit
-    let _permit = upload_semaphore.acquire().await.map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
+    let _permit = upload_semaphore
+        .acquire()
+        .await
+        .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
 
     let is_user_admin = is_admin_id(user_id);
     if !check_subscription(&bot, &db_pool, user_id, is_user_admin)
         .await
         .unwrap_or(true)
     {
-        bot.send_message(
-            chat_id,
-            i18n::t(MsgKey::SubscribeRequired, lang.as_deref()),
-        )
-        .await?;
+        bot.send_message(chat_id, i18n::t(MsgKey::SubscribeRequired, lang.as_deref()))
+            .await?;
         notify_batch_outcome(ymid.as_deref(), BatchOutcome::Failed);
         return Ok(());
     }
@@ -796,7 +863,13 @@ pub async fn process_video_request(
             if !meta.images.is_empty() {
                 let stem = format!("output/{}", Uuid::new_v4());
                 crate::handlers::photo::handle_photo_post(
-                    &bot, chat_id, &fetcher, &meta, &stem, is_audio, &mut progress_bar,
+                    &bot,
+                    chat_id,
+                    &fetcher,
+                    &meta,
+                    &stem,
+                    is_audio,
+                    &mut progress_bar,
                 )
                 .await?;
                 progress_bar.update(100, Some("✅ Done!")).await?;
@@ -809,7 +882,13 @@ pub async fn process_video_request(
         let mut retries = 0;
         let path = loop {
             let file_stem = format!("output/{}", Uuid::new_v4());
-            let fut = fetcher.download_video_from_url(url.clone(), &file_stem, &quality_preference, fingerprint.clone(), &mut progress_bar);
+            let fut = fetcher.download_video_from_url(
+                url.clone(),
+                &file_stem,
+                &quality_preference,
+                fingerprint.clone(),
+                &mut progress_bar,
+            );
 
             match timeout(DOWNLOAD_TIMEOUT, fut).await {
                 Ok(Ok(path)) => break path,
@@ -836,14 +915,22 @@ pub async fn process_video_request(
         let file_size = fs::metadata(&path)?.len();
 
         if file_size > TELEGRAM_BOT_API_FILE_LIMIT {
-            progress_bar.update(85, Some("📤 Uploading (Large)...")).await?;
+            progress_bar
+                .update(85, Some("📤 Uploading (Large)..."))
+                .await?;
             let upload_result = match timeout(UPLOAD_TIMEOUT, async {
                 if is_audio {
-                    mtproto_uploader.upload_audio(user_id, username, &path, "", &mut progress_bar).await
+                    mtproto_uploader
+                        .upload_audio(user_id, username, &path, "", &mut progress_bar)
+                        .await
                 } else {
-                    mtproto_uploader.upload_video(user_id, username, &path, "", &mut progress_bar).await
+                    mtproto_uploader
+                        .upload_video(user_id, username, &path, "", &mut progress_bar)
+                        .await
                 }
-            }).await {
+            })
+            .await
+            {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(anyhow::anyhow!("Large upload failed: {}", e)),
                 Err(_) => Err(anyhow::anyhow!(
@@ -867,20 +954,41 @@ pub async fn process_video_request(
                 let mut retries = 0;
                 loop {
                     let res = if is_audio {
-                        send_audio_with_progress_botapi(&bot.token(), chat_id, &path, None, &mut progress_bar).await
+                        send_audio_with_progress_botapi(
+                            &bot.token(),
+                            chat_id,
+                            &path,
+                            None,
+                            &mut progress_bar,
+                        )
+                        .await
                     } else {
-                        send_video_with_progress_botapi(&bot.token(), chat_id, &path, None, &mut progress_bar).await
+                        send_video_with_progress_botapi(
+                            &bot.token(),
+                            chat_id,
+                            &path,
+                            None,
+                            &mut progress_bar,
+                        )
+                        .await
                     };
                     match res {
                         Ok(_) => break Ok(()),
                         Err(e) => {
                             retries += 1;
-                            if retries >= 3 { break Err(e); }
-                            tokio::time::sleep(Duration::from_millis(1000 * 2_u64.pow(retries - 1))).await;
+                            if retries >= 3 {
+                                break Err(e);
+                            }
+                            tokio::time::sleep(Duration::from_millis(
+                                1000 * 2_u64.pow(retries - 1),
+                            ))
+                            .await;
                         }
                     }
                 }
-            }).await {
+            })
+            .await
+            {
                 Ok(result) => result,
                 Err(_) => Err(anyhow::anyhow!(
                     "Upload timed out after {} seconds",
@@ -911,14 +1019,36 @@ pub async fn process_video_request(
         Ok(Err(e)) => {
             // Tier 1: the bot knows why it failed — say so immediately.
             let key = classify_download_error(&e, &url);
-            fail_request(&bot, chat_id, &db_pool, &ymid, &url, &e, key, lang.as_deref(), &mut progress_bar).await;
+            fail_request(
+                &bot,
+                chat_id,
+                &db_pool,
+                &ymid,
+                &url,
+                &e,
+                key,
+                lang.as_deref(),
+                &mut progress_bar,
+            )
+            .await;
             Ok(())
         }
         Err(_) => {
             // Tier 2: something unforeseen hung the job — the budget killed
             // it, tell the user to retry.
             let e = anyhow::anyhow!("Job budget of {} seconds exceeded", JOB_BUDGET.as_secs());
-            fail_request(&bot, chat_id, &db_pool, &ymid, &url, &e, MsgKey::DownloadTimeout, lang.as_deref(), &mut progress_bar).await;
+            fail_request(
+                &bot,
+                chat_id,
+                &db_pool,
+                &ymid,
+                &url,
+                &e,
+                MsgKey::DownloadTimeout,
+                lang.as_deref(),
+                &mut progress_bar,
+            )
+            .await;
             Ok(())
         }
     }
@@ -928,6 +1058,7 @@ pub async fn process_video_request(
 mod tests {
     use super::*;
     use rusqlite::params;
+    use serial_test::serial;
 
     #[test]
     fn batch_status_fills_current_and_total() {
@@ -953,8 +1084,14 @@ mod tests {
                 assert!(!text.contains("{current}"), "lang {lang}: {text}");
                 assert!(!text.contains("{total}"), "lang {lang}: {text}");
                 if key != MsgKey::BatchSkipButton {
-                    assert!(text.contains('7'), "current not substituted for {lang}: {text}");
-                    assert!(text.contains('9'), "total not substituted for {lang}: {text}");
+                    assert!(
+                        text.contains('7'),
+                        "current not substituted for {lang}: {text}"
+                    );
+                    assert!(
+                        text.contains('9'),
+                        "total not substituted for {lang}: {text}"
+                    );
                 } else {
                     assert!(!text.is_empty(), "empty button text for {lang}");
                 }
@@ -1014,17 +1151,31 @@ mod tests {
 
     #[test]
     fn download_errors_classified_for_immediate_reply() {
-        let unsupported = anyhow::anyhow!("yt-dlp failed: ERROR: Unsupported URL: https://www.tiktok.com/@u/photo/1");
-        assert_eq!(classify_download_error(&unsupported, "https://example.com"), crate::i18n::MsgKey::UnsupportedFormat);
+        let unsupported = anyhow::anyhow!(
+            "yt-dlp failed: ERROR: Unsupported URL: https://www.tiktok.com/@u/photo/1"
+        );
+        assert_eq!(
+            classify_download_error(&unsupported, "https://example.com"),
+            crate::i18n::MsgKey::UnsupportedFormat
+        );
 
         let timed_out = anyhow::anyhow!("Download timeout");
-        assert_eq!(classify_download_error(&timed_out, "https://example.com"), crate::i18n::MsgKey::DownloadTimeout);
+        assert_eq!(
+            classify_download_error(&timed_out, "https://example.com"),
+            crate::i18n::MsgKey::DownloadTimeout
+        );
 
         let upload_timed_out = anyhow::anyhow!("Upload timed out after 300 seconds");
-        assert_eq!(classify_download_error(&upload_timed_out, "https://example.com"), crate::i18n::MsgKey::DownloadTimeout);
+        assert_eq!(
+            classify_download_error(&upload_timed_out, "https://example.com"),
+            crate::i18n::MsgKey::DownloadTimeout
+        );
 
         let generic = anyhow::anyhow!("yt-dlp failed: ERROR: Video unavailable");
-        assert_eq!(classify_download_error(&generic, "https://example.com"), crate::i18n::MsgKey::DownloadFailed);
+        assert_eq!(
+            classify_download_error(&generic, "https://example.com"),
+            crate::i18n::MsgKey::DownloadFailed
+        );
 
         let yt_block = anyhow::anyhow!("yt-dlp failed: Sign in to confirm you're not a bot");
         assert_eq!(
@@ -1084,6 +1235,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn ads_decision_matrix() {
         let (pool, _file) = ads_test_db().await;
         unsafe {
@@ -1092,14 +1244,18 @@ mod tests {
             std::env::remove_var("TEST_MODE");
         }
         pool.set_setting("ads_enabled", "true").await.unwrap();
-        pool.set_setting("admin_ads_enabled", "false").await.unwrap();
+        pool.set_setting("admin_ads_enabled", "false")
+            .await
+            .unwrap();
 
         // Regular user, ads globally on -> sees ads.
         assert!(ads_enabled_for(&pool, crate::database::PRIMARY_BOT_ID, 111, false).await);
         // Admin, global on, no override -> skips ads.
         assert!(!ads_enabled_for(&pool, crate::database::PRIMARY_BOT_ID, 999, true).await);
         // Premium user, global on -> skips ads.
-        pool.set_user_premium(crate::database::PRIMARY_BOT_ID, 222, 30).await.unwrap();
+        pool.set_user_premium(crate::database::PRIMARY_BOT_ID, 222, 30)
+            .await
+            .unwrap();
         assert!(!ads_enabled_for(&pool, crate::database::PRIMARY_BOT_ID, 222, false).await);
         // Same human on another bot has no premium there -> still sees ads.
         assert!(ads_enabled_for(&pool, "bbb", 222, false).await);
@@ -1111,12 +1267,18 @@ mod tests {
         pool.set_setting("admin_ads_enabled", "true").await.unwrap();
         assert!(ads_enabled_for(&pool, crate::database::PRIMARY_BOT_ID, 999, true).await);
         // Admin without the override still skips.
-        pool.set_setting("admin_ads_enabled", "false").await.unwrap();
+        pool.set_setting("admin_ads_enabled", "false")
+            .await
+            .unwrap();
         assert!(!ads_enabled_for(&pool, crate::database::PRIMARY_BOT_ID, 999, true).await);
 
         // ymid resolves to the requesting user (what /api/ads-status uses).
         let ymid = pool
-            .create_pending_download(crate::database::PRIMARY_BOT_ID, 111, "https://vt.tiktok.com/x")
+            .create_pending_download(
+                crate::database::PRIMARY_BOT_ID,
+                111,
+                "https://vt.tiktok.com/x",
+            )
             .await
             .unwrap();
         assert_eq!(pool.get_user_id_by_ymid(&ymid).await.unwrap(), 111);
@@ -1127,12 +1289,11 @@ mod tests {
         }
     }
 
-
     #[test]
     fn processing_guard_allows_retry_after_previous_request_finishes() {
         let url = format!("https://vt.tiktok.com/test-{}", Uuid::new_v4());
-        let guard = UrlProcessingGuard::try_acquire(&url)
-            .expect("first request should claim the URL");
+        let guard =
+            UrlProcessingGuard::try_acquire(&url).expect("first request should claim the URL");
 
         assert!(
             UrlProcessingGuard::try_acquire(&url).is_none(),

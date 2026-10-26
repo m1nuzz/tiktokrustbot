@@ -11,45 +11,54 @@ pub mod utils;
 pub mod web_server;
 pub mod yt_dlp_interface;
 
-pub use handlers::payments;
-use teloxide::prelude::*;
-use handlers::broadcast::BroadcastState;
+use commands::{AdminCommand, Command};
+use database::DatabasePool;
 use handlers::broadcast::BroadcastScope;
-use handlers::broadcast::{BROADCAST_CANCEL, BROADCAST_CONFIRM, BROADCAST_SCOPE_ALL, BROADCAST_SCOPE_THIS};
-use handlers::{
-    receive_broadcast_message, add_premium_user_handler, start_broadcast,
-    handle_broadcast_confirmation, handle_scope_selection, handle_scope_text,
-    admin_panel_text_handler, command_handler,
-    settings_text_handler, format_text_handler,
-    back_text_handler, link_handler, BTN_BROADCAST, set_price_handler, premium_price_for,
-    all_users_text_handler, stats_text_handler, top10_text_handler, premium_users_text_handler,
-    daily_stats_text_handler, admin_ads_text_handler, language_button_handler, language_menu_handler,
-    weekly_stats_text_handler, start_with_payload_handler, funnel_text_handler,
-    subscription_menu_handler, subscription_toggle_handler, subscription_admin_toggle_handler,
-    set_channels_prompt_handler, set_channels_handler,
+use handlers::broadcast::BroadcastState;
+use handlers::broadcast::{
+    BROADCAST_CANCEL, BROADCAST_CONFIRM, BROADCAST_SCOPE_ALL, BROADCAST_SCOPE_THIS,
 };
 use handlers::link::{BatchInfo, LinkJob};
-use handlers::ui::{BTN_ADMIN_PANEL, BTN_BACK, BTN_FORMAT, BTN_SETTINGS, BTN_SUBSCRIPTION, BTN_SUBSCRIPTION_TOGGLE, BTN_SUBSCRIPTION_ADMIN_TOGGLE, BTN_SET_CHANNELS, BTN_LANGUAGE, BTN_AUTO_DETECT, BTN_PRICE};
-use database::DatabasePool;
+pub use handlers::payments;
+use handlers::ui::{
+    BTN_ADD_ADMIN, BTN_ADD_PREMIUM, BTN_ADMIN_LIST, BTN_ADMIN_MANAGEMENT, BTN_ADMIN_PANEL,
+    BTN_ADMIN_PREMIUM_GRANTS, BTN_AUTO_DETECT, BTN_BACK, BTN_FORMAT, BTN_LANGUAGE,
+    BTN_PREMIUM_GRANT_TOGGLE, BTN_PREMIUM_LIST, BTN_PREMIUM_MANAGEMENT, BTN_PRICE,
+    BTN_REMOVE_ADMIN, BTN_REMOVE_PREMIUM, BTN_SET_CHANNELS, BTN_SETTINGS, BTN_SUBSCRIPTION,
+    BTN_SUBSCRIPTION_ADMIN_TOGGLE, BTN_SUBSCRIPTION_TOGGLE,
+};
+use handlers::{
+    BTN_BROADCAST, add_admins_handler, add_admins_prompt_handler, add_premium_prompt_handler,
+    add_premium_users_handler, admin_ads_text_handler, admin_list_handler,
+    admin_management_menu_handler, admin_panel_text_handler, admin_premium_grants_handler,
+    all_users_text_handler, back_text_handler, command_handler, daily_stats_text_handler,
+    format_text_handler, funnel_text_handler, handle_broadcast_confirmation,
+    handle_scope_selection, handle_scope_text, language_button_handler, language_menu_handler,
+    link_handler, premium_custom_duration_handler, premium_duration_handler, premium_list_handler,
+    premium_management_menu_handler, premium_price_for, premium_users_text_handler,
+    receive_broadcast_message, remove_admins_handler, remove_admins_prompt_handler,
+    remove_premium_prompt_handler, remove_premium_users_handler, set_channels_handler,
+    set_channels_prompt_handler, set_price_handler, settings_text_handler, start_broadcast,
+    start_with_payload_handler, stats_text_handler, subscription_admin_toggle_handler,
+    subscription_menu_handler, subscription_toggle_handler, toggle_premium_grant_policy_handler,
+    top10_text_handler, weekly_stats_text_handler,
+};
 use mtproto_uploader::MTProtoUploader;
-use yt_dlp_interface::YoutubeFetcher;
-use utils::task_manager::TaskManager;
-use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
-use tokio::sync::Mutex;
-use tokio::time::{Duration, timeout};
+use std::sync::Arc;
+use teloxide::dispatching::DpHandlerDescription;
 use teloxide::dispatching::dialogue;
 use teloxide::dptree;
-use uuid::Uuid;
+use teloxide::prelude::*;
 use teloxide::types::CallbackQuery;
 use teloxide::types::{ChatMemberKind, ChatMemberUpdated};
-use teloxide::dispatching::DpHandlerDescription;
-use commands::{AdminCommand, Command};
+use tokio::sync::Mutex;
+use tokio::time::{Duration, timeout};
+use utils::task_manager::TaskManager;
+use uuid::Uuid;
+use yt_dlp_interface::YoutubeFetcher;
 
-pub type MyDialogue = dialogue::Dialogue<
-    BroadcastState,
-    dialogue::InMemStorage<BroadcastState>,
->;
+pub type MyDialogue = dialogue::Dialogue<BroadcastState, dialogue::InMemStorage<BroadcastState>>;
 
 /// Identity of the bot whose dispatcher owns this update. One value per
 /// dispatcher is injected into `dptree::deps`, so every handler that touches
@@ -113,7 +122,9 @@ async fn premium_start_handler(
     {
         log::error!("Failed to update user activity: {}", e);
     }
-    db_pool.log_funnel_event(bot_id, user_id, "premium_deep_link").await;
+    db_pool
+        .log_funnel_event(bot_id, user_id, "premium_deep_link")
+        .await;
     log::info!("User {} opened the premium deep link", user_id);
 
     handlers::payments::send_premium_invoice(
@@ -126,10 +137,13 @@ async fn premium_start_handler(
     .await?;
 
     let lang = db_pool.get_effective_lang(bot_id, user_id, None).await;
-    bot.send_message(msg.chat.id, i18n::t(i18n::MsgKey::Welcome, Some(lang.as_str())))
-        .reply_markup(handlers::command::get_main_reply_keyboard())
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    bot.send_message(
+        msg.chat.id,
+        i18n::t(i18n::MsgKey::Welcome, Some(lang.as_str())),
+    )
+    .reply_markup(handlers::command::get_main_reply_keyboard())
+    .await
+    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     Ok(())
 }
 
@@ -234,7 +248,8 @@ async fn run_link_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<LinkJob>) {
 }
 
 /// Build the main dispatcher handler tree for testing and production
-pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>, DpHandlerDescription> {
+pub fn build_handler()
+-> Handler<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>, DpHandlerDescription> {
     dptree::entry()
         // Payment handlers must be outside dialogue::enter because PreCheckoutQuery has no ChatId
         .branch(Update::filter_pre_checkout_query().endpoint(handlers::payments::handle_pre_checkout))
@@ -258,7 +273,16 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                         .branch(dptree::case![BroadcastState::WaitingForMessage { scope }].endpoint(|bot: Bot, dialogue: MyDialogue, msg: Message, scope: BroadcastScope| async move {
                             receive_broadcast_message(bot, dialogue, msg, scope).await
                         }))
-                        .branch(dptree::case![BroadcastState::WaitingForAddPremiumUserId].endpoint(add_premium_user_handler))
+                        .branch(dptree::case![BroadcastState::WaitingForAddAdmins].endpoint(add_admins_handler))
+                        .branch(dptree::case![BroadcastState::WaitingForRemoveAdmins].endpoint(remove_admins_handler))
+                        .branch(dptree::case![BroadcastState::WaitingForPremiumUsers].endpoint(add_premium_users_handler))
+                        .branch(dptree::case![BroadcastState::WaitingForPremiumDuration { user_ids }].endpoint(|bot: Bot, dialogue: MyDialogue, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>, user_ids: Vec<i64>| async move {
+                            premium_duration_handler(bot, dialogue, msg, ctx, db_pool, user_ids).await
+                        }))
+                        .branch(dptree::case![BroadcastState::WaitingForPremiumCustomDuration { user_ids }].endpoint(|bot: Bot, dialogue: MyDialogue, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>, user_ids: Vec<i64>| async move {
+                            premium_custom_duration_handler(bot, dialogue, msg, ctx, db_pool, user_ids).await
+                        }))
+                        .branch(dptree::case![BroadcastState::WaitingForRemovePremiumUsers].endpoint(remove_premium_users_handler))
                         .branch(dptree::case![BroadcastState::WaitingForSetPrice].endpoint(set_price_handler))
                         .branch(dptree::case![BroadcastState::WaitingForSubscriptionChannels].endpoint(set_channels_handler))
                         .branch(dptree::case![BroadcastState::Idle]
@@ -277,12 +301,38 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                                 .filter(|msg: Message| msg.text().map(|t| t == BTN_BROADCAST).unwrap_or(false))
                                 .endpoint(start_broadcast))
                         .branch(dptree::case![BroadcastState::Idle]
+                                .filter(|msg: Message| msg.text() == Some(BTN_ADMIN_MANAGEMENT))
+                                .endpoint(admin_management_menu_handler))
+                        .branch(dptree::case![BroadcastState::Idle]
+                                .filter(|msg: Message| msg.text() == Some(BTN_ADD_ADMIN))
+                                .endpoint(add_admins_prompt_handler))
+                        .branch(dptree::case![BroadcastState::Idle]
+                                .filter(|msg: Message| msg.text() == Some(BTN_REMOVE_ADMIN))
+                                .endpoint(remove_admins_prompt_handler))
+                        .branch(dptree::case![BroadcastState::Idle]
+                                .filter(|msg: Message| msg.text() == Some(BTN_ADMIN_LIST))
+                                .endpoint(admin_list_handler))
+                        .branch(dptree::case![BroadcastState::Idle]
+                                .filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(BTN_PREMIUM_GRANT_TOGGLE)))
+                                .endpoint(toggle_premium_grant_policy_handler))
+                        .branch(dptree::case![BroadcastState::Idle]
+                                .filter(|msg: Message| msg.text() == Some(BTN_PREMIUM_MANAGEMENT))
+                                .endpoint(premium_management_menu_handler))
+                        .branch(dptree::case![BroadcastState::Idle]
+                                .filter(|msg: Message| msg.text() == Some(BTN_ADD_PREMIUM))
+                                .endpoint(add_premium_prompt_handler))
+                        .branch(dptree::case![BroadcastState::Idle]
+                                .filter(|msg: Message| msg.text() == Some(BTN_REMOVE_PREMIUM))
+                                .endpoint(remove_premium_prompt_handler))
+                        .branch(dptree::case![BroadcastState::Idle]
+                                .filter(|msg: Message| msg.text() == Some(BTN_PREMIUM_LIST))
+                                .endpoint(premium_list_handler))
+                        .branch(dptree::case![BroadcastState::Idle]
+                                .filter(|msg: Message| msg.text() == Some(BTN_ADMIN_PREMIUM_GRANTS))
+                                .endpoint(admin_premium_grants_handler))
+                        .branch(dptree::case![BroadcastState::Idle]
                                 .filter(|msg: Message| msg.text().map(|t| t == "➕ Add Premium User").unwrap_or(false))
-                                .endpoint(|bot: Bot, dialogue: MyDialogue, msg: Message| async move {
-                                    bot.send_message(msg.chat.id, "👤 Send the numeric Telegram ID to grant 30 days of Premium (or /cancel):").await?;
-                                    dialogue.update(BroadcastState::WaitingForAddPremiumUserId).await?;
-                                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-                                }))
+                                .endpoint(add_premium_prompt_handler))
                         .branch(dptree::case![BroadcastState::Idle]
                                 .filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(BTN_PRICE)))
                                 .endpoint(|bot: Bot, dialogue: MyDialogue, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
@@ -429,9 +479,7 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("🔻 Funnel")).endpoint(funnel_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("🏆 Top 10")).endpoint(top10_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("👥 All users")).endpoint(all_users_text_handler))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("💎 Premium Users")).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
-                    premium_users_text_handler(bot, msg, ctx, db_pool).await
-                }))
+                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("💎 Premium Users")).endpoint(premium_list_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_BACK)).endpoint(back_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_LANGUAGE)).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                     language_menu_handler(bot, msg, ctx, db_pool).await
