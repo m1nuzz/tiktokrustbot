@@ -189,6 +189,8 @@ fn enqueue_link_job(job: LinkJob) {
 /// makes ad-choice messages appear in top-to-bottom order.
 async fn run_link_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<LinkJob>) {
     while let Some(first) = rx.recv().await {
+        let collect_start = std::time::Instant::now();
+        log::info!("Burst collection started");
         let mut jobs = vec![first];
         let deadline = std::time::Instant::now() + Duration::from_millis(250);
         loop {
@@ -202,6 +204,11 @@ async fn run_link_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<LinkJob>) {
             }
         }
 
+        log::info!(
+            "Burst collection finished: {} link(s) in {:?}",
+            jobs.len(),
+            collect_start.elapsed()
+        );
         jobs.sort_by_key(|job| job.msg.id.0);
         let batch_id = Uuid::new_v4().to_string();
         let total = jobs.len() as i64;

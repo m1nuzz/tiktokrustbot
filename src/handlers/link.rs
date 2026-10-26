@@ -802,6 +802,7 @@ pub async fn process_video_request(
     // Acknowledge immediately so the user sees feedback while the burst is
     // still being collected / the job waits for its turn.
     let mut progress_bar = ProgressBar::new(bot.clone(), chat_id);
+    log::info!("Sending Starting... for user {}", user_id);
     progress_bar.start("🎬 Starting...").await?;
 
     // A burst is delivered in message order even when several of its videos
