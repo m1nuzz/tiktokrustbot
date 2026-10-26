@@ -1,12 +1,12 @@
-pub mod fetcher;
-pub mod utils;
-pub mod urls;
 pub mod downloader;
 pub mod ensure;
+pub mod fetcher;
+pub mod urls;
+pub mod utils;
 
+pub use ensure::ensure_binaries;
 pub use fetcher::{PhotoPostFiles, TikwmMeta, YoutubeFetcher};
 pub use utils::is_executable_present;
-pub use ensure::ensure_binaries;
 
 // The download_file function is used by the auto_update module
 // We'll keep it available and suppress the unused warning when appropriate

@@ -134,7 +134,7 @@ pub const ALL_KEYS: &[MsgKey] = &[
     MsgKey::BatchSkipped,
     MsgKey::BatchFailed,
     MsgKey::BatchSkipButton,
-]; 
+];
 
 /// Language codes with full translations, as returned by [`resolve_lang`].
 pub const SUPPORTED_LANGS: &[&str] = &[
@@ -479,33 +479,81 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         // A chat message, not a mini-app string: an ad session that lapsed
         // before it was earned. Deliberately distinct from DownloadFailed,
         // because no download was ever attempted for such a row.
-        (MsgKey::SessionExpired, "ru") => "⌛ Сеанс с рекламой истёк, прежде чем видео было готово. Отправьте ссылку ещё раз, чтобы начать новый.",
-        (MsgKey::SessionExpired, "es") => "⌛ La sesión de anuncios caducó antes de que tu video estuviera listo. Envía el enlace de nuevo para empezar otra.",
-        (MsgKey::SessionExpired, "ar") => "⌛ انتهت جلسة الإعلان قبل أن يكون الفيديو جاهزًا. أرسل الرابط مرة أخرى لبدء جلسة جديدة.",
-        (MsgKey::SessionExpired, "zh-hans") => "⌛ 广告会话在视频准备完成前已过期。请重新发送链接以开始新的会话。",
-        (MsgKey::SessionExpired, "zh-hant") => "⌛ 廣告工作階段在影片準備完成前已過期。請重新傳送連結以開始新的階段。",
-        (MsgKey::SessionExpired, "pt-br") => "⌛ A sessão de anúncios expirou antes do vídeo ficar pronto. Envie o link novamente para iniciar uma nova.",
-        (MsgKey::SessionExpired, "tr") => "⌛ Reklam oturumu videonuz hazırlanmadan önce sona erdi. Yeni bir tane başlatmak için bağlantıyı tekrar gönderin.",
-        (MsgKey::SessionExpired, "uk") => "⌛ Сеанс реклами завершився, перш ніж відео було готове. Надішліть посилання ще раз, щоб почати новий.",
-        (MsgKey::SessionExpired, "id") => "⌛ Sesi iklan berakhir sebelum video Anda siap. Kirim ulang tautan untuk memulai sesi baru.",
-        (MsgKey::SessionExpired, "vi") => "⌛ Phiên quảng cáo đã hết hạn trước khi video sẵn sàng. Gửi lại liên kết để bắt đầu phiên mới.",
-        (MsgKey::SessionExpired, "th") => "⌛ เซสชันโฆษณาหมดอายุก่อนที่วิดีโอจะพร้อม กรุณาส่งลิงก์อีกครั้งเพื่อเริ่มเซสชันใหม่",
-        (MsgKey::SessionExpired, "my") => "⌛ အရောင်းအဝယ်အသုံးပြုမှုက ဗီဒီယို အသင့်ဖြစ်မီ ကုတ်သွားပါပြီ။ အသစ်တစ်ခု စတင်ရန် လင့်ကို ထပ်ပို့ပါ။",
-        (MsgKey::SessionExpired, "km") => "⌛ វគ្គរដ្ឋានផ្សាយត្រូវបានផុតកំណត់ មុនពេលវីដេអូនឹងរួចរាល់ សូមផ្ញើតំណម្រែម្តងទៀត ដើម្បីចាប់ផ្តើមថ្មី។",
-        (MsgKey::SessionExpired, "fr") => "⌛ La session publicitaire a expiré avant que la vidéo ne soit prête. Renvoyez le lien pour en commencer une nouvelle.",
-        (MsgKey::SessionExpired, "de") => "⌛ Die Ad-Sitzung ist abgelaufen, bevor dein Video bereit war. Sende den Link erneut, um eine neue zu starten.",
-        (MsgKey::SessionExpired, "it") => "⌛ La sessione pubblicitaria è scaduta prima che il video fosse pronto. Invia di nuovo il link per iniziarne una nuova.",
-        (MsgKey::SessionExpired, "nl") => "⌛ De advertentiesessie is verlopen voordat je video klaar was. Stuur de link opnieuw om een nieuwe te starten.",
-        (MsgKey::SessionExpired, "ko") => "⌛ 동영상이 준비되기 전에 광고 세션이 만료되었습니다. 새 세션을 시작하려면 링크를 다시 보내세요.",
-        (MsgKey::SessionExpired, "ms") => "⌛ Sesi iklan tamat sebelum video anda bersedia. Hantar pautan sekali lagi untuk memulakan sesi baharu.",
-        (MsgKey::SessionExpired, "hi") => "⌛ वीडियो तैयार होने से पहले ही विज्ञापन सत्र समाप्त हो गया। नया सत्र शुरू करने के लिए लिंक फिर से भेजें।",
-        (MsgKey::SessionExpired, "bn") => "⌛ ভিডিও প্রস্তুত হওয়ার আগেই বিজ্ঞাপন সেশন শেষ হয়েছে। নতুন সেশন শুরু করতে লিঙ্কটি আবার পাঠান।",
-        (MsgKey::SessionExpired, "fa") => "⌛ جلسهٔ تبلیغات پیش از آماده‌شدن ویدیو منقضی شد. برای شروع جلسه‌ای تازه، پیوند را دوباره بفرستید.",
-        (MsgKey::SessionExpired, "pl") => "⌛ Sesja reklamowa wygasła, zanim wideo było gotowe. Wyślij link ponownie, aby rozpocząć nową.",
+        (MsgKey::SessionExpired, "ru") => {
+            "⌛ Сеанс с рекламой истёк, прежде чем видео было готово. Отправьте ссылку ещё раз, чтобы начать новый."
+        }
+        (MsgKey::SessionExpired, "es") => {
+            "⌛ La sesión de anuncios caducó antes de que tu video estuviera listo. Envía el enlace de nuevo para empezar otra."
+        }
+        (MsgKey::SessionExpired, "ar") => {
+            "⌛ انتهت جلسة الإعلان قبل أن يكون الفيديو جاهزًا. أرسل الرابط مرة أخرى لبدء جلسة جديدة."
+        }
+        (MsgKey::SessionExpired, "zh-hans") => {
+            "⌛ 广告会话在视频准备完成前已过期。请重新发送链接以开始新的会话。"
+        }
+        (MsgKey::SessionExpired, "zh-hant") => {
+            "⌛ 廣告工作階段在影片準備完成前已過期。請重新傳送連結以開始新的階段。"
+        }
+        (MsgKey::SessionExpired, "pt-br") => {
+            "⌛ A sessão de anúncios expirou antes do vídeo ficar pronto. Envie o link novamente para iniciar uma nova."
+        }
+        (MsgKey::SessionExpired, "tr") => {
+            "⌛ Reklam oturumu videonuz hazırlanmadan önce sona erdi. Yeni bir tane başlatmak için bağlantıyı tekrar gönderin."
+        }
+        (MsgKey::SessionExpired, "uk") => {
+            "⌛ Сеанс реклами завершився, перш ніж відео було готове. Надішліть посилання ще раз, щоб почати новий."
+        }
+        (MsgKey::SessionExpired, "id") => {
+            "⌛ Sesi iklan berakhir sebelum video Anda siap. Kirim ulang tautan untuk memulai sesi baru."
+        }
+        (MsgKey::SessionExpired, "vi") => {
+            "⌛ Phiên quảng cáo đã hết hạn trước khi video sẵn sàng. Gửi lại liên kết để bắt đầu phiên mới."
+        }
+        (MsgKey::SessionExpired, "th") => {
+            "⌛ เซสชันโฆษณาหมดอายุก่อนที่วิดีโอจะพร้อม กรุณาส่งลิงก์อีกครั้งเพื่อเริ่มเซสชันใหม่"
+        }
+        (MsgKey::SessionExpired, "my") => {
+            "⌛ အရောင်းအဝယ်အသုံးပြုမှုက ဗီဒီယို အသင့်ဖြစ်မီ ကုတ်သွားပါပြီ။ အသစ်တစ်ခု စတင်ရန် လင့်ကို ထပ်ပို့ပါ။"
+        }
+        (MsgKey::SessionExpired, "km") => {
+            "⌛ វគ្គរដ្ឋានផ្សាយត្រូវបានផុតកំណត់ មុនពេលវីដេអូនឹងរួចរាល់ សូមផ្ញើតំណម្រែម្តងទៀត ដើម្បីចាប់ផ្តើមថ្មី។"
+        }
+        (MsgKey::SessionExpired, "fr") => {
+            "⌛ La session publicitaire a expiré avant que la vidéo ne soit prête. Renvoyez le lien pour en commencer une nouvelle."
+        }
+        (MsgKey::SessionExpired, "de") => {
+            "⌛ Die Ad-Sitzung ist abgelaufen, bevor dein Video bereit war. Sende den Link erneut, um eine neue zu starten."
+        }
+        (MsgKey::SessionExpired, "it") => {
+            "⌛ La sessione pubblicitaria è scaduta prima che il video fosse pronto. Invia di nuovo il link per iniziarne una nuova."
+        }
+        (MsgKey::SessionExpired, "nl") => {
+            "⌛ De advertentiesessie is verlopen voordat je video klaar was. Stuur de link opnieuw om een nieuwe te starten."
+        }
+        (MsgKey::SessionExpired, "ko") => {
+            "⌛ 동영상이 준비되기 전에 광고 세션이 만료되었습니다. 새 세션을 시작하려면 링크를 다시 보내세요."
+        }
+        (MsgKey::SessionExpired, "ms") => {
+            "⌛ Sesi iklan tamat sebelum video anda bersedia. Hantar pautan sekali lagi untuk memulakan sesi baharu."
+        }
+        (MsgKey::SessionExpired, "hi") => {
+            "⌛ वीडियो तैयार होने से पहले ही विज्ञापन सत्र समाप्त हो गया। नया सत्र शुरू करने के लिए लिंक फिर से भेजें।"
+        }
+        (MsgKey::SessionExpired, "bn") => {
+            "⌛ ভিডিও প্রস্তুত হওয়ার আগেই বিজ্ঞাপন সেশন শেষ হয়েছে। নতুন সেশন শুরু করতে লিঙ্কটি আবার পাঠান।"
+        }
+        (MsgKey::SessionExpired, "fa") => {
+            "⌛ جلسهٔ تبلیغات پیش از آماده‌شدن ویدیو منقضی شد. برای شروع جلسه‌ای تازه، پیوند را دوباره بفرستید."
+        }
+        (MsgKey::SessionExpired, "pl") => {
+            "⌛ Sesja reklamowa wygasła, zanim wideo było gotowe. Wyślij link ponownie, aby rozpocząć nową."
+        }
         (MsgKey::SessionExpired, "ta") => {
             "⌛ உங்கள் வீடியோ தயாராவதற்கு முன் விளம்பர அமர்வு காலாவதியானது. புதிதாகத் தொடங்க இணைப்பை மீண்டும் அனுப்புங்கள்."
         }
-        (MsgKey::SessionExpired, _) => "⌛ The ad session expired before your video was ready. Send the link again to start a new one.",
+        (MsgKey::SessionExpired, _) => {
+            "⌛ The ad session expired before your video was ready. Send the link again to start a new one."
+        }
         // ---- DownloadTimeout ----
         (MsgKey::DownloadTimeout, "ru") => "❌ Время скачивания истекло. Попробуйте снова.",
         (MsgKey::DownloadTimeout, "es") => "❌ La descarga tardó demasiado. Inténtalo de nuevo.",
@@ -643,29 +691,63 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::LanguageSet, "ta") => "✅ மொழி புதுப்பிக்கப்பட்டது.",
         (MsgKey::LanguageSet, _) => "✅ Language updated.",
         // ---- SendLinkGuide ----
-        (MsgKey::SendLinkGuide, "ru") => "🎬 Пришлите ссылку на TikTok, чтобы скачать видео, фото или музыку.",
-        (MsgKey::SendLinkGuide, "es") => "🎬 Envíame un enlace de TikTok para descargar video, fotos o música.",
-        (MsgKey::SendLinkGuide, "ar") => "🎬 أرسل لي رابط تيك توك لتنزيل الفيديو أو الصور أو الموسيقى.",
+        (MsgKey::SendLinkGuide, "ru") => {
+            "🎬 Пришлите ссылку на TikTok, чтобы скачать видео, фото или музыку."
+        }
+        (MsgKey::SendLinkGuide, "es") => {
+            "🎬 Envíame un enlace de TikTok para descargar video, fotos o música."
+        }
+        (MsgKey::SendLinkGuide, "ar") => {
+            "🎬 أرسل لي رابط تيك توك لتنزيل الفيديو أو الصور أو الموسيقى."
+        }
         (MsgKey::SendLinkGuide, "zh-hans") => "🎬 请给我发送 TikTok 链接以下载视频、照片或音乐。",
         (MsgKey::SendLinkGuide, "zh-hant") => "🎬 請給我發送 TikTok 連結以下載影片、照片或音樂。",
-        (MsgKey::SendLinkGuide, "pt-br") => "🎬 Envie-me um link do TikTok para baixar vídeo, fotos ou música.",
-        (MsgKey::SendLinkGuide, "tr") => "🎬 Video, fotoğraf veya müzik indirmek için bana bir TikTok bağlantısı gönder.",
-        (MsgKey::SendLinkGuide, "uk") => "🎬 Надішліть посилання на TikTok, щоб завантажити відео, фото чи музику.",
-        (MsgKey::SendLinkGuide, "id") => "🎬 Kirimkan saya tautan TikTok untuk mengunduh video, foto, atau musik.",
-        (MsgKey::SendLinkGuide, "vi") => "🎬 Hãy gửi cho tôi một liên kết TikTok để tải video, ảnh hoặc nhạc.",
+        (MsgKey::SendLinkGuide, "pt-br") => {
+            "🎬 Envie-me um link do TikTok para baixar vídeo, fotos ou música."
+        }
+        (MsgKey::SendLinkGuide, "tr") => {
+            "🎬 Video, fotoğraf veya müzik indirmek için bana bir TikTok bağlantısı gönder."
+        }
+        (MsgKey::SendLinkGuide, "uk") => {
+            "🎬 Надішліть посилання на TikTok, щоб завантажити відео, фото чи музику."
+        }
+        (MsgKey::SendLinkGuide, "id") => {
+            "🎬 Kirimkan saya tautan TikTok untuk mengunduh video, foto, atau musik."
+        }
+        (MsgKey::SendLinkGuide, "vi") => {
+            "🎬 Hãy gửi cho tôi một liên kết TikTok để tải video, ảnh hoặc nhạc."
+        }
         (MsgKey::SendLinkGuide, "th") => "🎬 ส่งลิงก์ TikTok มาให้ฉันเพื่อดาวน์โหลดวิดีโอ รูปภาพ หรือเพลง",
         (MsgKey::SendLinkGuide, "my") => "🎬 ဗီဒီယို၊ ဓာတ်ပုံ ဒါမှမဟုတ် သီချင်းဒေါင်းလုဒ်လုပ်ဖို့ TikTok လင့်ခ်ပို့ပေးပါ။",
         (MsgKey::SendLinkGuide, "km") => "🎬 សូមផ្ញើលីង TikTok មកឱ្យខ្ញុំដើម្បីទាញយកវីដេអូ រូបភាព ឬតន្ត្រី។",
-        (MsgKey::SendLinkGuide, "fr") => "🎬 Envoyez-moi un lien TikTok pour télécharger vidéo, photos ou musique.",
-        (MsgKey::SendLinkGuide, "de") => "🎬 Sende mir einen TikTok-Link, um Videos, Fotos oder Musik herunterzuladen.",
-        (MsgKey::SendLinkGuide, "it") => "🎬 Inviami un link di TikTok per scaricare video, foto o musica.",
-        (MsgKey::SendLinkGuide, "nl") => "🎬 Stuur me een TikTok-link om video, foto's of muziek te downloaden.",
-        (MsgKey::SendLinkGuide, "ko") => "🎬 동영상, 사진 또는 음악을 다운로드하려면 TikTok 링크를 보내주세요.",
-        (MsgKey::SendLinkGuide, "ms") => "🎬 Hantar saya pautan TikTok untuk memuat turun video, foto atau muzik.",
-        (MsgKey::SendLinkGuide, "hi") => "🎬 वीडियो, फोटो या संगीत डाउनलोड करने के लिए मुझे TikTok लिंक भेजें।",
+        (MsgKey::SendLinkGuide, "fr") => {
+            "🎬 Envoyez-moi un lien TikTok pour télécharger vidéo, photos ou musique."
+        }
+        (MsgKey::SendLinkGuide, "de") => {
+            "🎬 Sende mir einen TikTok-Link, um Videos, Fotos oder Musik herunterzuladen."
+        }
+        (MsgKey::SendLinkGuide, "it") => {
+            "🎬 Inviami un link di TikTok per scaricare video, foto o musica."
+        }
+        (MsgKey::SendLinkGuide, "nl") => {
+            "🎬 Stuur me een TikTok-link om video, foto's of muziek te downloaden."
+        }
+        (MsgKey::SendLinkGuide, "ko") => {
+            "🎬 동영상, 사진 또는 음악을 다운로드하려면 TikTok 링크를 보내주세요."
+        }
+        (MsgKey::SendLinkGuide, "ms") => {
+            "🎬 Hantar saya pautan TikTok untuk memuat turun video, foto atau muzik."
+        }
+        (MsgKey::SendLinkGuide, "hi") => {
+            "🎬 वीडियो, फोटो या संगीत डाउनलोड करने के लिए मुझे TikTok लिंक भेजें।"
+        }
         (MsgKey::SendLinkGuide, "bn") => "🎬 ভিডিও, ছবি বা গান ডাউনলোড করতে আমাকে TikTok লিঙ্ক পাঠান।",
-        (MsgKey::SendLinkGuide, "fa") => "🎬 برای دانلود ویدیو، عکس یا موسیقی یک لینک تیک‌تاک برایم بفرستید.",
-        (MsgKey::SendLinkGuide, "pl") => "🎬 Wyślij mi link do TikToka, aby pobrać film, zdjęcia lub muzykę.",
+        (MsgKey::SendLinkGuide, "fa") => {
+            "🎬 برای دانلود ویدیو، عکس یا موسیقی یک لینک تیک‌تاک برایم بفرستید."
+        }
+        (MsgKey::SendLinkGuide, "pl") => {
+            "🎬 Wyślij mi link do TikToka, aby pobrać film, zdjęcia lub muzykę."
+        }
         (MsgKey::SendLinkGuide, "ta") => {
             "🎬 வீடியோ, புகைப்படம் அல்லது இசையைப் பதிவிறக்க TikTok இணைப்பை அனுப்புங்கள்."
         }
@@ -957,33 +1039,77 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniNoAdsTitle, "ta") => "இப்போது விளம்பரங்கள் இல்லை 😕",
         (MsgKey::MiniNoAdsTitle, _) => "No ads right now 😕",
         // ---- MiniNoAdsDesc ----
-        (MsgKey::MiniNoAdsDesc, "ru") => "Сейчас нет доступной рекламы. Забери видео, попробуй быстрое предложение или повтори рекламу.",
-        (MsgKey::MiniNoAdsDesc, "es") => "No hay anuncios disponibles. Toma el video, prueba la oferta rápida o reintenta.",
-        (MsgKey::MiniNoAdsDesc, "ar") => "لا يوجد إعلان متاح حاليًا. خذ الفيديو أو جرّب العرض السريع أو أعد المحاولة.",
-        (MsgKey::MiniNoAdsDesc, "zh-hans") => "目前没有可用广告。领取视频、尝试快速优惠或重试广告。",
-        (MsgKey::MiniNoAdsDesc, "zh-hant") => "目前沒有可用廣告。領取影片、嘗試快速優惠或重試廣告。",
-        (MsgKey::MiniNoAdsDesc, "pt-br") => "Nenhum anúncio disponível. Pegue o vídeo, tente a oferta rápida ou tente de novo.",
-        (MsgKey::MiniNoAdsDesc, "tr") => "Şu anda uygun reklam yok. Videoyu al, hızlı teklifi dene ya da reklamı yeniden dene.",
-        (MsgKey::MiniNoAdsDesc, "uk") => "Наразі немає доступної реклами. Забери відео, спробуй швидку пропозицію або повтори рекламу.",
-        (MsgKey::MiniNoAdsDesc, "id") => "Tidak ada iklan yang tersedia. Ambil videonya, coba penawaran cepat, atau coba lagi.",
-        (MsgKey::MiniNoAdsDesc, "vi") => "Hiện không có quảng cáo. Hãy lấy video, thử ưu đãi nhanh hoặc thử lại.",
+        (MsgKey::MiniNoAdsDesc, "ru") => {
+            "Сейчас нет доступной рекламы. Забери видео, попробуй быстрое предложение или повтори рекламу."
+        }
+        (MsgKey::MiniNoAdsDesc, "es") => {
+            "No hay anuncios disponibles. Toma el video, prueba la oferta rápida o reintenta."
+        }
+        (MsgKey::MiniNoAdsDesc, "ar") => {
+            "لا يوجد إعلان متاح حاليًا. خذ الفيديو أو جرّب العرض السريع أو أعد المحاولة."
+        }
+        (MsgKey::MiniNoAdsDesc, "zh-hans") => {
+            "目前没有可用广告。领取视频、尝试快速优惠或重试广告。"
+        }
+        (MsgKey::MiniNoAdsDesc, "zh-hant") => {
+            "目前沒有可用廣告。領取影片、嘗試快速優惠或重試廣告。"
+        }
+        (MsgKey::MiniNoAdsDesc, "pt-br") => {
+            "Nenhum anúncio disponível. Pegue o vídeo, tente a oferta rápida ou tente de novo."
+        }
+        (MsgKey::MiniNoAdsDesc, "tr") => {
+            "Şu anda uygun reklam yok. Videoyu al, hızlı teklifi dene ya da reklamı yeniden dene."
+        }
+        (MsgKey::MiniNoAdsDesc, "uk") => {
+            "Наразі немає доступної реклами. Забери відео, спробуй швидку пропозицію або повтори рекламу."
+        }
+        (MsgKey::MiniNoAdsDesc, "id") => {
+            "Tidak ada iklan yang tersedia. Ambil videonya, coba penawaran cepat, atau coba lagi."
+        }
+        (MsgKey::MiniNoAdsDesc, "vi") => {
+            "Hiện không có quảng cáo. Hãy lấy video, thử ưu đãi nhanh hoặc thử lại."
+        }
         (MsgKey::MiniNoAdsDesc, "th") => "ตอนนี้ไม่มีโฆษณา รับวิดีโอ ลองข้อเสนอพิเศษ หรือลองอีกครั้ง",
-        (MsgKey::MiniNoAdsDesc, "my") => "ယခုရရှိနိုင်သော ကြော်ငြာမရှိပါ။ ဗီဒီယိုကိုယူပါ၊ အမြန်ကမ်းလှမ်းမှုကို စမ်းပါ သို့မဟုတ် ထပ်ကြိုးစားပါ။",
+        (MsgKey::MiniNoAdsDesc, "my") => {
+            "ယခုရရှိနိုင်သော ကြော်ငြာမရှိပါ။ ဗီဒီယိုကိုယူပါ၊ အမြန်ကမ်းလှမ်းမှုကို စမ်းပါ သို့မဟုတ် ထပ်ကြိုးစားပါ။"
+        }
         (MsgKey::MiniNoAdsDesc, "km") => "បច្ចុប្បន្នគ្មានពាណិជ្ជកម្មទេ។ យកវីដេអូ សាកល្បងការផ្តល់ជូនរហ័ស ឬព្យាយាមម្តងទៀត។",
-        (MsgKey::MiniNoAdsDesc, "fr") => "Aucune pub disponible. Prends la vidéo, essaie l’offre rapide ou réessaie.",
-        (MsgKey::MiniNoAdsDesc, "de") => "Keine Werbung verfügbar. Hol dir das Video, versuche das Schnellangebot oder versuche es erneut.",
-        (MsgKey::MiniNoAdsDesc, "it") => "Nessun annuncio disponibile. Prendi il video, prova l’offerta rapida o riprova.",
-        (MsgKey::MiniNoAdsDesc, "nl") => "Geen advertentie beschikbaar. Pak de video, probeer de snelle aanbieding of probeer opnieuw.",
-        (MsgKey::MiniNoAdsDesc, "ko") => "사용 가능한 광고가 없습니다. 영상을 가져가거나, 빠른 혜택을 시도하거나, 다시 시도하세요.",
-        (MsgKey::MiniNoAdsDesc, "ms") => "Tiada iklan tersedia. Ambil video, cuba tawaran pantas, atau cuba lagi.",
-        (MsgKey::MiniNoAdsDesc, "hi") => "अभी कोई विज्ञापन उपलब्ध नहीं है। वीडियो लें, त्वरित ऑफ़र आज़माएँ या पुनः प्रयास करें।",
-        (MsgKey::MiniNoAdsDesc, "bn") => "এই মুহূর্তে কোনো বিজ্ঞাপন উপলব্ধ নেই। ভিডিওটি নিন, দ্রুত অফার চেষ্টা করুন বা আবার চেষ্টা করুন।",
-        (MsgKey::MiniNoAdsDesc, "fa") => "در حال حاضر تبلیغی در دسترس نیست. ویدیو را بگیرید، پیشنهاد سریع را امتحان کنید یا دوباره تلاش کنید.",
-        (MsgKey::MiniNoAdsDesc, "pl") => "Brak dostępnych reklam. Weź film, wypróbuj szybką ofertę albo spróbuj ponownie.",
+        (MsgKey::MiniNoAdsDesc, "fr") => {
+            "Aucune pub disponible. Prends la vidéo, essaie l’offre rapide ou réessaie."
+        }
+        (MsgKey::MiniNoAdsDesc, "de") => {
+            "Keine Werbung verfügbar. Hol dir das Video, versuche das Schnellangebot oder versuche es erneut."
+        }
+        (MsgKey::MiniNoAdsDesc, "it") => {
+            "Nessun annuncio disponibile. Prendi il video, prova l’offerta rapida o riprova."
+        }
+        (MsgKey::MiniNoAdsDesc, "nl") => {
+            "Geen advertentie beschikbaar. Pak de video, probeer de snelle aanbieding of probeer opnieuw."
+        }
+        (MsgKey::MiniNoAdsDesc, "ko") => {
+            "사용 가능한 광고가 없습니다. 영상을 가져가거나, 빠른 혜택을 시도하거나, 다시 시도하세요."
+        }
+        (MsgKey::MiniNoAdsDesc, "ms") => {
+            "Tiada iklan tersedia. Ambil video, cuba tawaran pantas, atau cuba lagi."
+        }
+        (MsgKey::MiniNoAdsDesc, "hi") => {
+            "अभी कोई विज्ञापन उपलब्ध नहीं है। वीडियो लें, त्वरित ऑफ़र आज़माएँ या पुनः प्रयास करें।"
+        }
+        (MsgKey::MiniNoAdsDesc, "bn") => {
+            "এই মুহূর্তে কোনো বিজ্ঞাপন উপলব্ধ নেই। ভিডিওটি নিন, দ্রুত অফার চেষ্টা করুন বা আবার চেষ্টা করুন।"
+        }
+        (MsgKey::MiniNoAdsDesc, "fa") => {
+            "در حال حاضر تبلیغی در دسترس نیست. ویدیو را بگیرید، پیشنهاد سریع را امتحان کنید یا دوباره تلاش کنید."
+        }
+        (MsgKey::MiniNoAdsDesc, "pl") => {
+            "Brak dostępnych reklam. Weź film, wypróbuj szybką ofertę albo spróbuj ponownie."
+        }
         (MsgKey::MiniNoAdsDesc, "ta") => {
             "தற்போது விளம்பரம் எதுவும் இல்லை. வீடியோவை எடுங்கள், விரைவுச் சலுகையை முயற்சிக்கவும் அல்லது விளம்பரத்தை மீண்டும் முயற்சிக்கவும்."
         }
-        (MsgKey::MiniNoAdsDesc, _) => "No ad is available at the moment. Take the video, try the quick offer, or retry the ad.",
+        (MsgKey::MiniNoAdsDesc, _) => {
+            "No ad is available at the moment. Take the video, try the quick offer, or retry the ad."
+        }
         // ---- MiniAdblockTitle ----
         (MsgKey::MiniAdblockTitle, "ru") => "🛡 Обнаружен блокировщик рекламы",
         (MsgKey::MiniAdblockTitle, "es") => "🛡 Ad-block detectado",
@@ -1011,61 +1137,153 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniAdblockTitle, "ta") => "🛡 விளம்பரத் தடுப்பு கண்டறியப்பட்டது",
         (MsgKey::MiniAdblockTitle, _) => "🛡 Ad-block detected",
         // ---- MiniAdblockDesc ----
-        (MsgKey::MiniAdblockDesc, "ru") => "Реклама не загружается при включённой блокировке, смотреть нечего. Выключи блокировку рекламы для Telegram (приложение-блокировщик или настройка DNS / Private DNS) и вернись — реклама стартует сама. Если нет, закрой окно и нажми кнопку в боте заново.",
-        (MsgKey::MiniAdblockDesc, "es") => "Los anuncios no cargan con el bloqueador activado. Desactívalo para Telegram (tu app de bloqueo o el ajuste DNS / DNS privado) y vuelve: el anuncio empezará solo. Si no, cierra la ventana y pulsa el botón del bot de nuevo.",
-        (MsgKey::MiniAdblockDesc, "ar") => "يتعذر تحميل الإعلانات أثناء تفعيل مانع الإعلانات. عطّل مانع الإعلانات لتليغرام (تطبيق الحظر أو إعداد DNS / DNS الخاص) وعد — سيبدأ الإعلان تلقائيًا. إن لم يبدأ، أغلق النافذة واضغط زر البوت مجددًا.",
-        (MsgKey::MiniAdblockDesc, "zh-hans") => "开启广告拦截时无法加载广告。請為 Telegram 關閉廣告攔截（攔截應用或 DNS / Private DNS 設置）後回來——廣告會自動開始。如果沒有，請關閉窗口並重新點擊機器人按鈕。",
-        (MsgKey::MiniAdblockDesc, "zh-hant") => "開啟廣告攔截時無法載入廣告。為 Telegram 關閉廣告攔截（攔截應用程式或 DNS / Private DNS 設定）後回來——廣告會自動開始。如果沒有，請關閉視窗並重新點擊機器人按鈕。",
-        (MsgKey::MiniAdblockDesc, "pt-br") => "Os anúncios não carregam com o bloqueador ativo. Desative o bloqueio para o Telegram (seu app bloqueador ou a configuração DNS / DNS privado) e volte — o anúncio começará sozinho. Se não, feche a janela e aperte o botão do bot de novo.",
-        (MsgKey::MiniAdblockDesc, "tr") => "Reklam engelleyici açıkken reklamlar yüklenemez. Telegram için reklam engellemeyi kapat (engelleyici uygulaman veya DNS / Özel DNS ayarın) ve geri dön — reklam kendiliğinden başlayacak. Başlamazsa pencereyi kapatıp botun düğmesine yeniden bas.",
-        (MsgKey::MiniAdblockDesc, "uk") => "Реклама не завантажується, поки ввімкнено блокування. Вимкни блокування реклами для Telegram (застосунок-блокувальник або налаштування DNS / Private DNS) і повернись — реклама стартує сама. Якщо ні, закрий вікно й натисни кнопку в боті знову.",
-        (MsgKey::MiniAdblockDesc, "id") => "Iklan tidak dapat dimuat saat pemblokir aktif. Matikan pemblokir iklan untuk Telegram (aplikasi pemblokir atau pengaturan DNS / DNS Pribadi) dan kembali — iklan akan mulai sendiri. Jika tidak, tutup jendela dan tekan tombol bot lagi.",
-        (MsgKey::MiniAdblockDesc, "vi") => "Quảng cáo không tải được khi bật chặn quảng cáo. Hãy tắt chặn quảng cáo cho Telegram (ứng dụng chặn hoặc cài đặt DNS / DNS riêng) rồi quay lại — quảng cáo sẽ tự bắt đầu. Nếu không, hãy đóng cửa sổ và nhấn nút bot lần nữa.",
-        (MsgKey::MiniAdblockDesc, "th") => "โฆษณาโหลดไม่ได้ขณะเปิดบล็อกโฆษณา ปิดบล็อกโฆษณาสำหรับ Telegram (แอปบล็อกหรือการตั้งค่า DNS / Private DNS) แล้วกลับมา — โฆษณาจะเริ่มเอง ถ้าไม่เริ่ม ให้ปิดหน้าต่างแล้วกดปุ่มบอทอีกครั้ง",
-        (MsgKey::MiniAdblockDesc, "my") => "Ad-block ဖွင့်ထားသဖြင့် ကြော်ငြာများ load မရပါ။ Telegram အတွက် ad-block ကို ပိတ်ပါ (blocker အက်ပ် သို့မဟုတ် DNS / Private DNS ဆက်တင်) ပြီးပြန်လာပါ — ကြော်ငြာအလိုအလျောက် စပါလိမ့်မည်။ မစပါက ဝင်းဒိုးကိုပိတ်ပြီး bot ခလုတ်ကို ပြန်နှိပ်ပါ။",
-        (MsgKey::MiniAdblockDesc, "km") => "ពាណិជ្ជកម្មមិនអាចផ្ទុកបាននៅពេលបើកកម្មវិធីទប់ស្កាត់ទេ។ សូមបិទកម្មវិធីទប់ស្កាត់សម្រាប់ Telegram (កម្មវិធីទប់ស្កាត់ ឬការកំណត់ DNS / Private DNS) រួចត្រឡប់មកវិញ — ពាណិជ្ជកម្មនឹងចាប់ផ្តើមដោយខ្លួនឯង។ បើមិន សូមបិទបង្អួច ហើយចុចប៊ូតុង bot ម្តងទៀត។",
-        (MsgKey::MiniAdblockDesc, "fr") => "Les pubs ne chargent pas avec l’anti-pub activé. Désactive-le pour Telegram (ton appli ou le réglage DNS / DNS privé) et reviens — la pub démarrera toute seule. Sinon, ferme la fenêtre et retouche le bouton du bot.",
-        (MsgKey::MiniAdblockDesc, "de") => "Werbung lädt nicht bei aktivem Ad-blocker. Deaktiviere ihn für Telegram (Blocker-App oder DNS-/Private-DNS-Einstellung) und komm zurück — die Werbung startet von allein. Falls nicht, schließe das Fenster und drücke den Bot-Button erneut.",
-        (MsgKey::MiniAdblockDesc, "it") => "Gli annunci non si caricano con l’ad-block attivo. Disattivalo per Telegram (la tua app o l’impostazione DNS / DNS privato) e torna — l’annuncio partirà da solo. Altrimenti chiudi la finestra e premi di nuovo il pulsante del bot.",
-        (MsgKey::MiniAdblockDesc, "nl") => "Advertenties laden niet met adblock aan. Zet adblock uit voor Telegram (je blocker-app of de DNS-/Private DNS-instelling) en kom terug — de advertentie start vanzelf. Zo niet, sluit het venster en druk opnieuw op de bot-knop.",
-        (MsgKey::MiniAdblockDesc, "ko") => "광고 차단이 켜져 있으면 광고를 불러올 수 없습니다. Telegram에 대해 광고 차단(차단 앱 또는 DNS / Private DNS 설정)을 끄고 돌아오세요 — 광고가 자동으로 시작됩니다. 시작되지 않으면 창을 닫고 봇 버튼을 다시 누르세요.",
-        (MsgKey::MiniAdblockDesc, "ms") => "Iklan tidak dapat dimuat semasa penyekat iklan dihidupkan. Matikan penyekat iklan untuk Telegram (aplikasi penyekat atau tetapan DNS / DNS Peribadi) dan kembali — iklan akan bermula sendiri. Jika tidak, tutup tetingkap dan tekan butang bot sekali lagi.",
-        (MsgKey::MiniAdblockDesc, "hi") => "एड-ब्लॉक चालू होने पर विज्ञापन लोड नहीं होंगे। Telegram के लिए एड-ब्लॉक बंद करें (ब्लॉकर ऐप या DNS / प्राइवेट DNS सेटिंग) और वापस आएं — विज्ञापन अपने आप शुरू होगा। न हो तो विंडो बंद करके बॉट का बटन फिर दबाएं।",
-        (MsgKey::MiniAdblockDesc, "bn") => "অ্যাড-ব্লক চালু থাকলে বিজ্ঞাপন লোড হবে না। Telegram-এর জন্য অ্যাড-ব্লক বন্ধ করুন (ব্লকার অ্যাপ বা DNS / প্রাইভেট DNS সেটিং) এবং ফিরে আসুন — বিজ্ঞাপন নিজে নিজেই শুরু হবে। না হলে উইন্ডো বন্ধ করে বটের বোতাম আবার চাপুন।",
-        (MsgKey::MiniAdblockDesc, "fa") => "وقتی مسدودکننده روشن است تبلیغات بارگذاری نمی‌شوند. مسدودکننده را برای تلگرام خاموش کنید (برنامه مسدودکننده یا تنظیم DNS / DNS خصوصی) و برگردید — تبلیغ خودکار شروع می‌شود. اگر نشد، پنجره را ببندید و دوباره دکمه ربات را بزنید.",
-        (MsgKey::MiniAdblockDesc, "pl") => "Reklamy nie ładują się przy włączonym adblocku. Wyłącz blokowanie dla Telegrama (aplikacja blokująca lub ustawienie DNS / Private DNS) i wróć — reklama wystartuje sama. Jeśli nie, zamknij okno i naciśnij przycisk bota ponownie.",
+        (MsgKey::MiniAdblockDesc, "ru") => {
+            "Реклама не загружается при включённой блокировке, смотреть нечего. Выключи блокировку рекламы для Telegram (приложение-блокировщик или настройка DNS / Private DNS) и вернись — реклама стартует сама. Если нет, закрой окно и нажми кнопку в боте заново."
+        }
+        (MsgKey::MiniAdblockDesc, "es") => {
+            "Los anuncios no cargan con el bloqueador activado. Desactívalo para Telegram (tu app de bloqueo o el ajuste DNS / DNS privado) y vuelve: el anuncio empezará solo. Si no, cierra la ventana y pulsa el botón del bot de nuevo."
+        }
+        (MsgKey::MiniAdblockDesc, "ar") => {
+            "يتعذر تحميل الإعلانات أثناء تفعيل مانع الإعلانات. عطّل مانع الإعلانات لتليغرام (تطبيق الحظر أو إعداد DNS / DNS الخاص) وعد — سيبدأ الإعلان تلقائيًا. إن لم يبدأ، أغلق النافذة واضغط زر البوت مجددًا."
+        }
+        (MsgKey::MiniAdblockDesc, "zh-hans") => {
+            "开启广告拦截时无法加载广告。請為 Telegram 關閉廣告攔截（攔截應用或 DNS / Private DNS 設置）後回來——廣告會自動開始。如果沒有，請關閉窗口並重新點擊機器人按鈕。"
+        }
+        (MsgKey::MiniAdblockDesc, "zh-hant") => {
+            "開啟廣告攔截時無法載入廣告。為 Telegram 關閉廣告攔截（攔截應用程式或 DNS / Private DNS 設定）後回來——廣告會自動開始。如果沒有，請關閉視窗並重新點擊機器人按鈕。"
+        }
+        (MsgKey::MiniAdblockDesc, "pt-br") => {
+            "Os anúncios não carregam com o bloqueador ativo. Desative o bloqueio para o Telegram (seu app bloqueador ou a configuração DNS / DNS privado) e volte — o anúncio começará sozinho. Se não, feche a janela e aperte o botão do bot de novo."
+        }
+        (MsgKey::MiniAdblockDesc, "tr") => {
+            "Reklam engelleyici açıkken reklamlar yüklenemez. Telegram için reklam engellemeyi kapat (engelleyici uygulaman veya DNS / Özel DNS ayarın) ve geri dön — reklam kendiliğinden başlayacak. Başlamazsa pencereyi kapatıp botun düğmesine yeniden bas."
+        }
+        (MsgKey::MiniAdblockDesc, "uk") => {
+            "Реклама не завантажується, поки ввімкнено блокування. Вимкни блокування реклами для Telegram (застосунок-блокувальник або налаштування DNS / Private DNS) і повернись — реклама стартує сама. Якщо ні, закрий вікно й натисни кнопку в боті знову."
+        }
+        (MsgKey::MiniAdblockDesc, "id") => {
+            "Iklan tidak dapat dimuat saat pemblokir aktif. Matikan pemblokir iklan untuk Telegram (aplikasi pemblokir atau pengaturan DNS / DNS Pribadi) dan kembali — iklan akan mulai sendiri. Jika tidak, tutup jendela dan tekan tombol bot lagi."
+        }
+        (MsgKey::MiniAdblockDesc, "vi") => {
+            "Quảng cáo không tải được khi bật chặn quảng cáo. Hãy tắt chặn quảng cáo cho Telegram (ứng dụng chặn hoặc cài đặt DNS / DNS riêng) rồi quay lại — quảng cáo sẽ tự bắt đầu. Nếu không, hãy đóng cửa sổ và nhấn nút bot lần nữa."
+        }
+        (MsgKey::MiniAdblockDesc, "th") => {
+            "โฆษณาโหลดไม่ได้ขณะเปิดบล็อกโฆษณา ปิดบล็อกโฆษณาสำหรับ Telegram (แอปบล็อกหรือการตั้งค่า DNS / Private DNS) แล้วกลับมา — โฆษณาจะเริ่มเอง ถ้าไม่เริ่ม ให้ปิดหน้าต่างแล้วกดปุ่มบอทอีกครั้ง"
+        }
+        (MsgKey::MiniAdblockDesc, "my") => {
+            "Ad-block ဖွင့်ထားသဖြင့် ကြော်ငြာများ load မရပါ။ Telegram အတွက် ad-block ကို ပိတ်ပါ (blocker အက်ပ် သို့မဟုတ် DNS / Private DNS ဆက်တင်) ပြီးပြန်လာပါ — ကြော်ငြာအလိုအလျောက် စပါလိမ့်မည်။ မစပါက ဝင်းဒိုးကိုပိတ်ပြီး bot ခလုတ်ကို ပြန်နှိပ်ပါ။"
+        }
+        (MsgKey::MiniAdblockDesc, "km") => {
+            "ពាណិជ្ជកម្មមិនអាចផ្ទុកបាននៅពេលបើកកម្មវិធីទប់ស្កាត់ទេ។ សូមបិទកម្មវិធីទប់ស្កាត់សម្រាប់ Telegram (កម្មវិធីទប់ស្កាត់ ឬការកំណត់ DNS / Private DNS) រួចត្រឡប់មកវិញ — ពាណិជ្ជកម្មនឹងចាប់ផ្តើមដោយខ្លួនឯង។ បើមិន សូមបិទបង្អួច ហើយចុចប៊ូតុង bot ម្តងទៀត។"
+        }
+        (MsgKey::MiniAdblockDesc, "fr") => {
+            "Les pubs ne chargent pas avec l’anti-pub activé. Désactive-le pour Telegram (ton appli ou le réglage DNS / DNS privé) et reviens — la pub démarrera toute seule. Sinon, ferme la fenêtre et retouche le bouton du bot."
+        }
+        (MsgKey::MiniAdblockDesc, "de") => {
+            "Werbung lädt nicht bei aktivem Ad-blocker. Deaktiviere ihn für Telegram (Blocker-App oder DNS-/Private-DNS-Einstellung) und komm zurück — die Werbung startet von allein. Falls nicht, schließe das Fenster und drücke den Bot-Button erneut."
+        }
+        (MsgKey::MiniAdblockDesc, "it") => {
+            "Gli annunci non si caricano con l’ad-block attivo. Disattivalo per Telegram (la tua app o l’impostazione DNS / DNS privato) e torna — l’annuncio partirà da solo. Altrimenti chiudi la finestra e premi di nuovo il pulsante del bot."
+        }
+        (MsgKey::MiniAdblockDesc, "nl") => {
+            "Advertenties laden niet met adblock aan. Zet adblock uit voor Telegram (je blocker-app of de DNS-/Private DNS-instelling) en kom terug — de advertentie start vanzelf. Zo niet, sluit het venster en druk opnieuw op de bot-knop."
+        }
+        (MsgKey::MiniAdblockDesc, "ko") => {
+            "광고 차단이 켜져 있으면 광고를 불러올 수 없습니다. Telegram에 대해 광고 차단(차단 앱 또는 DNS / Private DNS 설정)을 끄고 돌아오세요 — 광고가 자동으로 시작됩니다. 시작되지 않으면 창을 닫고 봇 버튼을 다시 누르세요."
+        }
+        (MsgKey::MiniAdblockDesc, "ms") => {
+            "Iklan tidak dapat dimuat semasa penyekat iklan dihidupkan. Matikan penyekat iklan untuk Telegram (aplikasi penyekat atau tetapan DNS / DNS Peribadi) dan kembali — iklan akan bermula sendiri. Jika tidak, tutup tetingkap dan tekan butang bot sekali lagi."
+        }
+        (MsgKey::MiniAdblockDesc, "hi") => {
+            "एड-ब्लॉक चालू होने पर विज्ञापन लोड नहीं होंगे। Telegram के लिए एड-ब्लॉक बंद करें (ब्लॉकर ऐप या DNS / प्राइवेट DNS सेटिंग) और वापस आएं — विज्ञापन अपने आप शुरू होगा। न हो तो विंडो बंद करके बॉट का बटन फिर दबाएं।"
+        }
+        (MsgKey::MiniAdblockDesc, "bn") => {
+            "অ্যাড-ব্লক চালু থাকলে বিজ্ঞাপন লোড হবে না। Telegram-এর জন্য অ্যাড-ব্লক বন্ধ করুন (ব্লকার অ্যাপ বা DNS / প্রাইভেট DNS সেটিং) এবং ফিরে আসুন — বিজ্ঞাপন নিজে নিজেই শুরু হবে। না হলে উইন্ডো বন্ধ করে বটের বোতাম আবার চাপুন।"
+        }
+        (MsgKey::MiniAdblockDesc, "fa") => {
+            "وقتی مسدودکننده روشن است تبلیغات بارگذاری نمی‌شوند. مسدودکننده را برای تلگرام خاموش کنید (برنامه مسدودکننده یا تنظیم DNS / DNS خصوصی) و برگردید — تبلیغ خودکار شروع می‌شود. اگر نشد، پنجره را ببندید و دوباره دکمه ربات را بزنید."
+        }
+        (MsgKey::MiniAdblockDesc, "pl") => {
+            "Reklamy nie ładują się przy włączonym adblocku. Wyłącz blokowanie dla Telegrama (aplikacja blokująca lub ustawienie DNS / Private DNS) i wróć — reklama wystartuje sama. Jeśli nie, zamknij okno i naciśnij przycisk bota ponownie."
+        }
         (MsgKey::MiniAdblockDesc, "ta") => {
             "விளம்பரத் தடுப்பு இயக்கத்தில் இருக்கும்போது விளம்பரங்கள் ஏற்றப்படாது, எனவே பார்க்க எதுவும் இல்லை. Telegram-க்கான விளம்பரத் தடுப்பை அணைத்துவிட்டு திரும்ப வாருங்கள் — விளம்பரம் தானாகத் தொடங்கும். தொடங்கவில்லை என்றால், இந்தச் சாளரத்தை மூடி பாட்டின் பொத்தானை மீண்டும் அழுத்துங்கள்."
         }
-        (MsgKey::MiniAdblockDesc, _) => "Ads cannot load while ad-blocking is on, so there is nothing to watch. Turn off ad-blocking for Telegram (your ad-blocker app, or the DNS / Private DNS setting) and come back — the ad will start on its own. If it does not, close this window and press the bot's button again.",
+        (MsgKey::MiniAdblockDesc, _) => {
+            "Ads cannot load while ad-blocking is on, so there is nothing to watch. Turn off ad-blocking for Telegram (your ad-blocker app, or the DNS / Private DNS setting) and come back — the ad will start on its own. If it does not, close this window and press the bot's button again."
+        }
         // ---- MiniAdblockMiss ----
-        (MsgKey::MiniAdblockMiss, "ru") => " Все попытки загрузить рекламу не удались — выключи блокировку рекламы и попробуй снова.",
-        (MsgKey::MiniAdblockMiss, "es") => " Todos los intentos de cargar un anuncio fallaron: desactiva el bloqueador e inténtalo de nuevo.",
-        (MsgKey::MiniAdblockMiss, "ar") => " فشلت كل محاولات تحميل إعلان — عطّل مانع الإعلانات وحاول مجددًا.",
+        (MsgKey::MiniAdblockMiss, "ru") => {
+            " Все попытки загрузить рекламу не удались — выключи блокировку рекламы и попробуй снова."
+        }
+        (MsgKey::MiniAdblockMiss, "es") => {
+            " Todos los intentos de cargar un anuncio fallaron: desactiva el bloqueador e inténtalo de nuevo."
+        }
+        (MsgKey::MiniAdblockMiss, "ar") => {
+            " فشلت كل محاولات تحميل إعلان — عطّل مانع الإعلانات وحاول مجددًا."
+        }
         (MsgKey::MiniAdblockMiss, "zh-hans") => " 所有加载广告的尝试均失败——请关闭广告拦截并重试。",
         (MsgKey::MiniAdblockMiss, "zh-hant") => " 所有載入廣告的嘗試均失敗——請關閉廣告攔截並重試。",
-        (MsgKey::MiniAdblockMiss, "pt-br") => " Todas as tentativas de carregar um anúncio falharam — desative o bloqueador e tente de novo.",
-        (MsgKey::MiniAdblockMiss, "tr") => " Reklam yükleme girişimlerinin tümü başarısız oldu — reklam engellemeyi kapatıp tekrar dene.",
-        (MsgKey::MiniAdblockMiss, "uk") => " Усі спроби завантажити рекламу не вдалися — вимкни блокування реклами й спробуй знову.",
-        (MsgKey::MiniAdblockMiss, "id") => " Semua upaya memuat iklan gagal — matikan pemblokir iklan dan coba lagi.",
-        (MsgKey::MiniAdblockMiss, "vi") => " Mọi lần thử tải quảng cáo đều thất bại — hãy tắt chặn quảng cáo và thử lại.",
-        (MsgKey::MiniAdblockMiss, "th") => " ความพยายามโหลดโฆษณาทั้งหมดล้มเหลว — โปรดปิดบล็อกโฆษณาแล้วลองอีกครั้ง",
-        (MsgKey::MiniAdblockMiss, "my") => " ကြော်ငြာတင်ရန် ကြိုးစားမှုအားလုံး မအောင်မြင်ပါ — ad-block ကို ပိတ်ပြီး ထပ်ကြိုးစားပါ။",
-        (MsgKey::MiniAdblockMiss, "km") => "រាល់ការប៉ុនប៉ងផ្ទុកពាណិជ្ជកម្មបានបរាជ័យ — សូមបិទកម្មវិធីទប់ស្កាត់ ហើយព្យាយាមម្តងទៀត។",
-        (MsgKey::MiniAdblockMiss, "fr") => " Toutes les tentatives ont échoué — désactive l’anti-pub et réessaie.",
-        (MsgKey::MiniAdblockMiss, "de") => " Alle Versuche sind fehlgeschlagen — deaktiviere den Ad-blocker und versuche es erneut.",
-        (MsgKey::MiniAdblockMiss, "it") => " Tutti i tentativi non sono riusciti — disattiva l’ad-block e riprova.",
-        (MsgKey::MiniAdblockMiss, "nl") => " Alle pogingen zijn mislukt — zet adblock uit en probeer opnieuw.",
-        (MsgKey::MiniAdblockMiss, "ko") => " 모든 광고 로드 시도가 실패했습니다 — 광고 차단을 끄고 다시 시도하세요.",
-        (MsgKey::MiniAdblockMiss, "ms") => " Semua percubaan memuat iklan gagal — matikan penyekat iklan dan cuba lagi.",
-        (MsgKey::MiniAdblockMiss, "hi") => " विज्ञापन लोड करने के सभी प्रयास विफल — एड-ब्लॉक बंद करके पुनः प्रयास करें।",
-        (MsgKey::MiniAdblockMiss, "bn") => " বিজ্ঞাপন লোডের সব প্রচেষ্টা ব্যর্থ — অ্যাড-ব্লক বন্ধ করে আবার চেষ্টা করুন।",
-        (MsgKey::MiniAdblockMiss, "fa") => " همه تلاش‌ها برای بارگذاری تبلیغ ناموفق بود — مسدودکننده را خاموش کنید و دوباره تلاش کنید.",
-        (MsgKey::MiniAdblockMiss, "pl") => " Wszystkie próby wczytania reklamy zawiodły — wyłącz adblocka i spróbuj ponownie.",
+        (MsgKey::MiniAdblockMiss, "pt-br") => {
+            " Todas as tentativas de carregar um anúncio falharam — desative o bloqueador e tente de novo."
+        }
+        (MsgKey::MiniAdblockMiss, "tr") => {
+            " Reklam yükleme girişimlerinin tümü başarısız oldu — reklam engellemeyi kapatıp tekrar dene."
+        }
+        (MsgKey::MiniAdblockMiss, "uk") => {
+            " Усі спроби завантажити рекламу не вдалися — вимкни блокування реклами й спробуй знову."
+        }
+        (MsgKey::MiniAdblockMiss, "id") => {
+            " Semua upaya memuat iklan gagal — matikan pemblokir iklan dan coba lagi."
+        }
+        (MsgKey::MiniAdblockMiss, "vi") => {
+            " Mọi lần thử tải quảng cáo đều thất bại — hãy tắt chặn quảng cáo và thử lại."
+        }
+        (MsgKey::MiniAdblockMiss, "th") => {
+            " ความพยายามโหลดโฆษณาทั้งหมดล้มเหลว — โปรดปิดบล็อกโฆษณาแล้วลองอีกครั้ง"
+        }
+        (MsgKey::MiniAdblockMiss, "my") => {
+            " ကြော်ငြာတင်ရန် ကြိုးစားမှုအားလုံး မအောင်မြင်ပါ — ad-block ကို ပိတ်ပြီး ထပ်ကြိုးစားပါ။"
+        }
+        (MsgKey::MiniAdblockMiss, "km") => {
+            "រាល់ការប៉ុនប៉ងផ្ទុកពាណិជ្ជកម្មបានបរាជ័យ — សូមបិទកម្មវិធីទប់ស្កាត់ ហើយព្យាយាមម្តងទៀត។"
+        }
+        (MsgKey::MiniAdblockMiss, "fr") => {
+            " Toutes les tentatives ont échoué — désactive l’anti-pub et réessaie."
+        }
+        (MsgKey::MiniAdblockMiss, "de") => {
+            " Alle Versuche sind fehlgeschlagen — deaktiviere den Ad-blocker und versuche es erneut."
+        }
+        (MsgKey::MiniAdblockMiss, "it") => {
+            " Tutti i tentativi non sono riusciti — disattiva l’ad-block e riprova."
+        }
+        (MsgKey::MiniAdblockMiss, "nl") => {
+            " Alle pogingen zijn mislukt — zet adblock uit en probeer opnieuw."
+        }
+        (MsgKey::MiniAdblockMiss, "ko") => {
+            " 모든 광고 로드 시도가 실패했습니다 — 광고 차단을 끄고 다시 시도하세요."
+        }
+        (MsgKey::MiniAdblockMiss, "ms") => {
+            " Semua percubaan memuat iklan gagal — matikan penyekat iklan dan cuba lagi."
+        }
+        (MsgKey::MiniAdblockMiss, "hi") => {
+            " विज्ञापन लोड करने के सभी प्रयास विफल — एड-ब्लॉक बंद करके पुनः प्रयास करें।"
+        }
+        (MsgKey::MiniAdblockMiss, "bn") => {
+            " বিজ্ঞাপন লোডের সব প্রচেষ্টা ব্যর্থ — অ্যাড-ব্লক বন্ধ করে আবার চেষ্টা করুন।"
+        }
+        (MsgKey::MiniAdblockMiss, "fa") => {
+            " همه تلاش‌ها برای بارگذاری تبلیغ ناموفق بود — مسدودکننده را خاموش کنید و دوباره تلاش کنید."
+        }
+        (MsgKey::MiniAdblockMiss, "pl") => {
+            " Wszystkie próby wczytania reklamy zawiodły — wyłącz adblocka i spróbuj ponownie."
+        }
         (MsgKey::MiniAdblockMiss, "ta") => {
             " விளம்பரத்தை ஏற்றும் அனைத்து முயற்சிகளும் தோல்வியடைந்தன — விளம்பரத் தடுப்பை அணைத்து மீண்டும் முயற்சிக்கவும்."
         }
-        (MsgKey::MiniAdblockMiss, _) => " All attempts to load an ad have failed — please turn off ad-blocking and try again.",
+        (MsgKey::MiniAdblockMiss, _) => {
+            " All attempts to load an ad have failed — please turn off ad-blocking and try again."
+        }
         // ---- MiniVideoReadyTitle ----
         (MsgKey::MiniVideoReadyTitle, "ru") => "Твоё видео готово!",
         (MsgKey::MiniVideoReadyTitle, "es") => "¡Tu video está listo!",
@@ -1150,20 +1368,28 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniSuccessDesc, "ar") => "تم التحقق من مشاهدتك. نرسل لك الفيديو الآن.",
         (MsgKey::MiniSuccessDesc, "zh-hans") => "你的观看已确认。正在发送视频。",
         (MsgKey::MiniSuccessDesc, "zh-hant") => "你的觀看已確認。正在傳送影片。",
-        (MsgKey::MiniSuccessDesc, "pt-br") => "Sua visualização foi verificada. Estamos enviando seu vídeo.",
+        (MsgKey::MiniSuccessDesc, "pt-br") => {
+            "Sua visualização foi verificada. Estamos enviando seu vídeo."
+        }
         (MsgKey::MiniSuccessDesc, "tr") => "İzlemen doğrulandı. Videon gönderiliyor.",
         (MsgKey::MiniSuccessDesc, "uk") => "Твій перегляд зараховано. Надсилаємо тобі відео.",
         (MsgKey::MiniSuccessDesc, "id") => "Tayanganmu terverifikasi. Videomu sedang dikirim.",
-        (MsgKey::MiniSuccessDesc, "vi") => "Lượt xem của bạn đã được xác minh. Đang gửi video cho bạn.",
+        (MsgKey::MiniSuccessDesc, "vi") => {
+            "Lượt xem của bạn đã được xác minh. Đang gửi video cho bạn."
+        }
         (MsgKey::MiniSuccessDesc, "th") => "ยืนยันการดูแล้ว กำลังส่งวิดีโอให้คุณ",
         (MsgKey::MiniSuccessDesc, "my") => "သင့်ကြည့်ရှုမှုကို အတည်ပြုပြီးပါပြီ။ ဗီဒီယိုပို့နေပါသည်။",
         (MsgKey::MiniSuccessDesc, "km") => "ការមើលរបស់អ្នកត្រូវបានផ្ទៀងផ្ទាត់ហើយ។ កំពុងផ្ញើវីដេអូជូនអ្នក។",
         (MsgKey::MiniSuccessDesc, "fr") => "Ta vue est vérifiée. On t’envoie la vidéo.",
         (MsgKey::MiniSuccessDesc, "de") => "Dein View wurde verifiziert. Wir senden dir das Video.",
-        (MsgKey::MiniSuccessDesc, "it") => "La visualizzazione è verificata. Ti stiamo inviando il video.",
+        (MsgKey::MiniSuccessDesc, "it") => {
+            "La visualizzazione è verificata. Ti stiamo inviando il video."
+        }
         (MsgKey::MiniSuccessDesc, "nl") => "Je weergave is geverifieerd. We sturen je video nu.",
         (MsgKey::MiniSuccessDesc, "ko") => "시청이 확인됐습니다. 동영상을 전송 중이에요.",
-        (MsgKey::MiniSuccessDesc, "ms") => "Tontonan anda disahkan. Kami sedang menghantar video anda.",
+        (MsgKey::MiniSuccessDesc, "ms") => {
+            "Tontonan anda disahkan. Kami sedang menghantar video anda."
+        }
         (MsgKey::MiniSuccessDesc, "hi") => "आपका व्यू सत्यापित हो गया। वीडियो भेजा जा रहा है।",
         (MsgKey::MiniSuccessDesc, "bn") => "আপনার ভিউ যাচাই হয়েছে। ভিডিও পাঠানো হচ্ছে।",
         (MsgKey::MiniSuccessDesc, "fa") => "بازدید شما تأیید شد. ویدیو در حال ارسال است.",
@@ -1171,7 +1397,9 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniSuccessDesc, "ta") => {
             "உங்கள் விளம்பரப் பார்வை சரிபார்க்கப்பட்டது. உங்கள் வீடியோவை இப்போது அனுப்புகிறோம்."
         }
-        (MsgKey::MiniSuccessDesc, _) => "Your ad view has been verified. We are sending your video now.",
+        (MsgKey::MiniSuccessDesc, _) => {
+            "Your ad view has been verified. We are sending your video now."
+        }
         // ---- MiniThanksWatching ----
         (MsgKey::MiniThanksWatching, "ru") => "Спасибо за просмотр! Видео уже летит к тебе.",
         (MsgKey::MiniThanksWatching, "es") => "¡Gracias por mirar! Tu video está en camino.",
@@ -1181,7 +1409,9 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniThanksWatching, "pt-br") => "Obrigado por assistir! Seu vídeo está a caminho.",
         (MsgKey::MiniThanksWatching, "tr") => "İzlediğin için teşekkürler! Videon yolda.",
         (MsgKey::MiniThanksWatching, "uk") => "Дякуємо за перегляд! Відео вже летить до тебе.",
-        (MsgKey::MiniThanksWatching, "id") => "Terima kasih sudah menonton! Videomu sedang dalam perjalanan.",
+        (MsgKey::MiniThanksWatching, "id") => {
+            "Terima kasih sudah menonton! Videomu sedang dalam perjalanan."
+        }
         (MsgKey::MiniThanksWatching, "vi") => "Cảm ơn bạn đã xem! Video đang được gửi tới bạn.",
         (MsgKey::MiniThanksWatching, "th") => "ขอบคุณที่รับชม! วิดีโอกำลังมา",
         (MsgKey::MiniThanksWatching, "my") => "ကြည့်ပေးလို့ ကျေးဇူးပါ! ဗီဒီယိုရောက်လာနေပြီ။",
@@ -1191,7 +1421,9 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniThanksWatching, "it") => "Grazie per la visione! Il tuo video è in arrivo.",
         (MsgKey::MiniThanksWatching, "nl") => "Bedankt voor het kijken! Je video is onderweg.",
         (MsgKey::MiniThanksWatching, "ko") => "시청해 주셔서 감사합니다! 동영상이 전송 중이에요.",
-        (MsgKey::MiniThanksWatching, "ms") => "Terima kasih kerana menonton! Video anda dalam perjalanan.",
+        (MsgKey::MiniThanksWatching, "ms") => {
+            "Terima kasih kerana menonton! Video anda dalam perjalanan."
+        }
         (MsgKey::MiniThanksWatching, "hi") => "देखने के लिए धन्यवाद! आपका वीडियो आ रहा है।",
         (MsgKey::MiniThanksWatching, "bn") => "দেখার জন্য ধন্যবাদ! আপনার ভিডিও আসছে।",
         (MsgKey::MiniThanksWatching, "fa") => "ممنون که تماشا کردید! ویدیوی شما در راه است.",
@@ -1395,11 +1627,15 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniReadyDesc, "my") => "ကြော်ငြာများ ယခုပိတ်ထားသည်။ bot သို့ တိုက်ရိုက်သွားနိုင်သည်။",
         (MsgKey::MiniReadyDesc, "km") => "ពាណិជ្ជកម្មត្រូវបានបិទបច្ចុប្បន្ន។ អ្នកអាចទៅ bot ផ្ទាល់។",
         (MsgKey::MiniReadyDesc, "fr") => "Pubs désactivées. Va directement au bot.",
-        (MsgKey::MiniReadyDesc, "de") => "Werbung ist derzeit deaktiviert. Du kannst direkt zum Bot.",
+        (MsgKey::MiniReadyDesc, "de") => {
+            "Werbung ist derzeit deaktiviert. Du kannst direkt zum Bot."
+        }
         (MsgKey::MiniReadyDesc, "it") => "Annunci disattivati. Vai pure al bot.",
         (MsgKey::MiniReadyDesc, "nl") => "Advertenties zijn uitgeschakeld. Ga direct naar de bot.",
         (MsgKey::MiniReadyDesc, "ko") => "광고가 꺼져 있습니다. 봇으로 바로 가세요.",
-        (MsgKey::MiniReadyDesc, "ms") => "Iklan dilumpuhkan buat masa ini. Anda boleh terus ke bot.",
+        (MsgKey::MiniReadyDesc, "ms") => {
+            "Iklan dilumpuhkan buat masa ini. Anda boleh terus ke bot."
+        }
         (MsgKey::MiniReadyDesc, "hi") => "विज्ञापन अभी बंद हैं। सीधे बॉट पर जाएं।",
         (MsgKey::MiniReadyDesc, "bn") => "বিজ্ঞাপন বর্তমানে বন্ধ। সরাসরি বটে যান।",
         (MsgKey::MiniReadyDesc, "fa") => "تبلیغات فعلاً خاموش است. می‌توانید مستقیم به ربات بروید.",
@@ -1513,33 +1749,65 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::MiniErrNoServer, "ta") => "சேவையகத்தை அடைய முடியவில்லை.",
         (MsgKey::MiniErrNoServer, _) => "Could not reach the server.",
         // ---- MiniErrClaim ----
-        (MsgKey::MiniErrClaim, "ru") => "Пока не удалось подтвердить загрузку. Открой бота и отправь ссылку снова.",
-        (MsgKey::MiniErrClaim, "es") => "No se pudo confirmar la descarga. Abre el bot y envía el enlace de nuevo.",
+        (MsgKey::MiniErrClaim, "ru") => {
+            "Пока не удалось подтвердить загрузку. Открой бота и отправь ссылку снова."
+        }
+        (MsgKey::MiniErrClaim, "es") => {
+            "No se pudo confirmar la descarga. Abre el bot y envía el enlace de nuevo."
+        }
         (MsgKey::MiniErrClaim, "ar") => "تعذر تأكيد التنزيل بعد. افتح البوت وأرسل الرابط مجددًا.",
         (MsgKey::MiniErrClaim, "zh-hans") => "暂时无法确认下载。请打开机器人并重新发送链接。",
         (MsgKey::MiniErrClaim, "zh-hant") => "暫時無法確認下載。請開啟機器人並重新傳送連結。",
-        (MsgKey::MiniErrClaim, "pt-br") => "Não foi possível confirmar o download. Abra o bot e envie o link de novo.",
-        (MsgKey::MiniErrClaim, "tr") => "İndirme henüz onaylanamadı. Botu açıp bağlantıyı tekrar gönder.",
-        (MsgKey::MiniErrClaim, "uk") => "Поки не вдалося підтвердити завантаження. Відкрий бота й надішли посилання знову.",
-        (MsgKey::MiniErrClaim, "id") => "Belum bisa mengonfirmasi unduhan. Buka bot dan kirim tautannya lagi.",
-        (MsgKey::MiniErrClaim, "vi") => "Chưa xác nhận được lượt tải. Hãy mở bot và gửi lại liên kết.",
+        (MsgKey::MiniErrClaim, "pt-br") => {
+            "Não foi possível confirmar o download. Abra o bot e envie o link de novo."
+        }
+        (MsgKey::MiniErrClaim, "tr") => {
+            "İndirme henüz onaylanamadı. Botu açıp bağlantıyı tekrar gönder."
+        }
+        (MsgKey::MiniErrClaim, "uk") => {
+            "Поки не вдалося підтвердити завантаження. Відкрий бота й надішли посилання знову."
+        }
+        (MsgKey::MiniErrClaim, "id") => {
+            "Belum bisa mengonfirmasi unduhan. Buka bot dan kirim tautannya lagi."
+        }
+        (MsgKey::MiniErrClaim, "vi") => {
+            "Chưa xác nhận được lượt tải. Hãy mở bot và gửi lại liên kết."
+        }
         (MsgKey::MiniErrClaim, "th") => "ยังยืนยันการดาวน์โหลดไม่ได้ โปรดเปิดบอทแล้วส่งลิงก์อีกครั้ง",
         (MsgKey::MiniErrClaim, "my") => "ဒေါင်းလုဒ်ကို အတည်မပြုနိုင်သေးပါ။ bot ကိုဖွင့်ပြီး လင့်ခ်ကို ပြန်ပို့ပါ။",
         (MsgKey::MiniErrClaim, "km") => "មិនអាចបញ្ជាក់ការទាញយកបាននៅឡើយទេ។ សូមបើក bot ហើយផ្ញើលីងម្តងទៀត។",
-        (MsgKey::MiniErrClaim, "fr") => "Téléchargement non confirmé. Ouvre le bot et renvoie le lien.",
-        (MsgKey::MiniErrClaim, "de") => "Download noch nicht bestätigt. Öffne den Bot und sende den Link erneut.",
-        (MsgKey::MiniErrClaim, "it") => "Download non confermato. Apri il bot e invia di nuovo il link.",
-        (MsgKey::MiniErrClaim, "nl") => "Download niet bevestigd. Open de bot en stuur de link opnieuw.",
-        (MsgKey::MiniErrClaim, "ko") => "다운로드를 아직 확인할 수 없습니다. 봇을 열고 링크를 다시 보내주세요.",
-        (MsgKey::MiniErrClaim, "ms") => "Belum dapat mengesahkan muat turun. Buka bot dan hantar pautan sekali lagi.",
+        (MsgKey::MiniErrClaim, "fr") => {
+            "Téléchargement non confirmé. Ouvre le bot et renvoie le lien."
+        }
+        (MsgKey::MiniErrClaim, "de") => {
+            "Download noch nicht bestätigt. Öffne den Bot und sende den Link erneut."
+        }
+        (MsgKey::MiniErrClaim, "it") => {
+            "Download non confermato. Apri il bot e invia di nuovo il link."
+        }
+        (MsgKey::MiniErrClaim, "nl") => {
+            "Download niet bevestigd. Open de bot en stuur de link opnieuw."
+        }
+        (MsgKey::MiniErrClaim, "ko") => {
+            "다운로드를 아직 확인할 수 없습니다. 봇을 열고 링크를 다시 보내주세요."
+        }
+        (MsgKey::MiniErrClaim, "ms") => {
+            "Belum dapat mengesahkan muat turun. Buka bot dan hantar pautan sekali lagi."
+        }
         (MsgKey::MiniErrClaim, "hi") => "डाउनलोड की पुष्टि नहीं हो सकी। बॉट खोलें और लिंक फिर से भेजें।",
         (MsgKey::MiniErrClaim, "bn") => "ডাউনলোড এখনও নিশ্চিত করা যায়নি। বট খুলে আবার লিঙ্ক পাঠান।",
-        (MsgKey::MiniErrClaim, "fa") => "هنوز دانلود تأیید نشد. ربات را باز کنید و دوباره لینک را بفرستید.",
-        (MsgKey::MiniErrClaim, "pl") => "Nie udało się potwierdzić pobrania. Otwórz bota i wyślij link ponownie.",
+        (MsgKey::MiniErrClaim, "fa") => {
+            "هنوز دانلود تأیید نشد. ربات را باز کنید و دوباره لینک را بفرستید."
+        }
+        (MsgKey::MiniErrClaim, "pl") => {
+            "Nie udało się potwierdzić pobrania. Otwórz bota i wyślij link ponownie."
+        }
         (MsgKey::MiniErrClaim, "ta") => {
             "பதிவிறக்கத்தை இன்னும் உறுதிப்படுத்த முடியவில்லை. பாட்டைத் திறந்து இணைப்பை மீண்டும் அனுப்புங்கள்."
         }
-        (MsgKey::MiniErrClaim, _) => "Couldn't confirm the download yet. Please open the bot and send the link again.",
+        (MsgKey::MiniErrClaim, _) => {
+            "Couldn't confirm the download yet. Please open the bot and send the link again."
+        }
         // ---- PremiumInvoiceTitle ----
         (MsgKey::PremiumInvoiceTitle, "ru") => "Premium",
         (MsgKey::PremiumInvoiceTitle, "es") => "Premium",
@@ -1697,57 +1965,157 @@ pub fn t(key: MsgKey, lang: Option<&str>) -> &'static str {
         (MsgKey::YtAudioOnly, "ta") => "🎵 ஆடியோ மட்டும் (MP3)",
         (MsgKey::YtAudioOnly, _) => "🎵 Audio only (MP3)",
         // ---- YtBlocked ----
-        (MsgKey::YtBlocked, "ru") => "⚠️ Скачивание с YouTube временно недоступно — платформа блокирует наш сервер. Попробуйте позже.",
-        (MsgKey::YtBlocked, "es") => "⚠️ Las descargas de YouTube no están disponibles temporalmente: la plataforma está bloqueando nuestro servidor. Inténtalo más tarde.",
-        (MsgKey::YtBlocked, "ar") => "⚠️ تنزيلات YouTube غير متاحة مؤقتًا — المنصة تحظر خادمنا. حاول لاحقًا.",
-        (MsgKey::YtBlocked, "zh-hans") => "⚠️ YouTube 下载暂时不可用——平台正在封锁我们的服务器。请稍后再试。",
-        (MsgKey::YtBlocked, "zh-hant") => "⚠️ YouTube 下載暫時無法使用——平台正在封鎖我們的伺服器。請稍後再試。",
-        (MsgKey::YtBlocked, "pt-br") => "⚠️ Os downloads do YouTube estão temporariamente indisponíveis — a plataforma está bloqueando nosso servidor. Tente novamente mais tarde.",
-        (MsgKey::YtBlocked, "tr") => "⚠️ YouTube indirmeleri geçici olarak kullanılamıyor — platform sunucumuzu engelliyor. Lütfen daha sonra tekrar deneyin.",
-        (MsgKey::YtBlocked, "uk") => "⚠️ Завантаження з YouTube тимчасово недоступне — платформа блокує наш сервер. Спробуйте пізніше.",
-        (MsgKey::YtBlocked, "id") => "⚠️ Unduhan YouTube sementara tidak tersedia — platform memblokir server kami. Coba lagi nanti.",
-        (MsgKey::YtBlocked, "vi") => "⚠️ Tải xuống YouTube tạm thời không khả dụng — nền tảng đang chặn máy chủ của chúng tôi. Vui lòng thử lại sau.",
-        (MsgKey::YtBlocked, "th") => "⚠️ การดาวน์โหลด YouTube ไม่พร้อมใช้งานชั่วคราว — แพลตฟอร์มกำลังบล็อกเซิร์ฟเวอร์ของเรา โปรดลองใหม่ภายหลัง",
-        (MsgKey::YtBlocked, "my") => "⚠️ YouTube ဒေါင်းလုဒ်များ ယာယီမရနိုင်ပါ — ပလက်ဖောင်းက ကျွန်ုပ်တို့ဆာဗာကို ပိတ်ဆို့နေသည်။ နောက်မှ ထပ်စမ်းပါ။",
-        (MsgKey::YtBlocked, "km") => "⚠️ ការទាញយក YouTube មិនអាចប្រើបានជាបណ្តោះអាសន្ន — វេទិកាកំពុងរារាំងម៉ាស៊ីនមេរបស់យើង។ សូមព្យាយាមម្តងទៀតនៅពេលក្រោយ។",
-        (MsgKey::YtBlocked, "fr") => "⚠️ Les téléchargements YouTube sont temporairement indisponibles — la plateforme bloque notre serveur. Réessayez plus tard.",
-        (MsgKey::YtBlocked, "de") => "⚠️ YouTube-Downloads sind vorübergehend nicht verfügbar — die Plattform blockiert unseren Server. Bitte später erneut versuchen.",
-        (MsgKey::YtBlocked, "it") => "⚠️ I download da YouTube non sono temporaneamente disponibili — la piattaforma sta bloccando il nostro server. Riprova più tardi.",
-        (MsgKey::YtBlocked, "nl") => "⚠️ YouTube-downloads zijn tijdelijk niet beschikbaar — het platform blokkeert onze server. Probeer het later opnieuw.",
-        (MsgKey::YtBlocked, "ko") => "⚠️ YouTube 다운로드를 일시적으로 사용할 수 없습니다 — 플랫폼이 당사 서버를 차단하고 있습니다. 나중에 다시 시도하세요.",
-        (MsgKey::YtBlocked, "ms") => "⚠️ Muat turun YouTube tidak tersedia buat sementara — platform menyekat pelayan kami. Cubalah lagi kemudian.",
-        (MsgKey::YtBlocked, "hi") => "⚠️ YouTube डाउनलोड अस्थायी रूप से उपलब्ध नहीं हैं — प्लेटफ़ॉर्म हमारे सर्वर को ब्लॉक कर रहा है। कृपया बाद में पुनः प्रयास करें।",
-        (MsgKey::YtBlocked, "bn") => "⚠️ YouTube ডাউনলোড সাময়িকভাবে অনুপলব্ধ — প্ল্যাটফর্ম আমাদের সার্ভার ব্লক করছে। অনুগ্রহ করে পরে আবার চেষ্টা করুন।",
-        (MsgKey::YtBlocked, "fa") => "⚠️ دانلودهای یوتیوب موقتاً در دسترس نیستند — پلتفرم سرور ما را مسدود کرده است. لطفاً بعداً دوباره امتحان کنید.",
-        (MsgKey::YtBlocked, "pl") => "⚠️ Pobieranie z YouTube jest tymczasowo niedostępne — platforma blokuje nasz serwer. Spróbuj ponownie później.",
-        (MsgKey::YtBlocked, "ta") => "⚠️ YouTube பதிவிறக்கங்கள் தற்காலிகமாக கிடைக்கவில்லை — தளம் எங்கள் சேவையகத்தைத் தடுக்கிறது. பின்னர் மீண்டும் முயற்சிக்கவும்.",
-        (MsgKey::YtBlocked, _) => "⚠️ YouTube downloads are temporarily unavailable — the platform is blocking our server. Please try again later.",
+        (MsgKey::YtBlocked, "ru") => {
+            "⚠️ Скачивание с YouTube временно недоступно — платформа блокирует наш сервер. Попробуйте позже."
+        }
+        (MsgKey::YtBlocked, "es") => {
+            "⚠️ Las descargas de YouTube no están disponibles temporalmente: la plataforma está bloqueando nuestro servidor. Inténtalo más tarde."
+        }
+        (MsgKey::YtBlocked, "ar") => {
+            "⚠️ تنزيلات YouTube غير متاحة مؤقتًا — المنصة تحظر خادمنا. حاول لاحقًا."
+        }
+        (MsgKey::YtBlocked, "zh-hans") => {
+            "⚠️ YouTube 下载暂时不可用——平台正在封锁我们的服务器。请稍后再试。"
+        }
+        (MsgKey::YtBlocked, "zh-hant") => {
+            "⚠️ YouTube 下載暫時無法使用——平台正在封鎖我們的伺服器。請稍後再試。"
+        }
+        (MsgKey::YtBlocked, "pt-br") => {
+            "⚠️ Os downloads do YouTube estão temporariamente indisponíveis — a plataforma está bloqueando nosso servidor. Tente novamente mais tarde."
+        }
+        (MsgKey::YtBlocked, "tr") => {
+            "⚠️ YouTube indirmeleri geçici olarak kullanılamıyor — platform sunucumuzu engelliyor. Lütfen daha sonra tekrar deneyin."
+        }
+        (MsgKey::YtBlocked, "uk") => {
+            "⚠️ Завантаження з YouTube тимчасово недоступне — платформа блокує наш сервер. Спробуйте пізніше."
+        }
+        (MsgKey::YtBlocked, "id") => {
+            "⚠️ Unduhan YouTube sementara tidak tersedia — platform memblokir server kami. Coba lagi nanti."
+        }
+        (MsgKey::YtBlocked, "vi") => {
+            "⚠️ Tải xuống YouTube tạm thời không khả dụng — nền tảng đang chặn máy chủ của chúng tôi. Vui lòng thử lại sau."
+        }
+        (MsgKey::YtBlocked, "th") => {
+            "⚠️ การดาวน์โหลด YouTube ไม่พร้อมใช้งานชั่วคราว — แพลตฟอร์มกำลังบล็อกเซิร์ฟเวอร์ของเรา โปรดลองใหม่ภายหลัง"
+        }
+        (MsgKey::YtBlocked, "my") => {
+            "⚠️ YouTube ဒေါင်းလုဒ်များ ယာယီမရနိုင်ပါ — ပလက်ဖောင်းက ကျွန်ုပ်တို့ဆာဗာကို ပိတ်ဆို့နေသည်။ နောက်မှ ထပ်စမ်းပါ။"
+        }
+        (MsgKey::YtBlocked, "km") => {
+            "⚠️ ការទាញយក YouTube មិនអាចប្រើបានជាបណ្តោះអាសន្ន — វេទិកាកំពុងរារាំងម៉ាស៊ីនមេរបស់យើង។ សូមព្យាយាមម្តងទៀតនៅពេលក្រោយ។"
+        }
+        (MsgKey::YtBlocked, "fr") => {
+            "⚠️ Les téléchargements YouTube sont temporairement indisponibles — la plateforme bloque notre serveur. Réessayez plus tard."
+        }
+        (MsgKey::YtBlocked, "de") => {
+            "⚠️ YouTube-Downloads sind vorübergehend nicht verfügbar — die Plattform blockiert unseren Server. Bitte später erneut versuchen."
+        }
+        (MsgKey::YtBlocked, "it") => {
+            "⚠️ I download da YouTube non sono temporaneamente disponibili — la piattaforma sta bloccando il nostro server. Riprova più tardi."
+        }
+        (MsgKey::YtBlocked, "nl") => {
+            "⚠️ YouTube-downloads zijn tijdelijk niet beschikbaar — het platform blokkeert onze server. Probeer het later opnieuw."
+        }
+        (MsgKey::YtBlocked, "ko") => {
+            "⚠️ YouTube 다운로드를 일시적으로 사용할 수 없습니다 — 플랫폼이 당사 서버를 차단하고 있습니다. 나중에 다시 시도하세요."
+        }
+        (MsgKey::YtBlocked, "ms") => {
+            "⚠️ Muat turun YouTube tidak tersedia buat sementara — platform menyekat pelayan kami. Cubalah lagi kemudian."
+        }
+        (MsgKey::YtBlocked, "hi") => {
+            "⚠️ YouTube डाउनलोड अस्थायी रूप से उपलब्ध नहीं हैं — प्लेटफ़ॉर्म हमारे सर्वर को ब्लॉक कर रहा है। कृपया बाद में पुनः प्रयास करें।"
+        }
+        (MsgKey::YtBlocked, "bn") => {
+            "⚠️ YouTube ডাউনলোড সাময়িকভাবে অনুপলব্ধ — প্ল্যাটফর্ম আমাদের সার্ভার ব্লক করছে। অনুগ্রহ করে পরে আবার চেষ্টা করুন।"
+        }
+        (MsgKey::YtBlocked, "fa") => {
+            "⚠️ دانلودهای یوتیوب موقتاً در دسترس نیستند — پلتفرم سرور ما را مسدود کرده است. لطفاً بعداً دوباره امتحان کنید."
+        }
+        (MsgKey::YtBlocked, "pl") => {
+            "⚠️ Pobieranie z YouTube jest tymczasowo niedostępne — platforma blokuje nasz serwer. Spróbuj ponownie później."
+        }
+        (MsgKey::YtBlocked, "ta") => {
+            "⚠️ YouTube பதிவிறக்கங்கள் தற்காலிகமாக கிடைக்கவில்லை — தளம் எங்கள் சேவையகத்தைத் தடுக்கிறது. பின்னர் மீண்டும் முயற்சிக்கவும்."
+        }
+        (MsgKey::YtBlocked, _) => {
+            "⚠️ YouTube downloads are temporarily unavailable — the platform is blocking our server. Please try again later."
+        }
         // ---- IgBlocked ----
-        (MsgKey::IgBlocked, "ru") => "⚠️ Скачивание из Instagram временно недоступно — платформа блокирует наш сервер. Попробуйте позже.",
-        (MsgKey::IgBlocked, "es") => "⚠️ Las descargas de Instagram no están disponibles temporalmente: la plataforma está bloqueando nuestro servidor. Inténtalo más tarde.",
-        (MsgKey::IgBlocked, "ar") => "⚠️ تنزيلات Instagram غير متاحة مؤقتًا — المنصة تحظر خادمنا. حاول لاحقًا.",
-        (MsgKey::IgBlocked, "zh-hans") => "⚠️ Instagram 下载暂时不可用——平台正在封锁我们的服务器。请稍后再试。",
-        (MsgKey::IgBlocked, "zh-hant") => "⚠️ Instagram 下載暫時無法使用——平台正在封鎖我們的伺服器。請稍後再試。",
-        (MsgKey::IgBlocked, "pt-br") => "⚠️ Os downloads do Instagram estão temporariamente indisponíveis — a plataforma está bloqueando nosso servidor. Tente novamente mais tarde.",
-        (MsgKey::IgBlocked, "tr") => "⚠️ Instagram indirmeleri geçici olarak kullanılamıyor — platform sunucumuzu engelliyor. Lütfen daha sonra tekrar deneyin.",
-        (MsgKey::IgBlocked, "uk") => "⚠️ Завантаження з Instagram тимчасово недоступне — платформа блокує наш сервер. Спробуйте пізніше.",
-        (MsgKey::IgBlocked, "id") => "⚠️ Unduhan Instagram sementara tidak tersedia — platform memblokir server kami. Coba lagi nanti.",
-        (MsgKey::IgBlocked, "vi") => "⚠️ Tải xuống Instagram tạm thời không khả dụng — nền tảng đang chặn máy chủ của chúng tôi. Vui lòng thử lại sau.",
-        (MsgKey::IgBlocked, "th") => "⚠️ การดาวน์โหลด Instagram ไม่พร้อมใช้งานชั่วคราว — แพลตฟอร์มกำลังบล็อกเซิร์ฟเวอร์ของเรา โปรดลองใหม่ภายหลัง",
-        (MsgKey::IgBlocked, "my") => "⚠️ Instagram ဒေါင်းလုဒ်များ ယာယီမရနိုင်ပါ — ပလက်ဖောင်းက ကျွန်ုပ်တို့ဆာဗာကို ပိတ်ဆို့နေသည်။ နောက်မှ ထပ်စမ်းပါ။",
-        (MsgKey::IgBlocked, "km") => "⚠️ ការទាញយក Instagram មិនអាចប្រើបានជាបណ្តោះអាសន្ន — វេទិកាកំពុងរារាំងម៉ាស៊ីនមេរបស់យើង។ សូមព្យាយាមម្តងទៀតនៅពេលក្រោយ។",
-        (MsgKey::IgBlocked, "fr") => "⚠️ Les téléchargements Instagram sont temporairement indisponibles — la plateforme bloque notre serveur. Réessayez plus tard.",
-        (MsgKey::IgBlocked, "de") => "⚠️ Instagram-Downloads sind vorübergehend nicht verfügbar — die Plattform blockiert unseren Server. Bitte später erneut versuchen.",
-        (MsgKey::IgBlocked, "it") => "⚠️ I download da Instagram non sono temporaneamente disponibili — la piattaforma sta bloccando il nostro server. Riprova più tardi.",
-        (MsgKey::IgBlocked, "nl") => "⚠️ Instagram-downloads zijn tijdelijk niet beschikbaar — het platform blokkeert onze server. Probeer het later opnieuw.",
-        (MsgKey::IgBlocked, "ko") => "⚠️ Instagram 다운로드를 일시적으로 사용할 수 없습니다 — 플랫폼이 당사 서버를 차단하고 있습니다. 나중에 다시 시도하세요.",
-        (MsgKey::IgBlocked, "ms") => "⚠️ Muat turun Instagram tidak tersedia buat sementara — platform menyekat pelayan kami. Cubalah lagi kemudian.",
-        (MsgKey::IgBlocked, "hi") => "⚠️ Instagram डाउनलोड अस्थायी रूप से उपलब्ध नहीं हैं — प्लेटफ़ॉर्म हमारे सर्वर को ब्लॉक कर रहा है। कृपया बाद में पुनः प्रयास करें।",
-        (MsgKey::IgBlocked, "bn") => "⚠️ Instagram ডাউনলোড সাময়িকভাবে অনুপলব্ধ — প্ল্যাটফর্ম আমাদের সার্ভার ব্লক করছে। অনুগ্রহ করে পরে আবার চেষ্টা করুন।",
-        (MsgKey::IgBlocked, "fa") => "⚠️ دانلودهای اینستاگرام موقتاً در دسترس نیستند — پلتفرم سرور ما را مسدود کرده است. لطفاً بعداً دوباره امتحان کنید.",
-        (MsgKey::IgBlocked, "pl") => "⚠️ Pobieranie z Instagrama jest tymczasowo niedostępne — platforma blokuje nasz serwer. Spróbuj ponownie później.",
-        (MsgKey::IgBlocked, "ta") => "⚠️ Instagram பதிவிறக்கங்கள் தற்காலிகமாக கிடைக்கவில்லை — தளம் எங்கள் சேவையகத்தைத் தடுக்கிறது. பின்னர் மீண்டும் முயற்சிக்கவும்.",
-        (MsgKey::IgBlocked, _) => "⚠️ Instagram downloads are temporarily unavailable — the platform is blocking our server. Please try again later.",
+        (MsgKey::IgBlocked, "ru") => {
+            "⚠️ Скачивание из Instagram временно недоступно — платформа блокирует наш сервер. Попробуйте позже."
+        }
+        (MsgKey::IgBlocked, "es") => {
+            "⚠️ Las descargas de Instagram no están disponibles temporalmente: la plataforma está bloqueando nuestro servidor. Inténtalo más tarde."
+        }
+        (MsgKey::IgBlocked, "ar") => {
+            "⚠️ تنزيلات Instagram غير متاحة مؤقتًا — المنصة تحظر خادمنا. حاول لاحقًا."
+        }
+        (MsgKey::IgBlocked, "zh-hans") => {
+            "⚠️ Instagram 下载暂时不可用——平台正在封锁我们的服务器。请稍后再试。"
+        }
+        (MsgKey::IgBlocked, "zh-hant") => {
+            "⚠️ Instagram 下載暫時無法使用——平台正在封鎖我們的伺服器。請稍後再試。"
+        }
+        (MsgKey::IgBlocked, "pt-br") => {
+            "⚠️ Os downloads do Instagram estão temporariamente indisponíveis — a plataforma está bloqueando nosso servidor. Tente novamente mais tarde."
+        }
+        (MsgKey::IgBlocked, "tr") => {
+            "⚠️ Instagram indirmeleri geçici olarak kullanılamıyor — platform sunucumuzu engelliyor. Lütfen daha sonra tekrar deneyin."
+        }
+        (MsgKey::IgBlocked, "uk") => {
+            "⚠️ Завантаження з Instagram тимчасово недоступне — платформа блокує наш сервер. Спробуйте пізніше."
+        }
+        (MsgKey::IgBlocked, "id") => {
+            "⚠️ Unduhan Instagram sementara tidak tersedia — platform memblokir server kami. Coba lagi nanti."
+        }
+        (MsgKey::IgBlocked, "vi") => {
+            "⚠️ Tải xuống Instagram tạm thời không khả dụng — nền tảng đang chặn máy chủ của chúng tôi. Vui lòng thử lại sau."
+        }
+        (MsgKey::IgBlocked, "th") => {
+            "⚠️ การดาวน์โหลด Instagram ไม่พร้อมใช้งานชั่วคราว — แพลตฟอร์มกำลังบล็อกเซิร์ฟเวอร์ของเรา โปรดลองใหม่ภายหลัง"
+        }
+        (MsgKey::IgBlocked, "my") => {
+            "⚠️ Instagram ဒေါင်းလုဒ်များ ယာယီမရနိုင်ပါ — ပလက်ဖောင်းက ကျွန်ုပ်တို့ဆာဗာကို ပိတ်ဆို့နေသည်။ နောက်မှ ထပ်စမ်းပါ။"
+        }
+        (MsgKey::IgBlocked, "km") => {
+            "⚠️ ការទាញយក Instagram មិនអាចប្រើបានជាបណ្តោះអាសន្ន — វេទិកាកំពុងរារាំងម៉ាស៊ីនមេរបស់យើង។ សូមព្យាយាមម្តងទៀតនៅពេលក្រោយ។"
+        }
+        (MsgKey::IgBlocked, "fr") => {
+            "⚠️ Les téléchargements Instagram sont temporairement indisponibles — la plateforme bloque notre serveur. Réessayez plus tard."
+        }
+        (MsgKey::IgBlocked, "de") => {
+            "⚠️ Instagram-Downloads sind vorübergehend nicht verfügbar — die Plattform blockiert unseren Server. Bitte später erneut versuchen."
+        }
+        (MsgKey::IgBlocked, "it") => {
+            "⚠️ I download da Instagram non sono temporaneamente disponibili — la piattaforma sta bloccando il nostro server. Riprova più tardi."
+        }
+        (MsgKey::IgBlocked, "nl") => {
+            "⚠️ Instagram-downloads zijn tijdelijk niet beschikbaar — het platform blokkeert onze server. Probeer het later opnieuw."
+        }
+        (MsgKey::IgBlocked, "ko") => {
+            "⚠️ Instagram 다운로드를 일시적으로 사용할 수 없습니다 — 플랫폼이 당사 서버를 차단하고 있습니다. 나중에 다시 시도하세요."
+        }
+        (MsgKey::IgBlocked, "ms") => {
+            "⚠️ Muat turun Instagram tidak tersedia buat sementara — platform menyekat pelayan kami. Cubalah lagi kemudian."
+        }
+        (MsgKey::IgBlocked, "hi") => {
+            "⚠️ Instagram डाउनलोड अस्थायी रूप से उपलब्ध नहीं हैं — प्लेटफ़ॉर्म हमारे सर्वर को ब्लॉक कर रहा है। कृपया बाद में पुनः प्रयास करें।"
+        }
+        (MsgKey::IgBlocked, "bn") => {
+            "⚠️ Instagram ডাউনলোড সাময়িকভাবে অনুপলব্ধ — প্ল্যাটফর্ম আমাদের সার্ভার ব্লক করছে। অনুগ্রহ করে পরে আবার চেষ্টা করুন।"
+        }
+        (MsgKey::IgBlocked, "fa") => {
+            "⚠️ دانلودهای اینستاگرام موقتاً در دسترس نیستند — پلتفرم سرور ما را مسدود کرده است. لطفاً بعداً دوباره امتحان کنید."
+        }
+        (MsgKey::IgBlocked, "pl") => {
+            "⚠️ Pobieranie z Instagrama jest tymczasowo niedostępne — platforma blokuje nasz serwer. Spróbuj ponownie później."
+        }
+        (MsgKey::IgBlocked, "ta") => {
+            "⚠️ Instagram பதிவிறக்கங்கள் தற்காலிகமாக கிடைக்கவில்லை — தளம் எங்கள் சேவையகத்தைத் தடுக்கிறது. பின்னர் மீண்டும் முயற்சிக்கவும்."
+        }
+        (MsgKey::IgBlocked, _) => {
+            "⚠️ Instagram downloads are temporarily unavailable — the platform is blocking our server. Please try again later."
+        }
         // ---- BatchProgress ----
         (MsgKey::BatchProgress, "ru") => "📥 Видео {current} из {total}",
         (MsgKey::BatchProgress, "es") => "📥 Vídeo {current} de {total}",

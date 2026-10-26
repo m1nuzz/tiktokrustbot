@@ -97,10 +97,7 @@ pub async fn check_subscription(
     let mut checked_any = false;
     for (channel_id, _name) in channels {
         let recipient = channel_recipient(&channel_id);
-        match bot
-            .get_chat_member(recipient, UserId(user_id as u64))
-            .await
-        {
+        match bot.get_chat_member(recipient, UserId(user_id as u64)).await {
             Ok(member) => {
                 checked_any = true;
                 if !member.kind.is_present() {

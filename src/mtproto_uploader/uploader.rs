@@ -1,10 +1,10 @@
+use grammers_client::client::InitParams;
 use grammers_client::{Client, Config};
 use grammers_session::Session;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use grammers_client::client::InitParams;
 use tokio::sync::Mutex;
 
 use crate::mtproto_uploader::constants::SESSION_FILE;
@@ -27,7 +27,13 @@ impl MTProtoUploader {
         ffprobe_path: PathBuf,
         ffmpeg_path: PathBuf,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::new_with_session(bot_token, PathBuf::from(SESSION_FILE), ffprobe_path, ffmpeg_path).await
+        Self::new_with_session(
+            bot_token,
+            PathBuf::from(SESSION_FILE),
+            ffprobe_path,
+            ffmpeg_path,
+        )
+        .await
     }
 
     /// Per-bot constructor: each bot keeps its own session file so two
@@ -44,7 +50,8 @@ impl MTProtoUploader {
 
         let is_test_mode = env::var("TEST_MODE")
             .unwrap_or_else(|_| "false".to_string())
-            .to_lowercase() == "true";
+            .to_lowercase()
+            == "true";
 
         if is_test_mode && session_file.exists() {
             log::warn!(
@@ -54,7 +61,7 @@ impl MTProtoUploader {
         }
 
         let session = Session::load_file_or_create(session_file.clone())?;
-        
+
         // Configure initialization parameters
         let params = InitParams {
             device_model: "Desktop".to_string(),
@@ -73,13 +80,14 @@ impl MTProtoUploader {
             update_queue_limit: Some(1000),
             ..Default::default()
         };
-        
+
         let client = Client::connect(Config {
             session,
             api_id,
             api_hash: api_hash.clone(),
             params,
-        }).await?;
+        })
+        .await?;
 
         if !client.is_authorized().await? {
             client.bot_sign_in(bot_token).await?;
@@ -107,25 +115,31 @@ impl MTProtoUploader {
                 // Try to execute ping
                 let result = {
                     let client_guard = client_keepalive.lock().await;
-                    client_guard.invoke(&tl::functions::updates::GetState {}).await
+                    client_guard
+                        .invoke(&tl::functions::updates::GetState {})
+                        .await
                 };
 
                 match result {
                     Ok(_) => {
                         consecutive_failures = 0;
                         log::debug!("Keep-alive ping successful")
-                    },
+                    }
                     Err(e) => {
                         consecutive_failures += 1;
                         if consecutive_failures < 3 {
                             log::warn!(
                                 "Keep-alive ping failed ({}/3): {:?}, retrying before reconnecting...",
-                                consecutive_failures, e
+                                consecutive_failures,
+                                e
                             );
                             continue;
                         }
                         consecutive_failures = 0;
-                        log::error!("Keep-alive ping failed 3 times in a row: {:?}, reconnecting...", e);
+                        log::error!(
+                            "Keep-alive ping failed 3 times in a row: {:?}, reconnecting...",
+                            e
+                        );
 
                         // Reconnection attempt. Note: replacing the client
                         // drops the old one (grammers disconnects on drop),
@@ -162,13 +176,14 @@ impl MTProtoUploader {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let api_id: i32 = env::var("TELEGRAM_API_ID")?.parse()?;
         let api_hash = env::var("TELEGRAM_API_HASH")?;
-        
+
         let is_test_mode = env::var("TEST_MODE")
             .unwrap_or_else(|_| "false".to_string())
-            .to_lowercase() == "true";
-        
+            .to_lowercase()
+            == "true";
+
         let session = Session::load_file_or_create(session_file)?;
-        
+
         let params = InitParams {
             device_model: "Desktop".to_string(),
             system_version: "Windows 10".to_string(),
@@ -185,30 +200,34 @@ impl MTProtoUploader {
             update_queue_limit: Some(1000),
             ..Default::default()
         };
-        
+
         let new_client = Client::connect(Config {
             session,
             api_id,
             api_hash,
             params,
-        }).await?;
+        })
+        .await?;
 
         // Check authorization and reconnect as a bot if necessary
         if !new_client.is_authorized().await? {
             new_client.bot_sign_in(bot_token).await?;
         }
         new_client.session().save_to_file(session_file)?;
-        
+
         // Replace the old client with a new one
         {
             let mut client_guard = client.lock().await;
             *client_guard = new_client;
         }
-        
+
         Ok(())
     }
 
-    pub async fn with_reconnect_retry<T, F, Fut>(&self, operation: F) -> Result<T, Box<dyn std::error::Error + Send + Sync>>
+    pub async fn with_reconnect_retry<T, F, Fut>(
+        &self,
+        operation: F,
+    ) -> Result<T, Box<dyn std::error::Error + Send + Sync>>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<T, Box<dyn std::error::Error + Send + Sync>>>,
@@ -216,14 +235,20 @@ impl MTProtoUploader {
         let max_retries = 3;
         for attempt in 0..max_retries {
             let result = operation().await;
-            
+
             match result {
                 Ok(value) => return Ok(value),
-                Err(e) if e.to_string().contains("read 0 bytes") || 
-                          e.to_string().contains("ConnectionReset") ||
-                          e.to_string().contains("Connection lost") => {
-                    log::warn!("Connection lost, reconnecting... (attempt {}/{})", attempt + 1, max_retries);
-                    
+                Err(e)
+                    if e.to_string().contains("read 0 bytes")
+                        || e.to_string().contains("ConnectionReset")
+                        || e.to_string().contains("Connection lost") =>
+                {
+                    log::warn!(
+                        "Connection lost, reconnecting... (attempt {}/{})",
+                        attempt + 1,
+                        max_retries
+                    );
+
                     if let Err(reconnect_err) =
                         Self::reconnect_client(&self.client, &self.bot_token, &self.session_file)
                             .await
@@ -242,9 +267,12 @@ impl MTProtoUploader {
                 Err(e) => return Err(e),
             }
         }
-        
+
         // If we have reached this point, then this is an error that is not related to the connection
         // or all reconnection attempts were unsuccessful
-        Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Operation failed after retries")))
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Operation failed after retries",
+        )))
     }
 }

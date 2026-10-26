@@ -1,21 +1,21 @@
-use axum::{
-    extract::{RawQuery, State, Query},
-    routing::{get, post},
-    Json, Router,
-    response::Html,
-};
-use axum::http::{header, HeaderMap, HeaderValue};
-use tower_http::cors::CorsLayer;
-use std::sync::Arc;
-use std::collections::HashMap;
-use std::time::Duration;
 use crate::database::{ClaimVia, DatabasePool, PRIMARY_BOT_ID, SessionYmid};
-use crate::yt_dlp_interface::YoutubeFetcher;
 use crate::mtproto_uploader::MTProtoUploader;
 use crate::utils::task_manager::TaskManager;
+use crate::yt_dlp_interface::YoutubeFetcher;
+use axum::http::{HeaderMap, HeaderValue, header};
+use axum::{
+    Json, Router,
+    extract::{Query, RawQuery, State},
+    response::Html,
+    routing::{get, post},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 use teloxide::prelude::*;
+use tower_http::cors::CorsLayer;
 
 /// Mini-app HTML embedded at compile time — no need to deploy the folder separately
 const MINI_APP_HTML: &str = include_str!("../mini-app/index.html");
@@ -317,9 +317,13 @@ pub async fn start_web_server(state: AppState, port: u16) {
 
     let addr = format!("0.0.0.0:{}", port);
     log::info!("Starting web server on {}", addr);
-    
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("Failed to bind web server port");
-    axum::serve(listener, app).await.expect("Failed to start axum server");
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("Failed to bind web server port");
+    axum::serve(listener, app)
+        .await
+        .expect("Failed to start axum server");
 }
 
 /// Substitutes the per-locale STRINGS dict into the mini-app template.
@@ -332,10 +336,7 @@ fn inject_mini_app_strings(html: &str, lang: &str, dict: &serde_json::Value) -> 
     let html = html.replace("/*STRINGS_INJECT*/null", &dict.to_string());
     html.replace(
         "<html lang=\"en\">",
-        &format!(
-            "<html lang=\"{}\">",
-            crate::i18n::resolve_lang(Some(lang))
-        ),
+        &format!("<html lang=\"{}\">", crate::i18n::resolve_lang(Some(lang))),
     )
 }
 
@@ -354,7 +355,11 @@ fn inject_mini_app_strings(html: &str, lang: &str, dict: &serde_json::Value) -> 
 fn inject_bot_username(html: &str, username: Option<&str>) -> String {
     let literal = username
         .map(|name| name.trim().trim_start_matches('@'))
-        .map(|name| name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').collect::<String>())
+        .map(|name| {
+            name.chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<String>()
+        })
         .filter(|name| !name.is_empty())
         .map(|name| serde_json::Value::String(name).to_string())
         .unwrap_or_else(|| "null".to_string());
@@ -392,7 +397,10 @@ async fn serve_mini_app(
         .unwrap_or_else(|_| "https://omg10.com/4/11148490".to_string());
 
     // Inject SmartLink URL into HTML
-    let html = MINI_APP_HTML.replace("// SMARTLINK_INJECT", &format!("const AD_CONFIG_SMARTLINK = \"{}\";", smartlink));
+    let html = MINI_APP_HTML.replace(
+        "// SMARTLINK_INJECT",
+        &format!("const AD_CONFIG_SMARTLINK = \"{}\";", smartlink),
+    );
     // Localise the mini-app the same way the bot localises replies: an
     // explicit ?lang= (appended by the bot button) wins, else the stored
     // /language override for the ymid's owner, else English. The resolved
@@ -402,8 +410,17 @@ async fn serve_mini_app(
         _ => match query.get("ymid") {
             Some(ymid) if !ymid.is_empty() => match state.db.get_user_id_by_ymid(ymid).await {
                 Ok(user_id) => {
-                    let row_bot_id: String = state.db.get_bot_id_by_ymid(ymid).await.ok().flatten().unwrap_or_else(|| PRIMARY_BOT_ID.to_string());
-                    state.db.get_effective_lang(&row_bot_id, user_id, None).await
+                    let row_bot_id: String = state
+                        .db
+                        .get_bot_id_by_ymid(ymid)
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| PRIMARY_BOT_ID.to_string());
+                    state
+                        .db
+                        .get_effective_lang(&row_bot_id, user_id, None)
+                        .await
                 }
                 Err(_) => "en".to_string(),
             },
@@ -440,7 +457,10 @@ async fn serve_mini_app(
     // Every open already carries a unique ?ymid=, this only stops the client
     // from reusing a previous document for it.
     let mut headers = HeaderMap::new();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store, no-cache, must-revalidate, max-age=0"));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate, max-age=0"),
+    );
     headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
     (headers, Html(html))
 }
@@ -457,7 +477,13 @@ async fn get_ads_status(
         match state.db.get_user_id_by_ymid(ymid).await {
             Ok(user_id) => {
                 let is_user_admin = crate::handlers::admin::is_admin_id(user_id);
-                let row_bot_id: String = state.db.get_bot_id_by_ymid(ymid).await.ok().flatten().unwrap_or_else(|| PRIMARY_BOT_ID.to_string());
+                let row_bot_id: String = state
+                    .db
+                    .get_bot_id_by_ymid(ymid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| PRIMARY_BOT_ID.to_string());
                 let enabled = crate::handlers::link::ads_enabled_for(
                     &state.db,
                     &row_bot_id,
@@ -509,8 +535,17 @@ async fn spawn_download_job(
     };
     // The row owns the bot: funnel and locale stay on the bot the user came
     // from. Unknown ymid keeps the previous primary fallback.
-    let row_bot_id: String = state.db.get_bot_id_by_ymid(&ymid).await.ok().flatten().unwrap_or_else(|| PRIMARY_BOT_ID.to_string());
-    state.db.log_funnel_event(&row_bot_id, user_id, reason).await;
+    let row_bot_id: String = state
+        .db
+        .get_bot_id_by_ymid(&ymid)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| PRIMARY_BOT_ID.to_string());
+    state
+        .db
+        .log_funnel_event(&row_bot_id, user_id, reason)
+        .await;
     // A download really begins here, so record it: this is what lets the
     // expiry sweeper tell a failed download from a session that never earned
     // its ad, and therefore which of the two messages the user gets.
@@ -521,7 +556,10 @@ async fn spawn_download_job(
     }
     // Resolve locale from the stored /language override (no Telegram
     // User object in this flow, so no device language available).
-    let lang = state.db.get_effective_lang(&row_bot_id, user_id, None).await;
+    let lang = state
+        .db
+        .get_effective_lang(&row_bot_id, user_id, None)
+        .await;
     // The row's owning bot sends its own sessions. Unknown ymid resolves
     // through the same primary fallback as before (bot_for falls back to the
     // first configured bot for unmapped ids).
@@ -541,8 +579,10 @@ async fn spawn_download_job(
             ChatId(user_id),
             Some(lang),
             Some(ymid),
-            None
-        ).await {
+            None,
+        )
+        .await
+        {
             log::error!("Error processing claimed download: {}", e);
         }
     });
@@ -706,10 +746,7 @@ async fn monetag_postback(
     Query(query): Query<PostbackQuery>,
     RawQuery(raw): RawQuery,
 ) -> impl axum::response::IntoResponse {
-    let reward = query
-        .reward_event_type
-        .unwrap_or_default()
-        .to_lowercase();
+    let reward = query.reward_event_type.unwrap_or_default().to_lowercase();
     // The extractor drops any macro absent from PostbackQuery, so the parsed
     // view can never tell us what we are NOT capturing. Log the raw query once
     // per postback: an unexpected parameter has to be visible in the journal,
@@ -799,7 +836,8 @@ async fn monetag_postback(
                 }
                 refused => log::debug!(
                     "Unvalued display for ymid {} delivered nothing: {:?}",
-                    task_ymid, refused
+                    task_ymid,
+                    refused
                 ),
             }
         });
@@ -830,7 +868,8 @@ async fn monetag_postback(
             }
             refused => log::debug!(
                 "Valued postback for ymid {} delivered nothing: {:?}",
-                task_ymid, refused
+                task_ymid,
+                refused
             ),
         }
     });
@@ -840,7 +879,11 @@ async fn monetag_postback(
 
 /// Built as a pure function so both the extended and the dead-end branch are
 /// testable without a Bot or an HTTP server.
-fn ping_response(status: &str, lease_expires_at: Option<String>, live: bool) -> SessionPingResponse {
+fn ping_response(
+    status: &str,
+    lease_expires_at: Option<String>,
+    live: bool,
+) -> SessionPingResponse {
     SessionPingResponse {
         status: status.to_string(),
         lease_expires_at,
@@ -879,9 +922,7 @@ async fn session_ping(
     }
 }
 
-fn check_status_response(
-    state: Option<(String, Option<String>)>,
-) -> CheckStatusResponse {
+fn check_status_response(state: Option<(String, Option<String>)>) -> CheckStatusResponse {
     match state {
         Some((status, lease_expires_at)) => CheckStatusResponse {
             status,
@@ -905,10 +946,7 @@ async fn check_ad_status(
         Ok(snapshot) => Json(check_status_response(snapshot)),
         Err(e) => {
             log::error!("Error checking status for ymid {}: {}", ymid, e);
-            Json(check_status_response(Some((
-                "error".to_string(),
-                None,
-            ))))
+            Json(check_status_response(Some(("error".to_string(), None))))
         }
     }
 }
@@ -934,10 +972,7 @@ async fn get_ad_impression(
         log::warn!("ad-valued check failed for ymid {}: {}", ymid, e);
         false
     });
-    Json(AdImpressionResponse {
-        impression,
-        valued,
-    })
+    Json(AdImpressionResponse { impression, valued })
 }
 
 async fn claim_video(
@@ -984,10 +1019,15 @@ async fn claim_video(
 
     match claim_result {
         Ok((user_id, url, via)) => {
-            log::info!("Claim success ({:?})! Triggering download for user {}: {}", via, user_id, url);
+            log::info!(
+                "Claim success ({:?})! Triggering download for user {}: {}",
+                via,
+                user_id,
+                url
+            );
             spawn_download_job(state, user_id, url, ymid, via).await;
             Json(json!({ "success": true }))
-        },
+        }
         Err(e) => {
             // The valued postback's own auto-delivery may have completed this
             // row while we were waiting, so the video is on its way.
@@ -1035,8 +1075,8 @@ mod tests {
     fn ping_and_check_status_payloads_carry_the_server_lease() {
         let deadline = "2026-10-07 12:00:00".to_string();
 
-        let live =
-            serde_json::to_string(&ping_response("verified", Some(deadline.clone()), true)).unwrap();
+        let live = serde_json::to_string(&ping_response("verified", Some(deadline.clone()), true))
+            .unwrap();
         assert!(live.contains("\"lease_expires_at\":\"2026-10-07 12:00:00\""));
         assert!(live.contains("\"live\":true"));
 
@@ -1074,11 +1114,7 @@ mod tests {
             "MiniNoAdsTitle".to_string(),
             serde_json::Value::String("x".to_string()),
         );
-        let out = inject_mini_app_strings(
-            template,
-            "ru",
-            &serde_json::Value::Object(dict),
-        );
+        let out = inject_mini_app_strings(template, "ru", &serde_json::Value::Object(dict));
         assert_eq!(out.matches("const STRINGS").count(), 1);
         assert!(!out.contains("STRINGS_INJECT"));
         assert!(!out.contains("}null"), "leftover null after the dict");
@@ -1122,8 +1158,7 @@ mod tests {
     fn bot_username_is_whitelisted_before_it_reaches_the_client() {
         let template = "<script>const BOT_USERNAME = /*BOT_USERNAME_INJECT*/null;</script>";
 
-        assert!(inject_bot_username(template, Some("@Some_Bot1"))
-            .contains("\"Some_Bot1\""));
+        assert!(inject_bot_username(template, Some("@Some_Bot1")).contains("\"Some_Bot1\""));
         // Anything outside [A-Za-z0-9_] is dropped, including an attempt to end
         // the declaration and start new script.
         let hostile = inject_bot_username(template, Some("bot\";alert(1);//"));
@@ -1142,7 +1177,8 @@ mod tests {
     /// serde drops unknown body fields instead of rejecting them, so a body
     /// from an already-open older client still reaches the gate.
     #[test]
-    fn claim_request_ignores_unknown_body_fields() {        let parsed: ClaimRequest =
+    fn claim_request_ignores_unknown_body_fields() {
+        let parsed: ClaimRequest =
             serde_json::from_str(r#"{"ymid":"legacy-ymid","legacy_attestation":true}"#).unwrap();
         assert_eq!(parsed.ymid, "legacy-ymid");
     }
@@ -1159,7 +1195,8 @@ mod tests {
             ("failed", "failed"),
             ("not_found", "not_found"),
         ] {
-            let payload = serde_json::to_string(&claim_refusal(status, CLAIM_PENDING_ERROR)).unwrap();
+            let payload =
+                serde_json::to_string(&claim_refusal(status, CLAIM_PENDING_ERROR)).unwrap();
             assert!(payload.contains("\"success\":false"));
             assert!(
                 payload.contains(&format!("\"status\":\"{}\"", expected)),
@@ -1171,12 +1208,16 @@ mod tests {
 
         // The pre-existing answer wording is untouched, and a ymid that does not
         // exist keeps its own message.
-        assert!(serde_json::to_string(&claim_refusal("pending", CLAIM_PENDING_ERROR))
-            .unwrap()
-            .contains(CLAIM_PENDING_ERROR));
-        assert!(serde_json::to_string(&claim_refusal("not_found", CLAIM_INVALID_REQUEST_ERROR))
-            .unwrap()
-            .contains(CLAIM_INVALID_REQUEST_ERROR));
+        assert!(
+            serde_json::to_string(&claim_refusal("pending", CLAIM_PENDING_ERROR))
+                .unwrap()
+                .contains(CLAIM_PENDING_ERROR)
+        );
+        assert!(
+            serde_json::to_string(&claim_refusal("not_found", CLAIM_INVALID_REQUEST_ERROR))
+                .unwrap()
+                .contains(CLAIM_INVALID_REQUEST_ERROR)
+        );
     }
 
     /// Same contract against a real row: the status the client acts on is read
@@ -1244,13 +1285,16 @@ mod tests {
             ymid: "entry".to_string(),
             reused: true,
         });
-        assert!(serde_json::to_string(&reused)
-            .unwrap()
-            .contains("\"reused\":true"));
+        assert!(
+            serde_json::to_string(&reused)
+                .unwrap()
+                .contains("\"reused\":true")
+        );
     }
 
     #[test]
-    fn classify_verify_separates_moved_already_verified_and_terminal() {        assert_eq!(
+    fn classify_verify_separates_moved_already_verified_and_terminal() {
+        assert_eq!(
             classify_verify(1, Some("verified")),
             VerifyOutcome::Verified
         );
@@ -1323,9 +1367,18 @@ mod tests {
         // Mirror the handler: the postback is journaled before the delivery task
         // runs, and the journaled row IS the proof the gate reads. Without it this
         // ymid has no valued impression and the gate must refuse.
-        db.log_postback("valued-pending", Some("impression"), "valued", None, None, None, None, None)
-            .await
-            .unwrap();
+        db.log_postback(
+            "valued-pending",
+            Some("impression"),
+            "valued",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let outcome = deliver_after_ad_display(&db, "valued-pending").await;
         assert_eq!(
@@ -1355,9 +1408,18 @@ mod tests {
 
         let mut deliveries = 0;
         for _ in 0..3 {
-            db.log_postback("retried", Some("impression"), "valued", None, None, None, None, None)
-                .await
-                .unwrap();
+            db.log_postback(
+                "retried",
+                Some("impression"),
+                "valued",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
             if let ValuedPostbackResult::Delivered { .. } =
                 deliver_after_ad_display(&db, "retried").await
             {
@@ -1379,9 +1441,18 @@ mod tests {
         let (pool, _file) = crate::database::setup_test_db().await;
         let db = Arc::new(pool);
         crate::database::setup_gate_row(&db, "free-pending", "pending", 5, &[]).await;
-        db.log_postback("free-pending", Some("impression"), "non_valued", None, None, None, None, None)
-            .await
-            .unwrap();
+        db.log_postback(
+            "free-pending",
+            Some("impression"),
+            "non_valued",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let outcome = deliver_after_ad_display(&db, "free-pending").await;
         assert!(
@@ -1390,7 +1461,9 @@ mod tests {
             outcome
         );
         assert_eq!(
-            db.get_pending_download_status("free-pending").await.unwrap(),
+            db.get_pending_download_status("free-pending")
+                .await
+                .unwrap(),
             Some("completed".to_string())
         );
     }
@@ -1402,17 +1475,35 @@ mod tests {
         let (pool, _file) = crate::database::setup_test_db().await;
         let db = Arc::new(pool);
         crate::database::setup_gate_row(&db, "race", "pending", 5, &[]).await;
-        db.log_postback("race", Some("impression"), "valued", None, None, None, None, None)
-            .await
-            .unwrap();
+        db.log_postback(
+            "race",
+            Some("impression"),
+            "valued",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             deliver_after_ad_display(&db, "race").await,
             ValuedPostbackResult::Delivered { .. }
         ));
 
-        db.log_postback("race", Some("impression"), "non_valued", None, None, None, None, None)
-            .await
-            .unwrap();
+        db.log_postback(
+            "race",
+            Some("impression"),
+            "non_valued",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let again = deliver_after_ad_display(&db, "race").await;
         assert!(
             !matches!(again, ValuedPostbackResult::Delivered { .. }),
@@ -1473,9 +1564,7 @@ mod tests {
             ValuedPostbackResult::Delivered { .. }
         ));
         assert_eq!(
-            db.get_pending_download_status("click-first")
-                .await
-                .unwrap(),
+            db.get_pending_download_status("click-first").await.unwrap(),
             Some("completed".to_string())
         );
     }
@@ -1490,9 +1579,18 @@ mod tests {
         crate::database::setup_gate_row(&db, "too-late", "expired", 5, &[]).await;
 
         for ymid in ["already-done", "too-late", "never-existed"] {
-            db.log_postback(ymid, Some("impression"), "valued", None, None, None, None, None)
-                .await
-                .unwrap();
+            db.log_postback(
+                ymid,
+                Some("impression"),
+                "valued",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
             let outcome = deliver_after_ad_display(&db, ymid).await;
             assert!(
                 matches!(&outcome, ValuedPostbackResult::NotDeliverable(_)),

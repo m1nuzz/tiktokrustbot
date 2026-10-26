@@ -1,20 +1,26 @@
+use anyhow::anyhow;
 use std::path::Path;
 use tokio::process::Command;
-use anyhow::anyhow;
 
-use crate::utils::progress_bar::ProgressBar;
-use crate::mtproto_uploader::uploader::MTProtoUploader;
-use crate::mtproto_uploader::thumbnail::generate_thumbnail;
-use crate::mtproto_uploader::metadata::get_video_metadata;
-use crate::mtproto_uploader::file_uploader::{upload_file_in_parts_with_reconnect, upload_small_file_with_reconnect};
+use crate::mtproto_uploader::file_uploader::{
+    upload_file_in_parts_with_reconnect, upload_small_file_with_reconnect,
+};
 use crate::mtproto_uploader::message_sender::send_media_with_retry;
+use crate::mtproto_uploader::metadata::get_video_metadata;
+use crate::mtproto_uploader::thumbnail::generate_thumbnail;
+use crate::mtproto_uploader::uploader::MTProtoUploader;
+use crate::utils::progress_bar::ProgressBar;
 use crate::utils::temp_file::TempFileGuard;
 
 impl MTProtoUploader {
-    async fn ensure_faststart_video(&self, file_path: &Path) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    async fn ensure_faststart_video(
+        &self,
+        file_path: &Path,
+    ) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
         // Create a temporary file for the faststart-optimized video
         let temp_dir = std::env::temp_dir();
-        let file_name = file_path.file_name()
+        let file_name = file_path
+            .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("temp.mp4");
         let temp_path = temp_dir.join(format!("faststart_{}", file_name));
@@ -48,14 +54,18 @@ impl MTProtoUploader {
         progress_bar: &mut ProgressBar,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Create temporary faststart file with guard
-        let (video_path, _video_guard) = if file_path.extension().map_or(false, |ext| ext == "mp4") {
+        let (video_path, _video_guard) = if file_path.extension().map_or(false, |ext| ext == "mp4")
+        {
             match self.ensure_faststart_video(file_path).await {
                 Ok(temp_path) => {
                     let guard = TempFileGuard::new(temp_path.clone());
                     (temp_path, Some(guard))
-                },
+                }
                 Err(e) => {
-                    log::warn!("Failed to remux video with faststart, proceeding with original: {:?}", e);
+                    log::warn!(
+                        "Failed to remux video with faststart, proceeding with original: {:?}",
+                        e
+                    );
                     (file_path.to_path_buf(), None)
                 }
             }
@@ -64,31 +74,46 @@ impl MTProtoUploader {
         };
 
         // Upload the main video file using reconnect mechanism
-        let (file_id, file_parts) = upload_file_in_parts_with_reconnect(self, &video_path, progress_bar, "video").await.map_err(|e| {
-            log::error!("Failed to upload video file {:?}: {:?}", file_path, e);
-            e
-        })?;
+        let (file_id, file_parts) =
+            upload_file_in_parts_with_reconnect(self, &video_path, progress_bar, "video")
+                .await
+                .map_err(|e| {
+                    log::error!("Failed to upload video file {:?}: {:?}", file_path, e);
+                    e
+                })?;
 
         // Get video metadata
-        let video_metadata = get_video_metadata(self.ffprobe_path.to_string_lossy().as_ref(), &video_path).await.map_err(|e| {
-            log::error!("Failed to get video metadata for {:?}: {:?}", file_path, e);
-            e
-        })?;
+        let video_metadata =
+            get_video_metadata(self.ffprobe_path.to_string_lossy().as_ref(), &video_path)
+                .await
+                .map_err(|e| {
+                    log::error!("Failed to get video metadata for {:?}: {:?}", file_path, e);
+                    e
+                })?;
 
         // Generate and upload thumbnail
         let thumbnail_path = file_path.with_extension("jpg");
-        generate_thumbnail(&self.ffmpeg_path, file_path, &thumbnail_path).await.map_err(|e| {
-            log::error!("Failed to generate thumbnail for {:?}: {:?}", file_path, e);
-            e
-        })?;
+        generate_thumbnail(&self.ffmpeg_path, file_path, &thumbnail_path)
+            .await
+            .map_err(|e| {
+                log::error!("Failed to generate thumbnail for {:?}: {:?}", file_path, e);
+                e
+            })?;
 
         let _thumbnail_guard = TempFileGuard::new(thumbnail_path.clone());
 
         // Upload the thumbnail using the reconnect mechanism
-        let (thumbnail_file_id, thumbnail_parts) = upload_small_file_with_reconnect(self, &thumbnail_path).await.map_err(|e| {
-            log::error!("Failed to upload thumbnail file {:?}: {:?}", thumbnail_path, e);
-            e
-        })?;
+        let (thumbnail_file_id, thumbnail_parts) =
+            upload_small_file_with_reconnect(self, &thumbnail_path)
+                .await
+                .map_err(|e| {
+                    log::error!(
+                        "Failed to upload thumbnail file {:?}: {:?}",
+                        thumbnail_path,
+                        e
+                    );
+                    e
+                })?;
 
         // Send the media with retry logic
         send_media_with_retry(
@@ -105,7 +130,9 @@ impl MTProtoUploader {
             video_metadata.width,
             video_metadata.height,
             caption,
-        ).await.map_err(|e| {
+        )
+        .await
+        .map_err(|e| {
             log::error!("Failed to send media: {:?}", e);
             e
         })?;

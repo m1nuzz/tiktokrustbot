@@ -13,7 +13,10 @@ impl TaskManager {
 
     /// Waits for all tasks to complete
     pub async fn shutdown(&mut self) {
-        log::info!("Shutting down TaskManager, waiting for {} tasks", self.tasks.len());
+        log::info!(
+            "Shutting down TaskManager, waiting for {} tasks",
+            self.tasks.len()
+        );
         while let Some(result) = self.tasks.join_next().await {
             if let Err(e) = result {
                 log::error!("Task failed during shutdown: {:?}", e);
@@ -32,7 +35,10 @@ impl TaskManager {
 impl Drop for TaskManager {
     fn drop(&mut self) {
         if !self.tasks.is_empty() {
-            log::warn!("TaskManager dropped with {} active tasks, aborting them", self.tasks.len());
+            log::warn!(
+                "TaskManager dropped with {} active tasks, aborting them",
+                self.tasks.len()
+            );
             self.abort_all();
         }
     }

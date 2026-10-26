@@ -2,15 +2,15 @@ use crate::peers::resolve_peer;
 
 use anyhow;
 use grammers_tl_types as tl;
+use log;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::path::Path;
-use log;
 
 use crate::utils::progress_bar::ProgressBar;
 
-use crate::mtproto_uploader::uploader::MTProtoUploader; // Import MTProtoUploader
 use crate::mtproto_uploader::file_uploader::upload_file_in_parts_with_reconnect;
+use crate::mtproto_uploader::uploader::MTProtoUploader; // Import MTProtoUploader
 
 impl MTProtoUploader {
     pub async fn upload_audio(
@@ -22,18 +22,23 @@ impl MTProtoUploader {
         progress_bar: &mut ProgressBar,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Upload the audio file using reconnect mechanism
-        let (file_id, total_parts) = upload_file_in_parts_with_reconnect(self, file_path, progress_bar, "audio").await.map_err(|e| {
-            log::error!("Failed to upload audio file {:?}: {:?}", file_path, e);
-            e
-        })?;
+        let (file_id, total_parts) =
+            upload_file_in_parts_with_reconnect(self, file_path, progress_bar, "audio")
+                .await
+                .map_err(|e| {
+                    log::error!("Failed to upload audio file {:?}: {:?}", file_path, e);
+                    e
+                })?;
 
         // Access the actual client through the mutex
         let client = self.client.lock().await;
-        
-        let input_peer = resolve_peer(&self.client, chat_id, username.as_deref()).await.map_err(|e| {
-            log::error!("Failed to resolve peer: {:?}", e);
-            e
-        })?;
+
+        let input_peer = resolve_peer(&self.client, chat_id, username.as_deref())
+            .await
+            .map_err(|e| {
+                log::error!("Failed to resolve peer: {:?}", e);
+                e
+            })?;
 
         let input_file = tl::enums::InputFile::Big(tl::types::InputFileBig {
             id: file_id,
@@ -48,37 +53,43 @@ impl MTProtoUploader {
                 })?,
         });
 
-        let ext = file_path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        let ext = file_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
         let mime = match ext.as_str() {
             "mp3" => "audio/mpeg",
             "m4a" => "audio/mp4",
             "aac" => "audio/aac",
             "ogg" => "audio/ogg",
             _ => "audio/mpeg",
-        }.to_string();
+        }
+        .to_string();
 
         let audio_attr = tl::enums::DocumentAttribute::Audio(tl::types::DocumentAttributeAudio {
             voice: false,
-            duration: 0,              // optionally calculate beforehand
+            duration: 0, // optionally calculate beforehand
             title: None,
             performer: None,
             waveform: None,
         });
 
-        let media = tl::enums::InputMedia::UploadedDocument(tl::types::InputMediaUploadedDocument {
-            nosound_video: false,
-            spoiler: false,
-            file: input_file,
-            thumb: None,
-            mime_type: mime,
-            force_file: false,
-            attributes: vec![audio_attr],
-            stickers: Some(Vec::new()),
-            ttl_seconds: None,
-        });
+        let media =
+            tl::enums::InputMedia::UploadedDocument(tl::types::InputMediaUploadedDocument {
+                nosound_video: false,
+                spoiler: false,
+                file: input_file,
+                thumb: None,
+                mime_type: mime,
+                force_file: false,
+                attributes: vec![audio_attr],
+                stickers: Some(Vec::new()),
+                ttl_seconds: None,
+            });
 
         let mut rng = ChaCha8Rng::from_os_rng();
-        
+
         // Sending message
         let request = tl::functions::messages::SendMedia {
             silent: false,
@@ -99,12 +110,12 @@ impl MTProtoUploader {
             invert_media: false,
             quick_reply_shortcut: None,
         };
-        
+
         client.invoke(&request).await.map_err(|e| {
             log::error!("Failed to send audio: {:?}", e);
             e
         })?;
-        
+
         Ok(())
     }
 }

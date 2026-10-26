@@ -1,4 +1,3 @@
-
 use regex::Regex;
 
 /// Extract FLOOD_WAIT seconds from Telegram error

@@ -1,12 +1,12 @@
-use teloxide::prelude::*;
-use teloxide::types::{
-    LabeledPrice, PreCheckoutQuery, Message, InlineKeyboardMarkup, 
-    InlineKeyboardButton, InlineKeyboardButtonKind, True
-};
-use std::sync::Arc;
 use crate::database::DatabasePool;
 use crate::i18n;
 use std::env;
+use std::sync::Arc;
+use teloxide::prelude::*;
+use teloxide::types::{
+    InlineKeyboardButton, InlineKeyboardButtonKind, InlineKeyboardMarkup, LabeledPrice, Message,
+    PreCheckoutQuery, True,
+};
 
 pub const PREMIUM_PAYLOAD: &str = "premium_30_days_xtr";
 pub const CURRENCY_XTR: &str = "XTR";
@@ -24,34 +24,40 @@ pub fn is_xtr_currency(currency: &str) -> bool {
 /// 1. Send Invoice (Telegram Stars)
 /// optionally accepts an extra_button to combine invoice with other options (e.g. Free Ad-supported download)
 pub async fn send_premium_invoice(
-    bot: Bot, 
-    chat_id: ChatId, 
+    bot: Bot,
+    chat_id: ChatId,
     bot_id: &str,
     db_pool: Arc<DatabasePool>,
-    extra_button: Option<InlineKeyboardButton>
+    extra_button: Option<InlineKeyboardButton>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let price_val: u32 = crate::handlers::admin_panel::premium_price_for(&db_pool, bot_id).await;
-    
-    log::info!("[PAYMENT_CHAIN] 1. Initiation: User={}, Amount={} Stars", chat_id, price_val);
+
+    log::info!(
+        "[PAYMENT_CHAIN] 1. Initiation: User={}, Amount={} Stars",
+        chat_id,
+        price_val
+    );
 
     // Log the invoice being sent
-    let _ = db_pool.log_invoice(bot_id, chat_id.0, price_val as i64, PREMIUM_PAYLOAD).await;
+    let _ = db_pool
+        .log_invoice(bot_id, chat_id.0, price_val as i64, PREMIUM_PAYLOAD)
+        .await;
 
     // Invoice speaks the buyer's language: the title, description, Pay button
     // and price label all come from the same locale table as the bot replies.
     let lang = db_pool.get_effective_lang(bot_id, chat_id.0, None).await;
     let lang = Some(lang.as_str());
 
-    // Telegram API Rule: If a custom reply_markup is provided for an invoice, 
+    // Telegram API Rule: If a custom reply_markup is provided for an invoice,
     // the first button in the first row MUST be a Pay button.
     let pay_button = InlineKeyboardButton::new(
         crate::i18n::t(crate::i18n::MsgKey::PremiumPayButton, lang)
             .replace("{price}", &price_val.to_string()),
-        InlineKeyboardButtonKind::Pay(True)
+        InlineKeyboardButtonKind::Pay(True),
     );
 
     let mut rows = vec![vec![pay_button]];
-    
+
     // Add the extra button (e.g. "Get Video") in the second row
     if let Some(btn) = extra_button {
         rows.push(vec![btn]);
@@ -59,24 +65,30 @@ pub async fn send_premium_invoice(
 
     let markup = InlineKeyboardMarkup::new(rows);
 
-    match bot.send_invoice(
-        chat_id,
-        crate::i18n::t(crate::i18n::MsgKey::PremiumInvoiceTitle, lang),
-        crate::i18n::t(crate::i18n::MsgKey::PremiumInvoiceDesc, lang),
-        PREMIUM_PAYLOAD,
-        CURRENCY_XTR,
-        vec![LabeledPrice::new(
-            crate::i18n::t(crate::i18n::MsgKey::PremiumPriceLabel, lang),
-            price_val,
-        )],
-    )
-    .reply_markup(markup)
-    .await {
+    match bot
+        .send_invoice(
+            chat_id,
+            crate::i18n::t(crate::i18n::MsgKey::PremiumInvoiceTitle, lang),
+            crate::i18n::t(crate::i18n::MsgKey::PremiumInvoiceDesc, lang),
+            PREMIUM_PAYLOAD,
+            CURRENCY_XTR,
+            vec![LabeledPrice::new(
+                crate::i18n::t(crate::i18n::MsgKey::PremiumPriceLabel, lang),
+                price_val,
+            )],
+        )
+        .reply_markup(markup)
+        .await
+    {
         Ok(_) => {
             log::info!("[PAYMENT_CHAIN] 2. Invoice sent to user {}", chat_id);
         }
         Err(e) => {
-            log::error!("[PAYMENT_CHAIN] ❌ Error sending invoice to {}: {:?}", chat_id, e);
+            log::error!(
+                "[PAYMENT_CHAIN] ❌ Error sending invoice to {}: {:?}",
+                chat_id,
+                e
+            );
         }
     }
 
@@ -89,17 +101,26 @@ pub fn validate_pre_checkout(payload: &str, currency: &str) -> bool {
 }
 
 /// 2. Handle PreCheckoutQuery (Crucial step to stop the loading spinner)
-pub async fn handle_pre_checkout(bot: Bot, q: PreCheckoutQuery) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn handle_pre_checkout(
+    bot: Bot,
+    q: PreCheckoutQuery,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let query_id = q.id.clone();
     log::info!(
         "[PAYMENT_CHAIN] 3. PreCheckoutQuery received! ID={}, User={}, Payload={}, Amount={}",
-        query_id, q.from.id, q.invoice_payload, q.total_amount
+        query_id,
+        q.from.id,
+        q.invoice_payload,
+        q.total_amount
     );
 
     let ok = validate_pre_checkout(&q.invoice_payload, &q.currency);
 
     if !ok {
-        log::warn!("[PAYMENT_CHAIN] ❌ Rejecting PreCheckout {}: invalid payload or currency", query_id);
+        log::warn!(
+            "[PAYMENT_CHAIN] ❌ Rejecting PreCheckout {}: invalid payload or currency",
+            query_id
+        );
         bot.answer_pre_checkout_query(query_id, false)
             .error_message("Error: invalid order identifier or currency.")
             .await?;
@@ -108,13 +129,20 @@ pub async fn handle_pre_checkout(bot: Bot, q: PreCheckoutQuery) -> Result<(), Bo
 
     match bot.answer_pre_checkout_query(query_id.clone(), true).await {
         Ok(_) => {
-            log::info!("[PAYMENT_CHAIN] 4. PreCheckout approved (OK) for ID={}", query_id);
+            log::info!(
+                "[PAYMENT_CHAIN] 4. PreCheckout approved (OK) for ID={}",
+                query_id
+            );
         }
         Err(e) => {
-            log::error!("[PAYMENT_CHAIN] ❌ Error answering PreCheckout {}: {:?}", query_id, e);
+            log::error!(
+                "[PAYMENT_CHAIN] ❌ Error answering PreCheckout {}: {:?}",
+                query_id,
+                e
+            );
         }
     }
-    
+
     Ok(())
 }
 
@@ -131,21 +159,26 @@ pub async fn process_successful_payment_logic(
         return Ok(false);
     }
 
-    log::info!("[PAYMENT_CHAIN] 6. Granting premium in DB for user {}", user_id);
+    log::info!(
+        "[PAYMENT_CHAIN] 6. Granting premium in DB for user {}",
+        user_id
+    );
     db_pool.set_user_premium(bot_id, user_id, 30).await?;
-    
+
     // Log the successful payment
-    let _ = db_pool.log_payment(bot_id, user_id, amount as i64, payload).await;
-    
+    let _ = db_pool
+        .log_payment(bot_id, user_id, amount as i64, payload)
+        .await;
+
     Ok(true)
 }
 
 /// 3. Handle Successful Payment
 pub async fn handle_successful_payment(
-    bot: Bot, 
-    msg: Message, 
+    bot: Bot,
+    msg: Message,
     ctx: crate::BotCtx,
-    db_pool: Arc<DatabasePool>
+    db_pool: Arc<DatabasePool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let payment = match msg.successful_payment() {
         Some(p) => p,
@@ -168,37 +201,50 @@ pub async fn handle_successful_payment(
         &payment.invoice_payload,
         &payment.currency,
         payment.total_amount as i32,
-        &db_pool
-    ).await?;
+        &db_pool,
+    )
+    .await?;
 
     if success {
         if let Some(user) = &msg.from {
-            bot.send_message(msg.chat.id, "🎉 Success! Premium activated for 30 days! ✨").await?;
-            log::info!("[PAYMENT_CHAIN] 7. Payment completed. User {} (ID: {}) is now Premium.", user.first_name, user.id);
-            
-            let notify_success = db_pool.get_setting("notify_success").await.map(|v| v == "true").unwrap_or(true);
-            
+            bot.send_message(msg.chat.id, "🎉 Success! Premium activated for 30 days! ✨")
+                .await?;
+            log::info!(
+                "[PAYMENT_CHAIN] 7. Payment completed. User {} (ID: {}) is now Premium.",
+                user.first_name,
+                user.id
+            );
+
+            let notify_success = db_pool
+                .get_setting("notify_success")
+                .await
+                .map(|v| v == "true")
+                .unwrap_or(true);
+
             if notify_success {
                 let admin_ids_str = env::var("ADMIN_IDS").unwrap_or_default();
                 let admin_ids: Vec<i64> = admin_ids_str
                     .split(',')
                     .filter_map(|s| s.trim().parse().ok())
                     .collect();
-                
+
                 let notify_text = format!(
                     "💰 [STARS] Purchase! User @{} (ID: {}) bought Premium for {} Stars.",
                     user.username.as_deref().unwrap_or("unknown"),
                     user.id,
                     payment.total_amount
                 );
-                
+
                 for admin_id in admin_ids {
                     let _ = bot.send_message(ChatId(admin_id), &notify_text).await;
                 }
             }
         }
     } else {
-        log::error!("[PAYMENT_CHAIN] ❌ Validation failed for successful payment from user {}", user_id);
+        log::error!(
+            "[PAYMENT_CHAIN] ❌ Validation failed for successful payment from user {}",
+            user_id
+        );
     }
 
     Ok(())

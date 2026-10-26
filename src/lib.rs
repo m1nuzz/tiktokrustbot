@@ -524,7 +524,7 @@ pub fn build_handler()
                 .branch(Update::filter_message().filter(|msg: Message| msg.text().map(|t| crate::i18n::is_language_button(t)).unwrap_or(false)).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                     language_button_handler(bot, msg, ctx, db_pool).await
                 }))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text().map(|t| !handlers::ui::is_system_button(t)).unwrap_or(false)).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, fetcher: Arc<YoutubeFetcher>, mtproto_uploader: Arc<MTProtoUploader>, db_pool: Arc<DatabasePool>, task_manager: Arc<tokio::sync::Mutex<TaskManager>>, upload_semaphore: Arc<tokio::sync::Semaphore>| async move {
+                .branch(Update::filter_message().filter(|msg: Message| msg.text().map(|t| !handlers::ui::is_system_button(t)).unwrap_or(false)).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, fetcher: Arc<YoutubeFetcher>, mtproto_uploader: Arc<MTProtoUploader>, db_pool: Arc<DatabasePool>, task_manager: Arc<tokio::sync::Mutex<TaskManager>>, upload_semaphore: Arc<tokio::sync::Semaphore>, download_semaphore: Arc<tokio::sync::Semaphore>| async move {
                     let key = format!("{}:{}:{}", msg.chat.id.0, msg.id.0, msg.text().unwrap_or(""));
                     {
                         let mut p = PROCESSING.lock().await;
@@ -540,6 +540,7 @@ pub fn build_handler()
                         db_pool,
                         task_manager,
                         upload_semaphore,
+                        download_semaphore,
                         dedupe_key: key,
                     });
                     Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())

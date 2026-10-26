@@ -1,6 +1,6 @@
+use anyhow::Result;
 use std::path::PathBuf;
 use tokio::fs;
-use anyhow::Result;
 
 pub struct VersionManager {
     storage_dir: PathBuf,

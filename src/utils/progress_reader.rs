@@ -1,5 +1,8 @@
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 use tokio::io::{AsyncRead, ReadBuf};
-use std::{pin::Pin, task::{Context, Poll}};
 
 pub struct ProgressReader<R, F>
 where
@@ -18,7 +21,12 @@ where
     F: Fn(u64, u64) + Send + Sync + 'static + Unpin,
 {
     pub fn new(inner: R, total: u64, on_progress: F) -> Self {
-        Self { inner, uploaded: 0, total, on_progress }
+        Self {
+            inner,
+            uploaded: 0,
+            total,
+            on_progress,
+        }
     }
 }
 
@@ -27,7 +35,11 @@ where
     R: AsyncRead + Unpin,
     F: Fn(u64, u64) + Send + Sync + 'static + Unpin,
 {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         let before = buf.filled().len();
         match Pin::new(&mut this.inner).poll_read(cx, buf) {

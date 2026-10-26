@@ -1,13 +1,13 @@
-use teloxide::prelude::*;
-use teloxide::types::{KeyboardMarkup, KeyboardButton};
-use crate::handlers::admin::is_admin;
-use crate::handlers::ui::{BTN_ADMIN_PANEL, BTN_FORMAT, BTN_SETTINGS, BTN_BACK, BTN_LANGUAGE};
-use std::sync::Arc;
 use crate::database::DatabasePool;
+use crate::handlers::admin::is_admin;
+use crate::handlers::ui::{BTN_ADMIN_PANEL, BTN_BACK, BTN_FORMAT, BTN_LANGUAGE, BTN_SETTINGS};
+use std::sync::Arc;
+use teloxide::prelude::*;
+use teloxide::types::{KeyboardButton, KeyboardMarkup};
 
 pub async fn settings_text_handler(
     bot: Bot,
-    msg: Message
+    msg: Message,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut rows = vec![
         vec![KeyboardButton::new(BTN_FORMAT)],
@@ -32,7 +32,7 @@ pub async fn settings_text_handler(
 
 pub async fn format_text_handler(
     bot: Bot,
-    msg: Message
+    msg: Message,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let keyboard = KeyboardMarkup::new(vec![
         vec![
@@ -56,7 +56,7 @@ pub async fn format_text_handler(
 
 pub async fn back_text_handler(
     bot: Bot,
-    msg: Message
+    msg: Message,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     bot.send_message(msg.chat.id, "Returning to main menu...")
         .reply_markup(crate::handlers::command::get_main_reply_keyboard())
@@ -69,7 +69,7 @@ pub async fn back_text_handler(
 pub async fn subscription_text_handler(
     bot: Bot,
     msg: Message,
-    db_pool: Arc<DatabasePool>
+    db_pool: Arc<DatabasePool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !is_admin(&msg).await {
         bot.send_message(msg.chat.id, "This option is for admins only.")
@@ -78,27 +78,32 @@ pub async fn subscription_text_handler(
         return Ok(());
     }
 
-    let result = db_pool.execute_with_timeout(|conn| {
-        let current_value: String = conn.query_row(
-            "SELECT value FROM settings WHERE key = 'subscription_required'",
-            [],
-            |row| row.get(0),
-        )?;
-        let new_value = !(current_value == "true");
-        conn.execute(
-            "UPDATE settings SET value = ?1 WHERE key = 'subscription_required'",
-            rusqlite::params![new_value.to_string()],
-        )?;
-        Ok(new_value)
-    }).await;
+    let result = db_pool
+        .execute_with_timeout(|conn| {
+            let current_value: String = conn.query_row(
+                "SELECT value FROM settings WHERE key = 'subscription_required'",
+                [],
+                |row| row.get(0),
+            )?;
+            let new_value = !(current_value == "true");
+            conn.execute(
+                "UPDATE settings SET value = ?1 WHERE key = 'subscription_required'",
+                rusqlite::params![new_value.to_string()],
+            )?;
+            Ok(new_value)
+        })
+        .await;
 
     match result {
         Ok(new_value) => {
             let status = if new_value { "enabled" } else { "disabled" };
             log::info!("Subscription setting changed to {} in database", status);
-            bot.send_message(msg.chat.id, format!("Mandatory subscription is now {}", status))
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            bot.send_message(
+                msg.chat.id,
+                format!("Mandatory subscription is now {}", status),
+            )
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         }
         Err(e) => {
             log::error!("ToggleSubscription DB error: {}", e);

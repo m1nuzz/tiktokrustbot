@@ -687,7 +687,7 @@ impl DatabasePool {
         let batch_owned = batch_id.to_string();
         self.execute_with_timeout(move |conn| {
             let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM pending_downloads WHERE batch_id = ?1 AND batch_position < ?2 AND status IN ('pending', 'verified')",
+                "SELECT COUNT(*) FROM pending_downloads WHERE batch_id = ?1 AND batch_position < ?2 AND status IN ('pending', 'verified', 'downloading', 'downloaded')",
                 params![batch_owned, position],
                 |r| r.get(0),
             )?;
@@ -695,6 +695,70 @@ impl DatabasePool {
         })
         .await
         .map_err(|e| anyhow::anyhow!("Failed to check earlier batch rows for {}: {}", batch_id, e))
+    }
+
+    /// Whether an earlier row of the same burst has not finished downloading
+    /// yet. Used by the download phase to start downloads in parallel while
+    /// keeping upload order.
+    pub async fn earlier_downloads_unfinished(
+        &self,
+        batch_id: &str,
+        position: i64,
+    ) -> Result<bool, anyhow::Error> {
+        let batch_owned = batch_id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pending_downloads WHERE batch_id = ?1 AND batch_position < ?2 AND status IN ('pending', 'verified', 'downloading')",
+                params![batch_owned, position],
+                |r| r.get(0),
+            )?;
+            Ok(count > 0)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to check earlier downloads for {}: {}", batch_id, e))
+    }
+
+    pub async fn mark_pending_downloading(&self, id: &str) -> Result<usize, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "UPDATE pending_downloads SET status = 'downloading', job_started_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('pending', 'verified')",
+                params![id_owned],
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to mark {} downloading: {}", id, e))
+    }
+
+    pub async fn mark_pending_downloaded(
+        &self,
+        id: &str,
+        file_path: &str,
+    ) -> Result<usize, anyhow::Error> {
+        let id_owned = id.to_string();
+        let path_owned = file_path.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "UPDATE pending_downloads SET status = 'downloaded', file_path = ?2 WHERE id = ?1",
+                params![id_owned, path_owned],
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to mark {} downloaded: {}", id, e))
+    }
+
+    pub async fn get_pending_file_path(&self, id: &str) -> Result<Option<String>, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.query_row(
+                "SELECT file_path FROM pending_downloads WHERE id = ?1",
+                params![id_owned],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get file path for {}: {}", id, e))
     }
 
     /// Record that a download job really began for this row, returning how
@@ -1997,7 +2061,7 @@ pub(crate) async fn setup_test_db() -> (DatabasePool, tempfile::NamedTempFile) {
             (),
         )?;
         conn.execute(
-            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL, job_started_at DATETIME DEFAULT NULL, entry_ymid TEXT DEFAULT NULL, ad_requested_at DATETIME DEFAULT NULL, bot_id TEXT NOT NULL DEFAULT 'primary', batch_id TEXT DEFAULT NULL, batch_position INTEGER DEFAULT NULL, batch_total INTEGER DEFAULT NULL)",
+            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL, job_started_at DATETIME DEFAULT NULL, entry_ymid TEXT DEFAULT NULL, ad_requested_at DATETIME DEFAULT NULL, bot_id TEXT NOT NULL DEFAULT 'primary', batch_id TEXT DEFAULT NULL, batch_position INTEGER DEFAULT NULL, batch_total INTEGER DEFAULT NULL, file_path TEXT)",
             (),
         )?;
         conn.execute(

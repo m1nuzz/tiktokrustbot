@@ -6,11 +6,14 @@ pub fn get_latest_yt_dlp_url() -> String {
     } else if cfg!(target_os = "macos") {
         "yt-dlp_macos"
     } else {
-        "yt-dlp"  // fallback
+        "yt-dlp" // fallback
     };
-    
+
     // This downloads the latest release from GitHub
-    format!("https://github.com/yt-dlp/yt-dlp/releases/latest/download/{}", os)
+    format!(
+        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/{}",
+        os
+    )
 }
 
 pub fn get_latest_ffmpeg_url() -> String {

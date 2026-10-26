@@ -40,7 +40,9 @@ pub async fn send_photo_post(
                 .collect();
             bot.send_media_group(chat_id, media).await?;
         }
-        progress_bar.update(90, Some("📤 Uploading photos...")).await?;
+        progress_bar
+            .update(90, Some("📤 Uploading photos..."))
+            .await?;
     }
     Ok(())
 }
@@ -75,7 +77,9 @@ pub async fn handle_photo_post(
             .map_err(|e| anyhow::anyhow!("Failed to send photos: {}", e))?;
     }
     if let Some(audio_path) = &files.audio {
-        progress_bar.update(95, Some("📤 Uploading audio...")).await?;
+        progress_bar
+            .update(95, Some("📤 Uploading audio..."))
+            .await?;
         crate::telegram_bot_api_uploader::send_audio_with_progress_botapi(
             &bot.token(),
             chat_id,

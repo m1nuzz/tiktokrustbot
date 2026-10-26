@@ -394,6 +394,7 @@ async fn main() -> Result<(), Error> {
     }
     let task_manager = Arc::new(tokio::sync::Mutex::new(TaskManager::new(2)));
     let upload_semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(2));
 
     // --- Web Server Configuration ---
     // One map entry per configured bot. The first entry doubles as the
@@ -503,7 +504,8 @@ async fn main() -> Result<(), Error> {
                 cfg.uploader,
                 db_pool.clone(),
                 task_manager.clone(),
-                upload_semaphore.clone()
+                upload_semaphore.clone(),
+                download_semaphore.clone()
             ])
             .enable_ctrlc_handler()
             .build();

@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use anyhow::Result;
+use std::path::PathBuf;
 
 pub fn find_dotenv() -> Result<Option<PathBuf>> {
     // 1. Check directory where the executable is located
@@ -27,7 +27,7 @@ pub fn load_environment() -> Result<()> {
         Some(path) => {
             dotenv::from_path(&path)?;
             log::info!("Loaded environment variables from {:?}", path);
-        },
+        }
         None => {
             log::warn!("No .env file found. Using system environment variables.");
         }

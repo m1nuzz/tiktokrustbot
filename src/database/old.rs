@@ -308,6 +308,12 @@ pub fn init_database() -> Result<()> {
         "bot_id",
         "bot_id TEXT NOT NULL DEFAULT 'primary'",
     )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "file_path",
+        "file_path TEXT",
+    )?;
     // Silently retire download requests abandoned before this startup (the
     // user never finished watching the ad). They are marked notified so the
     // expiry sweeper never messages them; only new rows get notified. The

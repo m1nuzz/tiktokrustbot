@@ -1,4 +1,7 @@
-use serde::{de::{self, Deserializer, Visitor}, Deserialize};
+use serde::{
+    Deserialize,
+    de::{self, Deserializer, Visitor},
+};
 use std::fmt;
 
 pub fn de_f64_from_string_or_number<'de, D>(deserializer: D) -> Result<f64, D::Error>
@@ -43,7 +46,8 @@ where
             if s.eq_ignore_ascii_case("N/A") || s.is_empty() {
                 return Ok(0.0);
             }
-            s.parse::<f64>().map_err(|e| E::custom(format!("invalid f64: {} ({})", v, e)))
+            s.parse::<f64>()
+                .map_err(|e| E::custom(format!("invalid f64: {} ({})", v, e)))
         }
 
         fn visit_string<E>(self, v: String) -> Result<f64, E>
@@ -60,13 +64,19 @@ where
 pub struct Stream {
     pub width: u32,
     pub height: u32,
-    #[serde(default, deserialize_with = "crate::mtproto_uploader::video_metadata::de_f64_from_string_or_number")]
+    #[serde(
+        default,
+        deserialize_with = "crate::mtproto_uploader::video_metadata::de_f64_from_string_or_number"
+    )]
     pub duration: f64,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Format {
-    #[serde(default, deserialize_with = "crate::mtproto_uploader::video_metadata::de_f64_from_string_or_number")]
+    #[serde(
+        default,
+        deserialize_with = "crate::mtproto_uploader::video_metadata::de_f64_from_string_or_number"
+    )]
     pub duration: f64,
 }
 

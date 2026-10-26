@@ -1,6 +1,6 @@
-use tokio::process::Command;
-use std::path::Path;
 use anyhow::anyhow;
+use std::path::Path;
+use tokio::process::Command;
 
 use std::path::PathBuf;
 
@@ -35,9 +35,14 @@ pub async fn generate_thumbnail(
     let mut thumbnail_size = std::fs::metadata(output_path)?.len();
     let mut quality = 3; // Start with quality 3
 
-    while thumbnail_size > 200 * 1024 && quality < 31 { // Max 200KB
+    while thumbnail_size > 200 * 1024 && quality < 31 {
+        // Max 200KB
         quality += 2; // Increase quality (lower value means higher quality, so increase to lower quality)
-        log::warn!("Thumbnail size {}KB exceeds 200KB, re-compressing with quality {}", thumbnail_size / 1024, quality);
+        log::warn!(
+            "Thumbnail size {}KB exceeds 200KB, re-compressing with quality {}",
+            thumbnail_size / 1024,
+            quality
+        );
 
         let output = Command::new(ffmpeg_path)
             .arg("-y")
@@ -62,7 +67,10 @@ pub async fn generate_thumbnail(
     }
 
     if thumbnail_size > 200 * 1024 {
-        log::warn!("Thumbnail size {}KB still exceeds 200KB after max compression. Proceeding anyway.", thumbnail_size / 1024);
+        log::warn!(
+            "Thumbnail size {}KB still exceeds 200KB after max compression. Proceeding anyway.",
+            thumbnail_size / 1024
+        );
     }
 
     Ok(())

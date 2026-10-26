@@ -1,5 +1,5 @@
 use teloxide::prelude::*;
-use teloxide::types::{KeyboardMarkup, KeyboardButton};
+use teloxide::types::{KeyboardButton, KeyboardMarkup};
 use teloxide::utils::command::BotCommands;
 
 use crate::commands::Command;
@@ -9,10 +9,7 @@ use crate::i18n::{self, MsgKey};
 use std::sync::Arc;
 
 pub fn get_main_reply_keyboard() -> KeyboardMarkup {
-    KeyboardMarkup::new(vec![vec![
-        KeyboardButton::new("⚙️ Settings"),
-    ]])
-    .resize_keyboard()
+    KeyboardMarkup::new(vec![vec![KeyboardButton::new("⚙️ Settings")]]).resize_keyboard()
 }
 
 /// Parse a /start command, returning the optional deep-link payload.
@@ -32,7 +29,6 @@ pub fn parse_start_payload(text: &str) -> Option<Option<String>> {
             .filter(|s| !s.is_empty()),
     )
 }
-
 
 /// Register the sender and store first-touch referral attribution.
 /// Extracted from the handler so the attribution rule is testable without a Bot:
@@ -78,10 +74,7 @@ pub async fn start_with_payload_handler(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let user_id = msg.chat.id.0;
     let bot_id = ctx.bot_id.as_str();
-    let payload = msg
-        .text()
-        .and_then(parse_start_payload)
-        .flatten();
+    let payload = msg.text().and_then(parse_start_payload).flatten();
 
     if let Err(e) = record_start_attribution(&db_pool, bot_id, user_id, payload.clone()).await {
         log::error!("Failed to update user activity: {}", e);
@@ -91,10 +84,7 @@ pub async fn start_with_payload_handler(
     }
     db_pool.log_funnel_event(bot_id, user_id, "start").await;
 
-    let tg_lang = msg
-        .from
-        .as_ref()
-        .and_then(|u| u.language_code.as_deref());
+    let tg_lang = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
     let lang = db_pool.get_effective_lang(bot_id, user_id, tg_lang).await;
 
     bot.send_message(msg.chat.id, i18n::t(MsgKey::Welcome, Some(lang.as_str())))
@@ -109,7 +99,7 @@ pub async fn command_handler(
     msg: Message,
     cmd: Command,
     ctx: crate::BotCtx,
-    db_pool: Arc<DatabasePool>
+    db_pool: Arc<DatabasePool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let user_id = msg.chat.id.0;
     let bot_id = ctx.bot_id.as_str();
@@ -124,10 +114,7 @@ pub async fn command_handler(
         log::error!("Failed to update user activity: {}", e);
     }
 
-    let tg_lang = msg
-        .from
-        .as_ref()
-        .and_then(|u| u.language_code.as_deref());
+    let tg_lang = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
     let lang = db_pool.get_effective_lang(bot_id, user_id, tg_lang).await;
 
     match cmd {
@@ -174,7 +161,11 @@ mod tests {
         assert_eq!(parse_start_payload("/startsomething"), None);
     }
 
-    async fn ref_code_of(pool: &crate::database::DatabasePool, bot_id: &str, user_id: i64) -> Option<String> {
+    async fn ref_code_of(
+        pool: &crate::database::DatabasePool,
+        bot_id: &str,
+        user_id: i64,
+    ) -> Option<String> {
         let bot_owned = bot_id.to_string();
         pool.execute_with_timeout(move |conn| {
             conn.query_row(
@@ -196,20 +187,32 @@ mod tests {
         record_start_attribution(&pool, "primary", 71, Some("site".to_string()))
             .await
             .unwrap();
-        assert_eq!(ref_code_of(&pool, "primary", 71).await, Some("site".to_string()));
+        assert_eq!(
+            ref_code_of(&pool, "primary", 71).await,
+            Some("site".to_string())
+        );
 
         // A later press must never overwrite the first touch.
         record_start_attribution(&pool, "primary", 71, Some("other".to_string()))
             .await
             .unwrap();
-        assert_eq!(ref_code_of(&pool, "primary", 71).await, Some("site".to_string()));
+        assert_eq!(
+            ref_code_of(&pool, "primary", 71).await,
+            Some("site".to_string())
+        );
 
         // Same human on another bot is a different row: no ref leaks across.
         record_start_attribution(&pool, "bbb", 71, Some("other-bot".to_string()))
             .await
             .unwrap();
-        assert_eq!(ref_code_of(&pool, "bbb", 71).await, Some("other-bot".to_string()));
-        assert_eq!(ref_code_of(&pool, "primary", 71).await, Some("site".to_string()));
+        assert_eq!(
+            ref_code_of(&pool, "bbb", 71).await,
+            Some("other-bot".to_string())
+        );
+        assert_eq!(
+            ref_code_of(&pool, "primary", 71).await,
+            Some("site".to_string())
+        );
     }
 
     /// A `/start` with no payload registers the user without inventing
@@ -218,7 +221,9 @@ mod tests {
     async fn start_without_a_payload_writes_no_ref_code() {
         let (pool, _file) = crate::database::setup_test_db().await;
 
-        record_start_attribution(&pool, "primary", 72, None).await.unwrap();
+        record_start_attribution(&pool, "primary", 72, None)
+            .await
+            .unwrap();
         assert_eq!(ref_code_of(&pool, "primary", 72).await, None);
     }
 }

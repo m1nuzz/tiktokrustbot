@@ -70,6 +70,7 @@ pub struct LinkJob {
     pub db_pool: Arc<DatabasePool>,
     pub task_manager: Arc<tokio::sync::Mutex<TaskManager>>,
     pub upload_semaphore: Arc<tokio::sync::Semaphore>,
+    pub download_semaphore: Arc<tokio::sync::Semaphore>,
     pub dedupe_key: String,
 }
 
@@ -403,6 +404,7 @@ pub async fn link_handler(
         db_pool,
         task_manager,
         upload_semaphore,
+        download_semaphore,
         ..
     } = job;
     let user_id = msg.chat.id.0;
@@ -686,6 +688,7 @@ pub async fn link_handler(
         db_pool,
         task_manager,
         upload_semaphore,
+        download_semaphore,
         msg.chat
             .username()
             .map(|s| s.to_string())
@@ -738,6 +741,7 @@ pub async fn handle_yt_pick_callback(
     db_pool: Arc<DatabasePool>,
     task_manager: Arc<tokio::sync::Mutex<TaskManager>>,
     upload_semaphore: Arc<tokio::sync::Semaphore>,
+    download_semaphore: Arc<tokio::sync::Semaphore>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = bot.answer_callback_query(q.id.clone()).await;
 
@@ -794,6 +798,7 @@ pub async fn handle_yt_pick_callback(
         db_pool,
         task_manager,
         upload_semaphore,
+        download_semaphore,
         pick.username.clone(),
         ChatId(pick.chat_id),
         pick.lang.clone(),
@@ -832,6 +837,7 @@ pub async fn process_video_request(
     db_pool: Arc<DatabasePool>,
     _task_manager: Arc<tokio::sync::Mutex<TaskManager>>,
     upload_semaphore: Arc<tokio::sync::Semaphore>,
+    download_semaphore: Arc<tokio::sync::Semaphore>,
     username: Option<String>,
     chat_id: ChatId,
     lang: Option<String>,
@@ -856,7 +862,7 @@ pub async fn process_video_request(
             let notifier = batch_notifier(&batch_id);
             let deadline = std::time::Instant::now() + Duration::from_secs(1800);
             while db_pool
-                .earlier_batch_rows_unfinished(&batch_id, position)
+                .earlier_downloads_unfinished(&batch_id, position)
                 .await
                 .unwrap_or(false)
             {
@@ -865,7 +871,7 @@ pub async fn process_video_request(
                 }
                 let notified = notifier.notified();
                 if !db_pool
-                    .earlier_batch_rows_unfinished(&batch_id, position)
+                    .earlier_downloads_unfinished(&batch_id, position)
                     .await
                     .unwrap_or(false)
                 {
@@ -891,11 +897,14 @@ pub async fn process_video_request(
     let fingerprint = crate::handlers::fingerprint::get_current_fingerprint(db_pool.clone()).await;
     let is_audio = quality_preference == "audio";
 
-    // Acquire upload permit
-    let _permit = upload_semaphore
+    // Acquire download permit
+    let _download_permit = download_semaphore
         .acquire()
         .await
         .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
+    if let Some(ymid) = ymid.as_deref() {
+        let _ = db_pool.mark_pending_downloading(ymid).await;
+    }
 
     progress_bar.update(5, Some("⬇️ Downloading...")).await?;
 
@@ -961,6 +970,50 @@ pub async fn process_video_request(
 
         let _guard = TempFileGuard::new(path.clone());
         let file_size = fs::metadata(&path)?.len();
+
+        // Mark download finished so the next batch item can start downloading
+        // while this one uploads.
+        if let Some(ymid) = ymid.as_deref() {
+            let _ = db_pool.mark_pending_downloaded(ymid, &path).await;
+            if let Ok(Some((batch_id, _, _))) = db_pool.get_batch_info(ymid).await {
+                batch_notifier(&batch_id).notify_waiters();
+            }
+        }
+
+        // Wait for earlier rows to finish uploading before starting our upload.
+        if let Some(ymid) = ymid.as_deref() {
+            if let Ok(Some((batch_id, position, _total))) = db_pool.get_batch_info(ymid).await {
+                let notifier = batch_notifier(&batch_id);
+                let deadline = std::time::Instant::now() + Duration::from_secs(1800);
+                while db_pool
+                    .earlier_batch_rows_unfinished(&batch_id, position)
+                    .await
+                    .unwrap_or(false)
+                {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    let notified = notifier.notified();
+                    if !db_pool
+                        .earlier_batch_rows_unfinished(&batch_id, position)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = notified => {}
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    }
+                }
+            }
+        }
+
+        // Acquire upload permit
+        let _upload_permit = upload_semaphore
+            .acquire()
+            .await
+            .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
 
         if file_size > TELEGRAM_BOT_API_FILE_LIMIT {
             progress_bar

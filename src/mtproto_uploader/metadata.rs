@@ -1,11 +1,14 @@
-use serde_json;
-use tokio::process::Command;
-use std::path::Path;
 use anyhow::anyhow;
+use serde_json;
+use std::path::Path;
+use tokio::process::Command;
 
 use crate::mtproto_uploader::video_metadata::{FFProbeOutput, Stream};
 
-pub async fn get_video_metadata(ffprobe_path: &str, file_path: &Path) -> Result<Stream, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn get_video_metadata(
+    ffprobe_path: &str,
+    file_path: &Path,
+) -> Result<Stream, Box<dyn std::error::Error + Send + Sync>> {
     let output = Command::new(ffprobe_path)
         .arg("-v")
         .arg("error")
@@ -26,7 +29,11 @@ pub async fn get_video_metadata(ffprobe_path: &str, file_path: &Path) -> Result<
     }
 
     let ff: FFProbeOutput = serde_json::from_slice(&output.stdout)?;
-    let mut s = ff.streams.into_iter().next().ok_or_else(|| anyhow::anyhow!("No video stream"))?;
+    let mut s = ff
+        .streams
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No video stream"))?;
 
     if s.duration <= 0.0 {
         if let Some(fmt) = ff.format {
