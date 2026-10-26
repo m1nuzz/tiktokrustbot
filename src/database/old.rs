@@ -306,6 +306,10 @@ pub fn init_database() -> Result<()> {
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('admin_ads_enabled', 'false')",
         (),
     )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('admin_subscription_enabled', 'false')",
+        (),
+    )?;
     // Multi-bot registry and per-bot settings. Tokens live in env only and
     // never reach the database; rows carry bot_id, this table maps it back to
     // a username for readable reports. The 'primary' row attributes legacy

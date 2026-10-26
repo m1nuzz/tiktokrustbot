@@ -54,6 +54,7 @@ pub enum BroadcastState {
     WaitingForConfirmation { message: String, scope: BroadcastScope },
     WaitingForAddPremiumUserId,
     WaitingForSetPrice,
+    WaitingForSubscriptionChannels,
 }
 
 /// Target send rate: 20-22 msg/s stays under the ~30/s Bot API limit with

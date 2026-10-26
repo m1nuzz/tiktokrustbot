@@ -2,6 +2,9 @@ pub const BTN_ADMIN_PANEL: &str = "Admin Panel";
 pub const BTN_SETTINGS: &str = "⚙️ Settings";
 pub const BTN_FORMAT: &str = "Format";
 pub const BTN_SUBSCRIPTION: &str = "Subscription";
+pub const BTN_SUBSCRIPTION_TOGGLE: &str = "Subscription: ";
+pub const BTN_SUBSCRIPTION_ADMIN_TOGGLE: &str = "Subscription admin: ";
+pub const BTN_SET_CHANNELS: &str = "Set channels";
 pub const BTN_TOGGLE_ADS: &str = "Ads: ";
 pub const BTN_TOGGLE_SUCCESS_NOTIFS: &str = "Notify Success: ";
 pub const BTN_TOGGLE_FAIL_NOTIFS: &str = "Notify Fail: ";
@@ -25,11 +28,13 @@ pub fn is_system_button(text: &str) -> bool {
     matches!(
         text,
         BTN_ADMIN_PANEL | BTN_SETTINGS | BTN_FORMAT | BTN_SUBSCRIPTION | BTN_BACK |
-        BTN_LANGUAGE | BTN_AUTO_DETECT |
+        BTN_LANGUAGE | BTN_AUTO_DETECT | BTN_SET_CHANNELS |
         "📢 Broadcast" | "📊 Stats" | "🏆 Top 10" | "👥 All users" | "💎 Premium Users" | "➕ Add Premium User" |
         "📈 Stats" | "📅 Week" | "🔻 Funnel" |
         "h265" | "h264" | "audio" | BTN_PRICE
-    ) || text.starts_with(BTN_TOGGLE_ADS)
+    ) || text.starts_with(BTN_SUBSCRIPTION_TOGGLE)
+      || text.starts_with(BTN_SUBSCRIPTION_ADMIN_TOGGLE)
+      || text.starts_with(BTN_TOGGLE_ADS)
       || text.starts_with(BTN_TOGGLE_SUCCESS_NOTIFS)
       || text.starts_with(BTN_TOGGLE_FAIL_NOTIFS)
       || text.starts_with(BTN_PRICE)
@@ -58,5 +63,14 @@ mod tests {
         assert!(is_system_button(BTN_LANGUAGE));
         assert!(is_system_button(BTN_PRICE));
         assert!(is_system_button(&format!("{}: 50 ⭐", BTN_PRICE)));
+    }
+
+    #[test]
+    fn subscription_submenu_buttons_are_system_but_not_menu() {
+        assert!(is_system_button(BTN_SET_CHANNELS));
+        assert!(is_system_button(&format!("{}ON ✅", BTN_SUBSCRIPTION_TOGGLE)));
+        assert!(is_system_button(&format!("{}OFF ❌", BTN_SUBSCRIPTION_ADMIN_TOGGLE)));
+        assert!(!is_menu_button(BTN_SET_CHANNELS));
+        assert!(!is_menu_button(&format!("{}ON ✅", BTN_SUBSCRIPTION_TOGGLE)));
     }
 }

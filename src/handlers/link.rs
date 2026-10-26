@@ -10,7 +10,7 @@ use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 use crate::database::DatabasePool;
-use crate::handlers::admin::is_admin;
+use crate::handlers::admin::{is_admin, is_admin_id};
 use crate::handlers::subscription::check_subscription;
 use crate::BotCtx;
 use crate::handlers::ui::is_menu_button;
@@ -303,24 +303,6 @@ fn extract_url_from_text(text: &str) -> Option<String> {
     }
 }
 
-async fn get_subscription_required(
-    db_pool: &DatabasePool,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let result = db_pool
-        .execute_with_timeout(|conn| {
-            match conn.query_row(
-                "SELECT value FROM settings WHERE key = 'subscription_required'",
-                [],
-                |row| Ok(row.get::<_, String>(0)? == "true"),
-            ) {
-                Ok(value) => Ok(value),
-                Err(_) => Ok(true), // Default to true
-            }
-        })
-        .await?;
-    Ok(result)
-}
-
 /// Single source of truth for "should this user see the ad flow?".
 /// Mirrors the admin-panel toggles: global `ads_enabled` gates regular users,
 /// `admin_ads_enabled` (or TEST_MODE) forces ads for admins to test.
@@ -402,6 +384,24 @@ pub async fn link_handler(
         }
     };
 
+    // Subscription gate runs before the ad choice, the YouTube picker and any
+    // pending row. In a burst only the first item speaks, so the user gets one
+    // message instead of one per link; the rest return silently.
+    let is_user_admin = is_admin(&msg).await;
+    if !check_subscription(&bot, &db_pool, user_id as i64, is_user_admin)
+        .await
+        .unwrap_or(true)
+    {
+        if batch.as_ref().map_or(true, |info| info.position == 1) {
+            bot.send_message(
+                msg.chat.id,
+                i18n::t(MsgKey::SubscribeRequired, Some(lang.as_str())),
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+
     // Deduplication. The guard releases the URL on every exit path, including errors.
     let _url_processing_guard = match UrlProcessingGuard::try_acquire(&url) {
         Some(guard) => guard,
@@ -466,7 +466,6 @@ pub async fn link_handler(
     }
 
     // Mini App Ad invitation logic (single source of truth, shared with /api/ads-status)
-    let is_user_admin = is_admin(&msg).await;
     let ads_enabled = ads_enabled_for(&db_pool, bot_id, user_id as i64, is_user_admin).await;
 
     if ads_enabled {
@@ -767,18 +766,18 @@ pub async fn process_video_request(
     // Acquire upload permit
     let _permit = upload_semaphore.acquire().await.map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
 
-    let subscription_required = get_subscription_required(&db_pool).await.unwrap_or(true);
-    if subscription_required {
-        if !check_subscription(&bot, user_id).await.unwrap_or(false) {
-            let admins: Vec<i64> = std::env::var("ADMIN_IDS").unwrap_or_default()
-                .split(',').filter_map(|s| s.trim().parse().ok()).collect();
-
-            if !admins.contains(&user_id) {
-                bot.send_message(chat_id, i18n::t(MsgKey::SubscribeRequired, lang.as_deref())).await?;
-                notify_batch_outcome(ymid.as_deref(), BatchOutcome::Failed);
-                return Ok(());
-            }
-        }
+    let is_user_admin = is_admin_id(user_id);
+    if !check_subscription(&bot, &db_pool, user_id, is_user_admin)
+        .await
+        .unwrap_or(true)
+    {
+        bot.send_message(
+            chat_id,
+            i18n::t(MsgKey::SubscribeRequired, lang.as_deref()),
+        )
+        .await?;
+        notify_batch_outcome(ymid.as_deref(), BatchOutcome::Failed);
+        return Ok(());
     }
 
     let mut progress_bar = ProgressBar::new(bot.clone(), chat_id);

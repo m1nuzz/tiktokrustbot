@@ -319,6 +319,9 @@ async fn main() -> Result<(), Error> {
             let _ = db_pool.set_setting("ads_enabled", val).await;
         }
     }
+    if let Err(e) = db_pool.seed_channels_from_env().await {
+        log::error!("Failed to seed channels from CHANNEL_IDS: {}", e);
+    }
 
     let task_manager = Arc::new(tokio::sync::Mutex::new(TaskManager::new(2)));
     let upload_semaphore = Arc::new(tokio::sync::Semaphore::new(2));

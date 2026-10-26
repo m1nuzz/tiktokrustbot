@@ -20,14 +20,16 @@ use handlers::{
     receive_broadcast_message, add_premium_user_handler, start_broadcast,
     handle_broadcast_confirmation, handle_scope_selection, handle_scope_text,
     admin_panel_text_handler, command_handler,
-    settings_text_handler, format_text_handler, subscription_text_handler,
+    settings_text_handler, format_text_handler,
     back_text_handler, link_handler, BTN_BROADCAST, set_price_handler, premium_price_for,
     all_users_text_handler, stats_text_handler, top10_text_handler, premium_users_text_handler,
     daily_stats_text_handler, admin_ads_text_handler, language_button_handler, language_menu_handler,
     weekly_stats_text_handler, start_with_payload_handler, funnel_text_handler,
+    subscription_menu_handler, subscription_toggle_handler, subscription_admin_toggle_handler,
+    set_channels_prompt_handler, set_channels_handler,
 };
 use handlers::link::{BatchInfo, LinkJob};
-use handlers::ui::{BTN_ADMIN_PANEL, BTN_BACK, BTN_FORMAT, BTN_SETTINGS, BTN_SUBSCRIPTION, BTN_LANGUAGE, BTN_AUTO_DETECT, BTN_PRICE};
+use handlers::ui::{BTN_ADMIN_PANEL, BTN_BACK, BTN_FORMAT, BTN_SETTINGS, BTN_SUBSCRIPTION, BTN_SUBSCRIPTION_TOGGLE, BTN_SUBSCRIPTION_ADMIN_TOGGLE, BTN_SET_CHANNELS, BTN_LANGUAGE, BTN_AUTO_DETECT, BTN_PRICE};
 use database::DatabasePool;
 use mtproto_uploader::MTProtoUploader;
 use yt_dlp_interface::YoutubeFetcher;
@@ -258,6 +260,19 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                         }))
                         .branch(dptree::case![BroadcastState::WaitingForAddPremiumUserId].endpoint(add_premium_user_handler))
                         .branch(dptree::case![BroadcastState::WaitingForSetPrice].endpoint(set_price_handler))
+                        .branch(dptree::case![BroadcastState::WaitingForSubscriptionChannels].endpoint(set_channels_handler))
+                        .branch(dptree::case![BroadcastState::Idle]
+                                .filter(|msg: Message| msg.text() == Some(BTN_SUBSCRIPTION))
+                                .endpoint(subscription_menu_handler))
+                        .branch(dptree::case![BroadcastState::Idle]
+                                .filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(BTN_SUBSCRIPTION_TOGGLE)))
+                                .endpoint(subscription_toggle_handler))
+                        .branch(dptree::case![BroadcastState::Idle]
+                                .filter(|msg: Message| msg.text().map_or(false, |t| t.starts_with(BTN_SUBSCRIPTION_ADMIN_TOGGLE)))
+                                .endpoint(subscription_admin_toggle_handler))
+                        .branch(dptree::case![BroadcastState::Idle]
+                                .filter(|msg: Message| msg.text() == Some(BTN_SET_CHANNELS))
+                                .endpoint(set_channels_prompt_handler))
                         .branch(dptree::case![BroadcastState::Idle]
                                 .filter(|msg: Message| msg.text().map(|t| t == BTN_BROADCAST).unwrap_or(false))
                                 .endpoint(start_broadcast))
@@ -417,7 +432,6 @@ pub fn build_handler() -> Handler<'static, Result<(), Box<dyn std::error::Error 
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some("💎 Premium Users")).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                     premium_users_text_handler(bot, msg, ctx, db_pool).await
                 }))
-                .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_SUBSCRIPTION)).endpoint(subscription_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_BACK)).endpoint(back_text_handler))
                 .branch(Update::filter_message().filter(|msg: Message| msg.text() == Some(BTN_LANGUAGE)).endpoint(|bot: Bot, msg: Message, ctx: BotCtx, db_pool: Arc<DatabasePool>| async move {
                     language_menu_handler(bot, msg, ctx, db_pool).await

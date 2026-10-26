@@ -3,12 +3,15 @@ use teloxide::types::{KeyboardMarkup, KeyboardButton};
 use teloxide::dispatching::dialogue::{InMemStorage, Dialogue};
 use crate::handlers::admin::is_admin;
 use crate::handlers::ui::{
-    BTN_ADMIN_PANEL, BTN_SUBSCRIPTION, BTN_BACK, BTN_PRICE,
+    BTN_ADMIN_PANEL, BTN_SUBSCRIPTION, BTN_SUBSCRIPTION_TOGGLE,
+    BTN_SUBSCRIPTION_ADMIN_TOGGLE, BTN_SET_CHANNELS, BTN_BACK, BTN_PRICE,
     BTN_TOGGLE_ADS, BTN_TOGGLE_SUCCESS_NOTIFS, BTN_TOGGLE_FAIL_NOTIFS
 };
 use crate::database::DatabasePool;
 use crate::handlers::broadcast::BroadcastState;
+use crate::handlers::subscription::{channel_recipient, parse_channel_tokens};
 use crate::BotCtx;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 pub const BTN_BROADCAST: &str = "📢 Broadcast";
@@ -566,6 +569,264 @@ pub async fn admin_ads_text_handler(
     db_pool.set_setting("admin_ads_enabled", next).await?;
     
     admin_panel_text_handler(bot, msg, ctx, db_pool).await
+}
+
+pub async fn subscription_menu_handler(
+    bot: Bot,
+    msg: Message,
+    db_pool: Arc<DatabasePool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !is_admin(&msg).await {
+        return Ok(());
+    }
+
+    let required = db_pool
+        .get_setting("subscription_required")
+        .await
+        .map(|value| value == "true")
+        .unwrap_or(true);
+    let admin_test = db_pool
+        .get_setting("admin_subscription_enabled")
+        .await
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    let channels = match db_pool.list_channels().await {
+        Ok(channels) => channels,
+        Err(e) => {
+            log::error!("Failed to list subscription channels: {}", e);
+            Vec::new()
+        }
+    };
+
+    let mut text = format!(
+        "Subscription\nStatus: {}\nAdmin test: {}\nChannels: {}",
+        if required { "ON ✅" } else { "OFF ❌" },
+        if admin_test { "ON ✅" } else { "OFF ❌" },
+        channels.len()
+    );
+    if channels.is_empty() {
+        text.push_str("\n\n⚠️ No channels configured: checks are inactive.");
+    } else {
+        text.push_str("\n\n");
+        for (index, (id, name)) in channels.iter().enumerate() {
+            match name.as_deref().filter(|name| !name.is_empty()) {
+                Some(name) => text.push_str(&format!("{}. {} ({})\n", index + 1, name, id)),
+                None => text.push_str(&format!("{}. {}\n", index + 1, id)),
+            }
+        }
+    }
+
+    let keyboard = KeyboardMarkup::new(vec![
+        vec![KeyboardButton::new(format!(
+            "{}{}",
+            BTN_SUBSCRIPTION_TOGGLE,
+            if required { "ON ✅" } else { "OFF ❌" }
+        ))],
+        vec![KeyboardButton::new(format!(
+            "{}{}",
+            BTN_SUBSCRIPTION_ADMIN_TOGGLE,
+            if admin_test { "ON ✅" } else { "OFF ❌" }
+        ))],
+        vec![KeyboardButton::new(BTN_SET_CHANNELS)],
+        vec![KeyboardButton::new(BTN_ADMIN_PANEL)],
+    ])
+    .resize_keyboard();
+
+    bot.send_message(msg.chat.id, text)
+        .reply_markup(keyboard)
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+    Ok(())
+}
+
+pub async fn subscription_toggle_handler(
+    bot: Bot,
+    msg: Message,
+    db_pool: Arc<DatabasePool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !is_admin(&msg).await {
+        return Ok(());
+    }
+
+    let current = db_pool
+        .get_setting("subscription_required")
+        .await
+        .map(|value| value == "true")
+        .unwrap_or(true);
+    let next = if current { "false" } else { "true" };
+    if let Err(e) = db_pool.set_setting("subscription_required", next).await {
+        log::error!("Failed to toggle subscription_required: {}", e);
+        bot.send_message(msg.chat.id, "❌ Database error.").await?;
+        return Ok(());
+    }
+
+    subscription_menu_handler(bot, msg, db_pool).await
+}
+
+pub async fn subscription_admin_toggle_handler(
+    bot: Bot,
+    msg: Message,
+    db_pool: Arc<DatabasePool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !is_admin(&msg).await {
+        return Ok(());
+    }
+
+    let current = db_pool
+        .get_setting("admin_subscription_enabled")
+        .await
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    let next = if current { "false" } else { "true" };
+    if let Err(e) = db_pool
+        .set_setting("admin_subscription_enabled", next)
+        .await
+    {
+        log::error!("Failed to toggle admin_subscription_enabled: {}", e);
+        bot.send_message(msg.chat.id, "❌ Database error.").await?;
+        return Ok(());
+    }
+
+    subscription_menu_handler(bot, msg, db_pool).await
+}
+
+pub async fn set_channels_prompt_handler(
+    bot: Bot,
+    dialogue: MyDialogue,
+    msg: Message,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !is_admin(&msg).await {
+        return Ok(());
+    }
+
+    bot.send_message(
+        msg.chat.id,
+        "Send channel IDs or @usernames separated by spaces (commas and t.me links also work).\n\
+         The bot must be an administrator in every channel.\n\
+         /cancel to abort.",
+    )
+    .await?;
+    dialogue
+        .update(BroadcastState::WaitingForSubscriptionChannels)
+        .await?;
+
+    Ok(())
+}
+
+pub async fn set_channels_handler(
+    bot: Bot,
+    dialogue: MyDialogue,
+    msg: Message,
+    ctx: BotCtx,
+    db_pool: Arc<DatabasePool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !is_admin(&msg).await {
+        return Ok(());
+    }
+
+    let Some(text) = msg.text() else {
+        return Ok(());
+    };
+    let text = text.trim();
+
+    if text == "/cancel" {
+        bot.send_message(msg.chat.id, "❌ Cancelled.").await?;
+        dialogue.exit().await?;
+        return subscription_menu_handler(bot, msg, db_pool).await;
+    }
+
+    if text == BTN_ADMIN_PANEL {
+        dialogue.exit().await?;
+        return admin_panel_text_handler(bot, msg, ctx, db_pool).await;
+    }
+
+    if text == BTN_SUBSCRIPTION {
+        dialogue.exit().await?;
+        return subscription_menu_handler(bot, msg, db_pool).await;
+    }
+
+    let tokens = parse_channel_tokens(text);
+    if tokens.is_empty() {
+        bot.send_message(
+            msg.chat.id,
+            "⚠️ No channel IDs found. Send IDs or @usernames separated by spaces (or /cancel):",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let admin_id = msg.from.as_ref().map(|user| user.id.0 as i64).unwrap_or(0);
+    let mut resolved = Vec::new();
+    let mut seen = HashSet::new();
+
+    for token in tokens {
+        let recipient = channel_recipient(&token);
+        let chat = match bot.get_chat(recipient.clone()).await {
+            Ok(chat) => chat,
+            Err(e) => {
+                log::error!("Failed to resolve channel {}: {}", token, e);
+                bot.send_message(
+                    msg.chat.id,
+                    format!(
+                        "❌ Channel {} is inaccessible. Check the ID/username and that the bot is a member.",
+                        token
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        if !chat.is_channel() {
+            bot.send_message(msg.chat.id, format!("❌ {} is not a channel.", token))
+                .await?;
+            return Ok(());
+        }
+
+        if let Err(e) = bot
+            .get_chat_member(recipient, teloxide::types::UserId(admin_id as u64))
+            .await
+        {
+            log::error!(
+                "Failed to verify membership check for channel {}: {}",
+                token,
+                e
+            );
+            bot.send_message(
+                msg.chat.id,
+                format!(
+                    "❌ Cannot check members in {}. Add the bot as an administrator there.",
+                    token
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let canonical_id = chat.id.0.to_string();
+        if !seen.insert(canonical_id.clone()) {
+            continue;
+        }
+        let name = chat
+            .title()
+            .map(|title| title.to_string())
+            .or_else(|| chat.username().map(|username| username.to_string()))
+            .unwrap_or_else(|| canonical_id.clone());
+        resolved.push((canonical_id, name));
+    }
+
+    let count = resolved.len();
+    if let Err(e) = db_pool.replace_channels(resolved).await {
+        log::error!("Failed to replace subscription channels: {}", e);
+        bot.send_message(msg.chat.id, "❌ Database error.").await?;
+        return Ok(());
+    }
+
+    bot.send_message(msg.chat.id, format!("✅ Channels updated: {}", count))
+        .await?;
+    dialogue.exit().await?;
+    subscription_menu_handler(bot, msg, db_pool).await
 }
 
 pub async fn premium_users_text_handler(

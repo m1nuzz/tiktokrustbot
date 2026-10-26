@@ -322,6 +322,79 @@ impl DatabasePool {
         }).await.map_err(|e| anyhow::anyhow!("Failed to set setting {}: {}", key, e))
     }
 
+    /// All channels the subscription gate checks, in insertion order.
+    pub async fn list_channels(&self) -> Result<Vec<(String, Option<String>)>, anyhow::Error> {
+        self.execute_with_timeout(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT channel_id, channel_name FROM channels ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to list channels: {}", e))
+    }
+
+    /// Replace the whole channel list atomically. Admin input is a complete
+    /// list, not an append operation.
+    pub async fn replace_channels(
+        &self,
+        channels: Vec<(String, String)>,
+    ) -> Result<(), anyhow::Error> {
+        self.execute_with_timeout(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM channels", [])?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO channels (channel_id, channel_name) VALUES (?1, ?2)",
+                )?;
+                for (id, name) in &channels {
+                    stmt.execute(params![id.as_str(), name.as_str()])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to replace channels: {}", e))
+    }
+
+    /// One-time compatibility import: if the channels table is still empty,
+    /// copy the legacy comma-separated `CHANNEL_IDS` env into it. After this
+    /// the database is the only source of truth.
+    pub async fn seed_channels_from_env(&self) -> Result<(), anyhow::Error> {
+        let raw = std::env::var("CHANNEL_IDS").unwrap_or_default();
+        if raw.trim().is_empty() {
+            return Ok(());
+        }
+        if !self.list_channels().await?.is_empty() {
+            return Ok(());
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let channels: Vec<(String, String)> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .filter(|id| seen.insert((*id).to_string()))
+            .map(|id| (id.to_string(), String::new()))
+            .collect();
+
+        if channels.is_empty() {
+            return Ok(());
+        }
+        self.replace_channels(channels).await
+    }
+
     /// Register a bot by its stable numeric id (token prefix). Idempotent:
     /// re-registering refreshes the username. Tokens never reach the database.
     pub async fn register_bot(&self, bot_id: &str, username: &str) -> Result<(), anyhow::Error> {
@@ -1439,6 +1512,10 @@ pub(crate) async fn setup_test_db() -> (DatabasePool, tempfile::NamedTempFile) {
         )?;
         conn.execute(
             "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE channels (id INTEGER PRIMARY KEY, channel_id TEXT UNIQUE NOT NULL, channel_name TEXT)",
             (),
         )?;
         conn.execute(
