@@ -799,6 +799,11 @@ pub async fn process_video_request(
     // Success and fail_request notify first; this guard covers early `?` exits.
     let _batch_failure_guard = BatchFailureGuard(ymid.clone());
 
+    // Acknowledge immediately so the user sees feedback while the burst is
+    // still being collected / the job waits for its turn.
+    let mut progress_bar = ProgressBar::new(bot.clone(), chat_id);
+    progress_bar.start("🎬 Starting...").await?;
+
     // A burst is delivered in message order even when several of its videos
     // are claimed at once: wait here until every earlier row of the same
     // burst has finished (completed/failed/expired) before sending this one.
@@ -836,19 +841,6 @@ pub async fn process_video_request(
         .await
         .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
 
-    let is_user_admin = is_admin_id(user_id);
-    if !check_subscription(&bot, &db_pool, user_id, is_user_admin)
-        .await
-        .unwrap_or(true)
-    {
-        bot.send_message(chat_id, i18n::t(MsgKey::SubscribeRequired, lang.as_deref()))
-            .await?;
-        notify_batch_outcome(ymid.as_deref(), BatchOutcome::Failed);
-        return Ok(());
-    }
-
-    let mut progress_bar = ProgressBar::new(bot.clone(), chat_id);
-    progress_bar.start("🎬 Starting...").await?;
     progress_bar.update(5, Some("⬇️ Downloading...")).await?;
 
     // Whole-job budget (Tier 2): download attempts + upload must finish

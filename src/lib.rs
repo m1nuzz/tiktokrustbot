@@ -190,7 +190,7 @@ fn enqueue_link_job(job: LinkJob) {
 async fn run_link_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<LinkJob>) {
     while let Some(first) = rx.recv().await {
         let mut jobs = vec![first];
-        let deadline = std::time::Instant::now() + Duration::from_millis(800);
+        let deadline = std::time::Instant::now() + Duration::from_millis(250);
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
