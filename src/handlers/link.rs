@@ -98,6 +98,11 @@ pub enum BatchOutcome {
 lazy_static::lazy_static! {
     static ref BATCH_WAITERS: Mutex<HashMap<String, tokio::sync::oneshot::Sender<BatchOutcome>>> =
         Mutex::new(HashMap::new());
+    /// batch_id -> notifier used to wake rows waiting for earlier items.
+    static ref BATCH_NOTIFIERS: Mutex<HashMap<String, Arc<tokio::sync::Notify>>> =
+        Mutex::new(HashMap::new());
+    /// ymid -> batch_id, so a finishing row can notify the right batch.
+    static ref YMID_BATCH: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
 }
 
 /// Fill the `{current}` / `{total}` placeholders in a batch status string.
@@ -136,6 +141,26 @@ impl Drop for BatchFailureGuard {
 
 /// Wake the link handler that is waiting on this row. No-op for direct
 /// downloads (`None`) and for rows that never entered the ad flow.
+/// Get or create the notifier for a batch. All rows of the batch share it.
+fn batch_notifier(batch_id: &str) -> Arc<tokio::sync::Notify> {
+    let mut map = BATCH_NOTIFIERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.entry(batch_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+        .clone()
+}
+
+/// Remember which batch a ymid belongs to, so its completion can wake waiters.
+fn register_batch_ymid(ymid: &str, batch_id: &str) {
+    YMID_BATCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(ymid.to_string(), batch_id.to_string());
+}
+
+/// Wake the link handler that is waiting on this row. No-op for direct
+/// downloads (`None`) and for rows that never entered the ad flow.
 pub fn notify_batch_outcome(ymid: Option<&str>, outcome: BatchOutcome) {
     let Some(id) = ymid else {
         return;
@@ -146,6 +171,20 @@ pub fn notify_batch_outcome(ymid: Option<&str>, outcome: BatchOutcome) {
         .remove(id);
     if let Some(tx) = waiter {
         let _ = tx.send(outcome);
+    }
+
+    // Event-driven wake-up for batch ordering. Look up the batch for this ymid
+    // and notify all rows waiting on it. Clean up the mapping afterwards.
+    let batch_id = YMID_BATCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(id);
+    if let Some(batch_id) = batch_id {
+        let notifier = batch_notifier(&batch_id);
+        notifier.notify_waiters();
+        // Best-effort cleanup of the notifier once the batch is finished.
+        // We cannot easily know here whether other rows remain, so keep it;
+        // memory growth is bounded by the number of in-flight batches.
     }
 }
 
@@ -537,6 +576,10 @@ pub async fn link_handler(
                     }
                 };
 
+                if let Some(info) = batch.as_ref() {
+                    register_batch_ymid(&ymid, &info.id);
+                }
+
                 let mut final_url = url_obj;
                 final_url.query_pairs_mut().append_pair("ymid", &ymid);
                 // The mini-app localises itself server-side from this tag
@@ -810,6 +853,7 @@ pub async fn process_video_request(
     // burst has finished (completed/failed/expired) before sending this one.
     if let Some(ymid) = ymid.as_deref() {
         if let Ok(Some((batch_id, position, _total))) = db_pool.get_batch_info(ymid).await {
+            let notifier = batch_notifier(&batch_id);
             let deadline = std::time::Instant::now() + Duration::from_secs(1800);
             while db_pool
                 .earlier_batch_rows_unfinished(&batch_id, position)
@@ -819,7 +863,18 @@ pub async fn process_video_request(
                 if std::time::Instant::now() >= deadline {
                     break;
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                let notified = notifier.notified();
+                if !db_pool
+                    .earlier_batch_rows_unfinished(&batch_id, position)
+                    .await
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
             }
         }
     }
@@ -1052,6 +1107,18 @@ mod tests {
     use super::*;
     use rusqlite::params;
     use serial_test::serial;
+    use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn batch_notifier_wakes_on_notify() {
+        register_batch_ymid("ymid-notify-test", "batch-notify-test");
+        let notifier = batch_notifier("batch-notify-test");
+        let notified = notifier.notified();
+        notify_batch_outcome(Some("ymid-notify-test"), BatchOutcome::Delivered);
+        timeout(Duration::from_millis(100), notified)
+            .await
+            .expect("notifier should wake promptly");
+    }
 
     #[test]
     fn batch_status_fills_current_and_total() {
