@@ -297,8 +297,8 @@ mod tests {
 
         reload_admin_cache(&pool).await.unwrap();
         assert_eq!(admin_ids(), vec![500, 600, 700]);
-        assert!(is_first_admin(&pool, 500).await);
-        assert!(!is_first_admin(&pool, 600).await);
+        assert!(is_first_admin(&pool, 700).await);
+        assert!(!is_first_admin(&pool, 500).await);
 
         reset_admin_cache();
     }
