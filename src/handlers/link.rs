@@ -1050,6 +1050,10 @@ pub async fn process_video_request(
                         upload_start.elapsed(),
                         path.display()
                     );
+                    if let Some(id) = ymid.as_deref() {
+                        let _ = db_pool.mark_pending_completed(id).await;
+                        notify_batch_outcome(Some(id), BatchOutcome::Delivered);
+                    }
                     progress_bar.update(100, Some("✅ Done!")).await?;
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     progress_bar.delete().await?;
@@ -1123,6 +1127,10 @@ pub async fn process_video_request(
                 upload_start.elapsed(),
                 path.display()
             );
+            if let Some(id) = ymid.as_deref() {
+                let _ = db_pool.mark_pending_completed(id).await;
+                notify_batch_outcome(Some(id), BatchOutcome::Delivered);
+            }
         }
         Ok::<(), anyhow::Error>(())
     };
