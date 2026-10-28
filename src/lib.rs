@@ -53,6 +53,7 @@ use teloxide::prelude::*;
 use teloxide::types::CallbackQuery;
 use teloxide::types::{ChatMemberKind, ChatMemberUpdated};
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
 use utils::task_manager::TaskManager;
 use uuid::Uuid;
@@ -213,6 +214,7 @@ async fn run_link_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<LinkJob>) {
         let batch_id = Uuid::new_v4().to_string();
         let total = jobs.len() as i64;
 
+        let mut set = JoinSet::new();
         for (index, job) in jobs.into_iter().enumerate() {
             let dedupe_key = job.dedupe_key.clone();
             // A lone link keeps the old single-link flow (no "1 of 1" header,
@@ -225,31 +227,35 @@ async fn run_link_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<LinkJob>) {
                 source_message_id: job.msg.id.0 as i64,
             });
 
-            let mut handle = tokio::spawn(link_handler(job, batch));
-            // While this burst item is waiting (for example on an ad choice),
-            // a newly sent link must not be stuck behind it: handle it in its
-            // own task with the single-link flow and keep the burst going.
-            let mut finished = false;
-            while !finished {
-                tokio::select! {
-                    res = &mut handle => {
-                        match res {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => log::error!("link_handler failed: {}", e),
-                            Err(e) => log::error!("link_handler task failed: {}", e),
-                        }
-                        finished = true;
-                    }
-                    Some(new_job) = rx.recv() => {
-                        let new_dedupe_key = new_job.dedupe_key.clone();
-                        tokio::spawn(async move {
-                            let _ = link_handler(new_job, None).await;
-                            PROCESSING.lock().await.remove(&new_dedupe_key);
-                        });
+            set.spawn(async move {
+                let res = link_handler(job, batch).await;
+                PROCESSING.lock().await.remove(&dedupe_key);
+                res
+            });
+        }
+
+        // Spawn every item of the burst up front. Ad choices are still
+        // serialized by the per-item turnstile, but downloads can start as
+        // soon as the download gate allows, instead of waiting for the whole
+        // previous item to finish.
+        while !set.is_empty() {
+            tokio::select! {
+                Some(res) = set.join_next() => {
+                    match res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => log::error!("link_handler failed: {}", e),
+                        Err(e) => log::error!("link_handler task failed: {}", e),
                     }
                 }
+                Some(new_job) = rx.recv() => {
+                    let new_dedupe_key = new_job.dedupe_key.clone();
+                    set.spawn(async move {
+                        let res = link_handler(new_job, None).await;
+                        PROCESSING.lock().await.remove(&new_dedupe_key);
+                        res
+                    });
+                }
             }
-            PROCESSING.lock().await.remove(&dedupe_key);
         }
     }
 }

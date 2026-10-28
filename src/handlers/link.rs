@@ -561,6 +561,39 @@ pub async fn link_handler(
     // Mini App Ad invitation logic (single source of truth, shared with /api/ads-status)
     let ads_enabled = ads_enabled_for(&db_pool, bot_id, user_id as i64, is_user_admin).await;
 
+    // Keep ad choices in top-to-bottom order even when downloads are allowed
+    // to prefetch. This only gates the choice UI; it does not serialize the
+    // download phase.
+    if ads_enabled {
+        if let Some(batch_info) = batch.as_ref() {
+            if batch_info.position > 1 {
+                let notifier = batch_notifier(&batch_info.id);
+                let deadline = std::time::Instant::now() + Duration::from_secs(1800);
+                while db_pool
+                    .earlier_batch_rows_unfinished(&batch_info.id, batch_info.position)
+                    .await
+                    .unwrap_or(false)
+                {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    let notified = notifier.notified();
+                    if !db_pool
+                        .earlier_batch_rows_unfinished(&batch_info.id, batch_info.position)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = notified => {}
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    }
+                }
+            }
+        }
+    }
+
     if ads_enabled {
         let webapp_url = std::env::var("WEBAPP_URL").unwrap_or_default();
         if !webapp_url.is_empty() {
