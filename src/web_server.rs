@@ -1619,5 +1619,10 @@ mod tests {
                 .await
                 .unwrap(),
             Some("completed".to_string())
+        );
+        assert_eq!(
+            db.get_pending_download_status("too-late").await.unwrap(),
+            Some("expired".to_string())
+        );
     }
 }
