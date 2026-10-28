@@ -247,11 +247,10 @@ impl DatabasePool {
 
                 // Optimize SQLite for concurrent access
                 conn.execute_batch(
-                    "PRAGMA journal_mode = WAL;
-                     PRAGMA synchronous = NORMAL;
+                    "PRAGMA synchronous = NORMAL;
                      PRAGMA cache_size = 32000;
                      PRAGMA temp_store = MEMORY;
-                     PRAGMA busy_timeout = 5000;",
+                     PRAGMA busy_timeout = 10000;",
                 )?;
 
                 operation(&conn)
@@ -4315,5 +4314,54 @@ mod tests {
             .unwrap();
         assert_eq!(status, "completed");
         assert_eq!(downloads, 1);
+    }
+
+    #[tokio::test]
+    async fn reaper_marks_expired_uploading_as_delivery_unknown() {
+        let (pool, _file) = setup_test_db().await;
+        let id = pool
+            .create_pending_download("primary", 2401, "http://uploading")
+            .await
+            .unwrap();
+        pool.mark_as_verified_with_logging(&id).await.unwrap();
+        pool.claim_verified_download(&id).await.unwrap();
+        assert_eq!(pool.mark_pending_downloading(&id).await.unwrap(), 1);
+        assert_eq!(
+            pool.mark_pending_downloaded(&id, "output/uploading.mp4")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(pool.mark_pending_uploading(&id).await.unwrap(), 1);
+
+        let owned = id.clone();
+        pool.execute_with_timeout(move |conn| {
+            conn.execute(
+                "UPDATE pending_downloads SET lease_expires_at = datetime('now', '-1 minute') WHERE id = ?1",
+                params![owned],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let reaped = pool.reap_stale_pending(10).await.unwrap();
+        assert!(
+            reaped
+                .iter()
+                .any(|(row_id, _, status, _)| row_id == &id && status == "delivery_unknown")
+        );
+
+        let status: String = pool
+            .execute_with_timeout(move |conn| {
+                conn.query_row(
+                    "SELECT status FROM pending_downloads WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(status, "delivery_unknown");
     }
 }

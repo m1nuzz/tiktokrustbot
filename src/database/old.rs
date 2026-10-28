@@ -71,7 +71,7 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Res
 pub fn init_database() -> Result<()> {
     let db_path = get_database_path();
     let conn = Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 10000;")?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, last_active DATETIME DEFAULT CURRENT_TIMESTAMP, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, quality_preference TEXT DEFAULT 'h264', premium_until DATETIME, lang TEXT DEFAULT NULL)",
         (),
