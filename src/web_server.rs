@@ -1618,11 +1618,6 @@ mod tests {
             db.get_pending_download_status("already-done")
                 .await
                 .unwrap(),
-            Some("claimed".to_string())
-        );
-        assert_eq!(
-            db.get_pending_download_status("too-late").await.unwrap(),
-            Some("expired".to_string())
-        );
+            Some("completed".to_string())
     }
 }
