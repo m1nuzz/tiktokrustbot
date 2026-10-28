@@ -196,6 +196,15 @@ pub fn init_database() -> Result<()> {
         "bot_id",
         "bot_id TEXT NOT NULL DEFAULT 'primary'",
     )?;
+    // Links one delivered download to the pending row that produced it, so a
+    // retry cannot count the same delivery twice and the funnel can tell
+    // "claimed" from "actually delivered".
+    ensure_column(
+        &conn,
+        "downloads",
+        "pending_id",
+        "pending_id TEXT DEFAULT NULL",
+    )?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY, admin_telegram_id BIGINT UNIQUE NOT NULL)",
         (),
@@ -309,6 +318,166 @@ pub fn init_database() -> Result<()> {
         "bot_id TEXT NOT NULL DEFAULT 'primary'",
     )?;
     ensure_column(&conn, "pending_downloads", "file_path", "file_path TEXT")?;
+    // Explicit state machine + durable delivery markers. The old `completed`
+    // status meant both "claimed by a job" and "delivered"; splitting those
+    // into `claimed` and `completed` is what lets batch ordering wait for the
+    // real delivery instead of treating a claim as finished.
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "chat_id",
+        "chat_id BIGINT DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "request_key",
+        "request_key TEXT DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "verified_at",
+        "verified_at DATETIME DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "claimed_at",
+        "claimed_at DATETIME DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "download_completed_at",
+        "download_completed_at DATETIME DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "upload_started_at",
+        "upload_started_at DATETIME DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "delivered_at",
+        "delivered_at DATETIME DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "failed_at",
+        "failed_at DATETIME DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "superseded_at",
+        "superseded_at DATETIME DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "attempt_count",
+        "attempt_count INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "max_attempts",
+        "max_attempts INTEGER NOT NULL DEFAULT 3",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "last_error",
+        "last_error TEXT DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "lease_token",
+        "lease_token TEXT DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "choice_chat_id",
+        "choice_chat_id BIGINT DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "choice_message_id",
+        "choice_message_id BIGINT DEFAULT NULL",
+    )?;
+    ensure_column(
+        &conn,
+        "pending_downloads",
+        "replaced_by",
+        "replaced_by TEXT DEFAULT NULL",
+    )?;
+
+    // Backfill the new columns from the information the old rows already
+    // carry. This is deliberately idempotent: every statement only fills NULLs
+    // or derives a value that cannot change once written.
+    conn.execute(
+        "UPDATE pending_downloads SET chat_id = user_id WHERE chat_id IS NULL",
+        (),
+    )?;
+    conn.execute(
+        "UPDATE pending_downloads SET request_key = bot_id || ':' || COALESCE(chat_id, user_id) || ':' || video_url WHERE request_key IS NULL",
+        (),
+    )?;
+    conn.execute(
+        "UPDATE pending_downloads SET verified_at = COALESCE(ad_requested_at, created_at) WHERE verified_at IS NULL AND status IN ('verified', 'claimed', 'downloading', 'downloaded', 'uploading', 'completed')",
+        (),
+    )?;
+    conn.execute(
+        "UPDATE pending_downloads SET claimed_at = COALESCE(notified_at, created_at) WHERE claimed_at IS NULL AND status IN ('claimed', 'downloading', 'downloaded', 'uploading', 'completed')",
+        (),
+    )?;
+    conn.execute(
+        "UPDATE pending_downloads SET download_completed_at = COALESCE(notified_at, created_at) WHERE download_completed_at IS NULL AND status IN ('downloaded', 'uploading', 'completed')",
+        (),
+    )?;
+    conn.execute(
+        "UPDATE pending_downloads SET delivered_at = COALESCE(notified_at, created_at) WHERE delivered_at IS NULL AND status = 'completed'",
+        (),
+    )?;
+    conn.execute(
+        "UPDATE pending_downloads SET failed_at = COALESCE(notified_at, created_at) WHERE failed_at IS NULL AND status = 'failed'",
+        (),
+    )?;
+
+    // A process restart kills every in-flight job. Rows in a post-claim state
+    // would otherwise never move again and would block their whole batch.
+    // Claimed/downloading rows are retryable only by a new user action, so
+    // close them honestly instead of pretending the old job survived.
+    let orphaned = conn.execute(
+        "UPDATE pending_downloads SET status = 'failed', failed_at = CURRENT_TIMESTAMP, notified_at = CURRENT_TIMESTAMP, last_error = 'orphaned after restart' WHERE status IN ('claimed', 'downloading', 'downloaded')",
+        (),
+    )?;
+    let interrupted = conn.execute(
+        "UPDATE pending_downloads SET status = 'delivery_unknown', notified_at = CURRENT_TIMESTAMP, last_error = 'upload interrupted by restart' WHERE status = 'uploading'",
+        (),
+    )?;
+    if orphaned + interrupted > 0 {
+        log::warn!(
+            "Retired {} orphaned and {} interrupted pending downloads at startup",
+            orphaned,
+            interrupted
+        );
+    }
+
+    // The unique pending index needs one row per request_key. Keep the newest
+    // pending row and close older duplicates as superseded.
+    conn.execute(
+        "UPDATE pending_downloads SET status = 'superseded', superseded_at = CURRENT_TIMESTAMP WHERE status = 'pending' AND rowid NOT IN (SELECT MAX(rowid) FROM pending_downloads WHERE status = 'pending' GROUP BY request_key)",
+        (),
+    )?;
+
     // Silently retire download requests abandoned before this startup (the
     // user never finished watching the ad). They are marked notified so the
     // expiry sweeper never messages them; only new rows get notified. The
@@ -431,6 +600,22 @@ pub fn init_database() -> Result<()> {
     );
     let _ = conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pending_bot ON pending_downloads(bot_id, created_at)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_request_pending ON pending_downloads(request_key) WHERE status = 'pending'",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_batch_order ON pending_downloads(batch_id, batch_position, status)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_lease ON pending_downloads(status, lease_expires_at)",
+        (),
+    );
+    let _ = conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_downloads_pending_unique ON downloads(pending_id) WHERE pending_id IS NOT NULL",
         (),
     );
     let _ = conn.execute(

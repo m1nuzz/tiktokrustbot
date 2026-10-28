@@ -1,6 +1,6 @@
 use regex::Regex;
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo};
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, WebAppInfo};
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -10,7 +10,7 @@ use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 use crate::BotCtx;
-use crate::database::DatabasePool;
+use crate::database::{DatabasePool, ReplacePendingOutcome};
 use crate::handlers::admin::{is_admin, is_admin_id};
 use crate::handlers::subscription::check_subscription;
 use crate::handlers::ui::is_menu_button;
@@ -91,6 +91,10 @@ pub enum BatchOutcome {
     Delivered,
     Skipped,
     Failed,
+    /// The user re-sent the same link while this ad choice was still pending.
+    /// The old row was atomically superseded and a fresh choice message was
+    /// sent, so this waiter must delete its stale message and exit quietly.
+    Replaced,
 }
 
 /// ymid -> waiter for the link handler that is currently blocked on the ad
@@ -183,9 +187,13 @@ pub fn notify_batch_outcome(ymid: Option<&str>, outcome: BatchOutcome) {
     if let Some(batch_id) = batch_id {
         let notifier = batch_notifier(&batch_id);
         notifier.notify_waiters();
-        // Best-effort cleanup of the notifier once the batch is finished.
-        // We cannot easily know here whether other rows remain, so keep it;
-        // memory growth is bounded by the number of in-flight batches.
+        // Drop the map entry once this row finishes. Waiters that already hold
+        // the Arc are still woken; a row that starts waiting later re-checks
+        // the DB before sleeping and will not miss a terminal predecessor.
+        BATCH_NOTIFIERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&batch_id);
     }
 }
 
@@ -227,18 +235,18 @@ const TELEGRAM_BOT_API_FILE_LIMIT: u64 = 48 * 1024 * 1024; // 48MB
 
 /// Owns a URL claim and releases it even when processing exits with an error.
 struct UrlProcessingGuard {
-    url: String,
+    key: String,
 }
 
 impl UrlProcessingGuard {
-    fn try_acquire(url: &str) -> Option<Self> {
+    fn try_acquire(key: &str) -> Option<Self> {
         let mut urls = URL_PROCESSING
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if urls.insert(url.to_owned()) {
+        if urls.insert(key.to_owned()) {
             Some(Self {
-                url: url.to_owned(),
+                key: key.to_owned(),
             })
         } else {
             None
@@ -251,7 +259,7 @@ impl Drop for UrlProcessingGuard {
         let mut urls = URL_PROCESSING
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        urls.remove(&self.url);
+        urls.remove(&self.key);
     }
 }
 
@@ -473,8 +481,10 @@ pub async fn link_handler(
         return Ok(());
     }
 
-    // Deduplication. The guard releases the URL on every exit path, including errors.
-    let _url_processing_guard = match UrlProcessingGuard::try_acquire(&url) {
+    // Deduplication is per (bot, chat, url): two different users sending the
+    // same link must not block each other. The guard releases on every exit.
+    let url_guard_key = format!("{}:{}:{}", bot_id, msg.chat.id.0, url);
+    let url_processing_guard = match UrlProcessingGuard::try_acquire(&url_guard_key) {
         Some(guard) => guard,
         None => {
             bot.send_message(
@@ -555,9 +565,10 @@ pub async fn link_handler(
         let webapp_url = std::env::var("WEBAPP_URL").unwrap_or_default();
         if !webapp_url.is_empty() {
             if let Ok(url_obj) = webapp_url.parse::<reqwest::Url>() {
-                let ymid = match db_pool
-                    .create_pending_download_with_batch(
+                let (ymid, effective_batch) = match db_pool
+                    .replace_pending_download(
                         bot_id,
+                        msg.chat.id.0,
                         user_id as i64,
                         &url,
                         batch.as_ref().map(|b| b.id.as_str()),
@@ -566,7 +577,40 @@ pub async fn link_handler(
                     )
                     .await
                 {
-                    Ok(id) => id,
+                    Ok(ReplacePendingOutcome::Created { new_id, batch }) => (new_id, batch),
+                    Ok(ReplacePendingOutcome::Replaced {
+                        new_id,
+                        old_id,
+                        old_choice_chat_id,
+                        old_choice_message_id,
+                        batch,
+                    }) => {
+                        // Delete the stale choice message before the old
+                        // waiter is woken: the old handler also deletes its
+                        // own `sent` message, and deleting twice is harmless.
+                        if let (Some(chat), Some(message)) =
+                            (old_choice_chat_id, old_choice_message_id)
+                        {
+                            let _ = bot
+                                .delete_message(ChatId(chat), MessageId(message as i32))
+                                .await;
+                        }
+                        notify_batch_outcome(Some(old_id.as_str()), BatchOutcome::Replaced);
+                        (new_id, batch)
+                    }
+                    Ok(ReplacePendingOutcome::Active { status }) => {
+                        log::info!(
+                            "Resend for {} kept the in-flight row (status {})",
+                            url,
+                            status
+                        );
+                        bot.send_message(
+                            msg.chat.id,
+                            i18n::t(MsgKey::AlreadyProcessing, Some(lang.as_str())),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                     Err(e) => {
                         log::error!("Failed to create pending download: {}", e);
                         bot.send_message(
@@ -578,8 +622,8 @@ pub async fn link_handler(
                     }
                 };
 
-                if let Some(info) = batch.as_ref() {
-                    register_batch_ymid(&ymid, &info.id);
+                if let Some((batch_id, _, _)) = effective_batch.as_ref() {
+                    register_batch_ymid(&ymid, batch_id);
                 }
 
                 let mut final_url = url_obj;
@@ -599,21 +643,21 @@ pub async fn link_handler(
                     )],
                     vec![InlineKeyboardButton::callback(prem_btn_text, "buy_premium")],
                 ];
-                if batch.is_some() {
+                if effective_batch.is_some() {
                     rows.push(vec![InlineKeyboardButton::callback(
                         i18n::t(MsgKey::BatchSkipButton, Some(lang.as_str())),
                         format!("batch_skip|{}", ymid),
                     )]);
                 }
 
-                let message_text = match &batch {
-                    Some(info) => format!(
+                let message_text = match &effective_batch {
+                    Some((_, position, total)) => format!(
                         "{}\n\n{}",
                         batch_text(
                             MsgKey::BatchProgress,
                             Some(lang.as_str()),
-                            info.position,
-                            info.total
+                            *position,
+                            *total
                         ),
                         choice_text
                     ),
@@ -621,7 +665,7 @@ pub async fn link_handler(
                 };
 
                 // Register before sending: a very fast tap must find the waiter.
-                let waiter = if batch.is_some() {
+                let waiter = if effective_batch.is_some() {
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     BATCH_WAITERS
                         .lock()
@@ -644,10 +688,40 @@ pub async fn link_handler(
                     }
                 };
 
+                match db_pool
+                    .set_choice_message(&ymid, msg.chat.id.0, sent.id.0 as i64)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // The row left `pending` between the insert and the
+                        // send (ad verified, claimed, or superseded). The
+                        // message is stale; delete it and do not wait.
+                        let _ = bot.delete_message(sent.chat.id, sent.id).await;
+                        remove_batch_waiter(&ymid);
+                        return Ok(());
+                    }
+                    Err(e) => log::warn!("Failed to store choice message for {}: {}", ymid, e),
+                }
+
+                // The ad wait must not hold the URL guard: a resend has to be
+                // able to find and replace this pending row.
+                drop(url_processing_guard);
+
+                if let Ok(Some(status)) = db_pool.get_pending_download_status(&ymid).await {
+                    if status != "pending" {
+                        let _ = bot.delete_message(sent.chat.id, sent.id).await;
+                        remove_batch_waiter(&ymid);
+                        return Ok(());
+                    }
+                }
+
                 // A real burst is handled strictly one item at a time: the next
                 // choice message only appears after this one is delivered,
                 // skipped or failed. Single links keep the old immediate flow.
-                if let (Some(info), Some(waiter)) = (batch, waiter) {
+                if let (Some((_batch_id, position, total)), Some(waiter)) =
+                    (effective_batch, waiter)
+                {
                     let outcome = match timeout(BATCH_WAIT_TIMEOUT, waiter).await {
                         Ok(Ok(outcome)) => outcome,
                         Ok(Err(_)) => BatchOutcome::Failed,
@@ -658,13 +732,18 @@ pub async fn link_handler(
                     };
                     remove_batch_waiter(&ymid);
 
+                    if outcome == BatchOutcome::Replaced {
+                        let _ = bot.delete_message(sent.chat.id, sent.id).await;
+                        return Ok(());
+                    }
+
                     let status_key = match outcome {
                         BatchOutcome::Delivered => MsgKey::BatchDelivered,
                         BatchOutcome::Skipped => MsgKey::BatchSkipped,
                         BatchOutcome::Failed => MsgKey::BatchFailed,
+                        BatchOutcome::Replaced => unreachable!(),
                     };
-                    let status_text =
-                        batch_text(status_key, Some(lang.as_str()), info.position, info.total);
+                    let status_text = batch_text(status_key, Some(lang.as_str()), position, total);
                     let _ = bot
                         .edit_message_text(sent.chat.id, sent.id, status_text)
                         .await;
@@ -898,12 +977,19 @@ pub async fn process_video_request(
     let is_audio = quality_preference == "audio";
 
     // Acquire download permit
-    let _download_permit = download_semaphore
+    let download_permit = download_semaphore
         .acquire()
         .await
         .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
     if let Some(ymid) = ymid.as_deref() {
-        let _ = db_pool.mark_pending_downloading(ymid).await;
+        match db_pool.mark_pending_downloading(ymid).await {
+            Ok(0) => {
+                log::warn!("Download {} is no longer claimable; aborting job", ymid);
+                return Err(anyhow::anyhow!("pending row {} is not claimable", ymid).into());
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!("Failed to mark {} downloading: {}", ymid, e),
+        }
     }
 
     progress_bar.update(5, Some("⬇️ Downloading...")).await?;
@@ -911,6 +997,7 @@ pub async fn process_video_request(
     // Whole-job budget (Tier 2): download attempts + upload must finish
     // within 30 minutes, otherwise the job is dropped and the user is told
     // to retry. Per-attempt DOWNLOAD_TIMEOUT / UPLOAD_TIMEOUT still apply.
+    let mut upload_started = false;
     let job = async {
         // TikTok photo posts (carousels): yt-dlp rejects /photo/ URLs, so
         // probe tikwm once first (it also resolves vt/vM short links).
@@ -973,13 +1060,16 @@ pub async fn process_video_request(
         // Mark download finished so the next batch item can start downloading
         // while this one uploads.
         if let Some(ymid) = ymid.as_deref() {
-            let _ = db_pool
-                .mark_pending_downloaded(ymid, path.to_str().unwrap_or(""))
-                .await;
+            let path_str = path.to_string_lossy().to_string();
+            let _ = db_pool.mark_pending_downloaded(ymid, &path_str).await;
             if let Ok(Some((batch_id, _, _))) = db_pool.get_batch_info(ymid).await {
                 batch_notifier(&batch_id).notify_waiters();
             }
         }
+        // The download permit must not be held through the upload: otherwise
+        // the third batch item cannot start downloading while the first two
+        // upload, defeating the whole split.
+        drop(download_permit);
 
         // Wait for earlier rows to finish uploading before starting our upload.
         if let Some(ymid) = ymid.as_deref() {
@@ -1010,11 +1100,20 @@ pub async fn process_video_request(
             }
         }
 
+        if let Some(ymid) = ymid.as_deref() {
+            match db_pool.mark_pending_uploading(ymid).await {
+                Ok(0) => log::warn!("Row {} is not ready for upload", ymid),
+                Ok(_) => {}
+                Err(e) => log::warn!("Failed to mark {} uploading: {}", ymid, e),
+            }
+        }
+
         // Acquire upload permit
         let _upload_permit = upload_semaphore
             .acquire()
             .await
             .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
+        upload_started = true;
 
         if file_size > TELEGRAM_BOT_API_FILE_LIMIT {
             progress_bar
@@ -1049,10 +1148,6 @@ pub async fn process_video_request(
                         upload_start.elapsed(),
                         path.display()
                     );
-                    if let Some(id) = ymid.as_deref() {
-                        let _ = db_pool.mark_pending_completed(id).await;
-                        notify_batch_outcome(Some(id), BatchOutcome::Delivered);
-                    }
                     progress_bar.update(100, Some("✅ Done!")).await?;
                     progress_bar.delete().await?;
                 }
@@ -1125,32 +1220,38 @@ pub async fn process_video_request(
                 upload_start.elapsed(),
                 path.display()
             );
-            if let Some(id) = ymid.as_deref() {
-                let _ = db_pool.mark_pending_completed(id).await;
-                notify_batch_outcome(Some(id), BatchOutcome::Delivered);
-            }
         }
         Ok::<(), anyhow::Error>(())
     };
 
     match timeout(JOB_BUDGET, job).await {
         Ok(Ok(())) => {
-            // Final logging (success only: failed uploads no longer count).
-            let video_url = url.clone();
-            let bot_id_owned = bot_id.to_string();
-            let _ = db_pool.execute_with_timeout(move |conn| {
-                conn.execute("INSERT OR IGNORE INTO users (bot_id, telegram_id) VALUES (?1, ?2)", rusqlite::params![bot_id_owned, user_id])?;
-                conn.execute("INSERT INTO downloads (bot_id, user_telegram_id, video_url) VALUES (?1, ?2, ?3)", rusqlite::params![bot_id_owned, user_id, video_url])?;
-                Ok(())
-            }).await;
-
             if let Some(id) = ymid.as_deref() {
-                let _ = db_pool.mark_pending_completed(id).await;
+                match db_pool.complete_delivery(bot_id, user_id, &url, id).await {
+                    Ok(true) => {}
+                    Ok(false) => log::warn!("Delivery for {} was already terminal", id),
+                    Err(e) => log::error!("Failed to record delivery for {}: {}", id, e),
+                }
+                notify_batch_outcome(Some(id), BatchOutcome::Delivered);
+            } else {
+                let video_url = url.clone();
+                let bot_id_owned = bot_id.to_string();
+                let _ = db_pool.execute_with_timeout(move |conn| {
+                    conn.execute("INSERT OR IGNORE INTO users (bot_id, telegram_id) VALUES (?1, ?2)", rusqlite::params![bot_id_owned, user_id])?;
+                    conn.execute("INSERT INTO downloads (bot_id, user_telegram_id, video_url) VALUES (?1, ?2, ?3)", rusqlite::params![bot_id_owned, user_id, video_url])?;
+                    Ok(())
+                }).await;
             }
-            notify_batch_outcome(ymid.as_deref(), BatchOutcome::Delivered);
             Ok(())
         }
         Ok(Err(e)) => {
+            if upload_started {
+                if let Some(id) = ymid.as_deref() {
+                    let _ = db_pool
+                        .mark_pending_delivery_unknown(id, &e.to_string())
+                        .await;
+                }
+            }
             // Tier 1: the bot knows why it failed — say so immediately.
             let key = classify_download_error(&e, &url);
             fail_request(
@@ -1171,6 +1272,13 @@ pub async fn process_video_request(
             // Tier 2: something unforeseen hung the job — the budget killed
             // it, tell the user to retry.
             let e = anyhow::anyhow!("Job budget of {} seconds exceeded", JOB_BUDGET.as_secs());
+            if upload_started {
+                if let Some(id) = ymid.as_deref() {
+                    let _ = db_pool
+                        .mark_pending_delivery_unknown(id, &e.to_string())
+                        .await;
+                }
+            }
             fail_request(
                 &bot,
                 chat_id,

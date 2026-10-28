@@ -647,6 +647,16 @@ enum VerifyOutcome {
     Unknown,
 }
 
+/// A row that already left `verified` has an owner: either a job is running
+/// (`claimed`/`downloading`/`downloaded`/`uploading`) or the video was
+/// delivered. A second claim must be an idempotent success, never a refusal.
+fn is_delivered_or_in_flight(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "claimed" | "downloading" | "downloaded" | "uploading"
+    )
+}
+
 /// `mark_as_verified_with_logging` reports affected rows, so 0 rows only means
 /// "this postback changed nothing" - the row itself says why.
 fn classify_verify(rows: usize, status: Option<&str>) -> VerifyOutcome {
@@ -996,10 +1006,11 @@ async fn claim_video(
     // 2. Already delivered (by the valued-postback auto-delivery or by an
     // earlier POST): idempotent success, and no reason to wait for a postback.
     if let Ok(Some(status)) = db.get_pending_download_status(&ymid).await {
-        if status == "completed" {
+        if is_delivered_or_in_flight(&status) {
             log::info!(
-                "Claim for ymid {} already completed, returning success",
-                ymid
+                "Claim for ymid {} already in flight/delivered ({}), returning success",
+                ymid,
+                status
             );
             return Json(json!({ "success": true }));
         }
@@ -1034,10 +1045,11 @@ async fn claim_video(
             // The valued postback's own auto-delivery may have completed this
             // row while we were waiting, so the video is on its way.
             if let Ok(Some(status)) = db.get_pending_download_status(&ymid).await {
-                if status == "completed" {
+                if is_delivered_or_in_flight(&status) {
                     log::info!(
-                        "Claim for ymid {} completed by auto-delivery while waiting, returning success",
-                        ymid
+                        "Claim for ymid {} in flight/delivered while waiting ({}), returning success",
+                        ymid,
+                        status
                     );
                     return Json(json!({ "success": true }));
                 }

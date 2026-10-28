@@ -444,7 +444,8 @@
         function handleTerminalStatus(status) {
             sessionTerminal = true;
             stopPolling();
-            if (status === 'completed') {
+            if (status === 'completed' || status === 'claimed' || status === 'downloading'
+                || status === 'downloaded' || status === 'uploading') {
                 trackEvent('already_delivered');
                 closeWebapp();
                 return;
@@ -615,7 +616,9 @@
                 // onto the no-fill screen: a delivered row closes (the video is
                 // in the chat), a lapsed or unknown one says to start a new
                 // session.
-                if (data.status === 'completed' || data.status === 'expired'
+                if (data.status === 'completed' || data.status === 'claimed'
+                    || data.status === 'downloading' || data.status === 'downloaded'
+                    || data.status === 'uploading' || data.status === 'expired'
                     || data.status === 'not_found' || data.status === 'failed') {
                     isPolling = false;
                     handleTerminalStatus(data.status);
@@ -1514,7 +1517,9 @@
                 const data = await res.json();
                 noteLeaseDeadline(data);
                 const status = data && data.status;
-                if (status === 'completed' || status === 'expired'
+                if (status === 'completed' || status === 'claimed'
+                    || status === 'downloading' || status === 'downloaded'
+                    || status === 'uploading' || status === 'expired'
                     || status === 'not_found' || status === 'failed') {
                     return status;
                 }

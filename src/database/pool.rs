@@ -116,6 +116,61 @@ pub struct WeeklyDayStats {
 /// One day of the conversion funnel. Drop-off reasons come from
 /// `pending_downloads` statuses; button-level steps from `funnel_events`.
 #[derive(Debug, Clone)]
+pub enum ReplacePendingOutcome {
+    Created {
+        new_id: String,
+        batch: Option<(String, i64, i64)>,
+    },
+    Replaced {
+        new_id: String,
+        old_id: String,
+        old_choice_chat_id: Option<i64>,
+        old_choice_message_id: Option<i64>,
+        batch: Option<(String, i64, i64)>,
+    },
+    Active {
+        status: String,
+    },
+}
+
+fn insert_replacement_row(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    bot_id: &str,
+    chat_id: i64,
+    user_id: i64,
+    video_url: &str,
+    request_key: &str,
+    lease_secs: i64,
+    batch: Option<&(String, i64, i64)>,
+) -> SqliteResult<()> {
+    let (batch_id, position, total) = match batch {
+        Some((batch_id, position, total)) => {
+            (Some(batch_id.as_str()), Some(*position), Some(*total))
+        }
+        None => (None, None, None),
+    };
+    tx.execute(
+        &format!(
+            "INSERT INTO pending_downloads (id, bot_id, chat_id, user_id, video_url, request_key, lease_expires_at, batch_id, batch_position, batch_total) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now', '+{} seconds'), ?7, ?8, ?9)",
+            lease_secs
+        ),
+        params![
+            id,
+            bot_id,
+            chat_id,
+            user_id,
+            video_url,
+            request_key,
+            batch_id,
+            position,
+            total
+        ],
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
 pub struct FunnelDayStats {
     pub date: String,
     pub started: i64,
@@ -587,17 +642,152 @@ impl DatabasePool {
         let bot_owned = bot_id.to_string();
         let batch_owned = batch_id.map(str::to_string);
         let lease_secs = SESSION_LEASE_SECS;
+        let request_key = format!("{}:{}:{}", bot_id, user_id, video_url);
 
         self.execute_with_timeout(move |conn| {
             conn.execute(
                 &format!(
-                    "INSERT INTO pending_downloads (id, bot_id, user_id, video_url, lease_expires_at, batch_id, batch_position, batch_total) VALUES (?1, ?2, ?3, ?4, datetime('now', '+{} seconds'), ?5, ?6, ?7)",
+                    "INSERT INTO pending_downloads (id, bot_id, user_id, chat_id, video_url, request_key, lease_expires_at, batch_id, batch_position, batch_total) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now', '+{} seconds'), ?7, ?8, ?9)",
                     lease_secs
                 ),
-                params![id_owned, bot_owned, user_id, video_url_owned, batch_owned, position, total],
+                params![id_owned, bot_owned, user_id, user_id, video_url_owned, request_key, batch_owned, position, total],
             )?;
             Ok(())
         }).await.map(|_| id).map_err(|e| anyhow::anyhow!("Failed to create pending download: {}", e))
+    }
+
+    /// Create a row for a chat, or atomically replace the still-pending row
+    /// with the same `(bot, chat, url)` request key. The old row is moved to
+    /// `superseded` in the same transaction that inserts the new one, so the
+    /// partial unique index can never see two pending rows for one request.
+    ///
+    /// A row past `pending` (verified/claimed/downloading/downloaded/uploading)
+    /// is already in flight and is never replaced: the caller must keep the
+    /// existing "already being processed" reply. Terminal rows are history and
+    /// do not block a new request.
+    pub async fn replace_pending_download(
+        &self,
+        bot_id: &str,
+        chat_id: i64,
+        user_id: i64,
+        video_url: &str,
+        batch_id: Option<&str>,
+        position: Option<i64>,
+        total: Option<i64>,
+    ) -> Result<ReplacePendingOutcome, anyhow::Error> {
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let new_id_owned = new_id.clone();
+        let bot_owned = bot_id.to_string();
+        let video_url_owned = video_url.to_string();
+        let request_key = format!("{}:{}:{}", bot_id, chat_id, video_url);
+        let batch_owned = batch_id.map(str::to_string);
+        let lease_secs = SESSION_LEASE_SECS;
+
+        self.execute_with_timeout(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let existing: Option<(
+                String,
+                String,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+                Option<i64>,
+                Option<i64>,
+            )> = tx
+                .query_row(
+                    "SELECT id, status, choice_chat_id, choice_message_id, batch_id, batch_position, batch_total FROM pending_downloads WHERE request_key = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    params![request_key],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .optional()?;
+
+            let existing = match existing {
+                Some((id, status, choice_chat_id, choice_message_id, old_batch_id, old_position, old_total)) => {
+                    if status == "pending" {
+                        let old_batch = match (old_batch_id, old_position, old_total) {
+                            (Some(b), Some(p), Some(t)) => Some((b, p, t)),
+                            _ => None,
+                        };
+                        let effective_batch = match (batch_owned.clone(), position, total) {
+                            (Some(b), Some(p), Some(t)) => Some((b, p, t)),
+                            _ => old_batch.clone(),
+                        };
+                        let superseded = tx.execute(
+                            "UPDATE pending_downloads SET status = 'superseded', superseded_at = CURRENT_TIMESTAMP, replaced_by = ?2 WHERE id = ?1 AND status = 'pending'",
+                            params![id, new_id_owned],
+                        )?;
+                        if superseded == 0 {
+                            tx.rollback()?;
+                            return Ok(ReplacePendingOutcome::Active {
+                                status: "pending".to_string(),
+                            });
+                        }
+                        insert_replacement_row(
+                            &tx,
+                            &new_id_owned,
+                            &bot_owned,
+                            chat_id,
+                            user_id,
+                            &video_url_owned,
+                            &request_key,
+                            lease_secs,
+                            effective_batch.as_ref(),
+                        )?;
+                        tx.commit()?;
+                        return Ok(ReplacePendingOutcome::Replaced {
+                            new_id: new_id_owned,
+                            old_id: id,
+                            old_choice_chat_id: choice_chat_id,
+                            old_choice_message_id: choice_message_id,
+                            batch: effective_batch,
+                        });
+                    }
+                    if matches!(
+                        status.as_str(),
+                        "verified" | "claimed" | "downloading" | "downloaded" | "uploading"
+                    ) {
+                        tx.rollback()?;
+                        return Ok(ReplacePendingOutcome::Active { status });
+                    }
+                    None
+                }
+                None => None,
+            };
+            let _ = existing;
+
+            let effective_batch = match (batch_owned, position, total) {
+                (Some(b), Some(p), Some(t)) => Some((b, p, t)),
+                _ => None,
+            };
+            insert_replacement_row(
+                &tx,
+                &new_id_owned,
+                &bot_owned,
+                chat_id,
+                user_id,
+                &video_url_owned,
+                &request_key,
+                lease_secs,
+                effective_batch.as_ref(),
+            )?;
+            tx.commit()?;
+            Ok(ReplacePendingOutcome::Created {
+                new_id: new_id_owned,
+                batch: effective_batch,
+            })
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create or replace pending download: {}", e))
     }
 
     /// Mark a pending row as verified and return the number of rows affected, so
@@ -608,7 +798,7 @@ impl DatabasePool {
         let id_owned = id.to_string();
         self.execute_with_timeout(move |conn| {
             let rows = conn.execute(
-                "UPDATE pending_downloads SET status = 'verified' WHERE id = ?1 AND status = 'pending'",
+                "UPDATE pending_downloads SET status = 'verified', verified_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status = 'pending'",
                 params![id_owned],
             )?;
             Ok(rows)
@@ -627,14 +817,47 @@ impl DatabasePool {
     /// `completed` at this point always means "claimed but never delivered".
     /// Notified immediately so the sweeper skips it.
     pub async fn mark_pending_failed(&self, id: &str) -> Result<usize, anyhow::Error> {
+        self.mark_pending_failed_with_reason(id, None).await
+    }
+
+    /// Mark any non-terminal row failed, including rows that already left
+    /// `pending`. The old filter omitted `downloading`/`downloaded`, which is
+    /// exactly why failed uploads used to leave rows blocking their batch
+    /// forever. `uploading` is excluded on purpose: an upload error is
+    /// ambiguous and must go through `mark_pending_delivery_unknown`.
+    pub async fn mark_pending_failed_with_reason(
+        &self,
+        id: &str,
+        reason: Option<&str>,
+    ) -> Result<usize, anyhow::Error> {
         let id_owned = id.to_string();
+        let reason_owned = reason.map(str::to_string);
         self.execute_with_timeout(move |conn| {
             let rows = conn.execute(
-                "UPDATE pending_downloads SET status = 'failed', notified_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('pending', 'verified', 'completed')",
-                params![id_owned],
+                "UPDATE pending_downloads SET status = 'failed', failed_at = CURRENT_TIMESTAMP, notified_at = CURRENT_TIMESTAMP, last_error = ?2, file_path = NULL, lease_token = NULL, lease_expires_at = NULL WHERE id = ?1 AND status IN ('pending', 'verified', 'claimed', 'downloading', 'downloaded')",
+                params![id_owned, reason_owned],
             )?;
             Ok(rows)
         }).await.map_err(|e| anyhow::anyhow!("Failed to mark {} as failed: {}", id, e))
+    }
+
+    /// An upload was attempted but its outcome is unknown (timeout, connection
+    /// reset, process restart). Never auto-retry: the video may already be in
+    /// the chat, and a retry would deliver it twice.
+    pub async fn mark_pending_delivery_unknown(
+        &self,
+        id: &str,
+        reason: &str,
+    ) -> Result<usize, anyhow::Error> {
+        let id_owned = id.to_string();
+        let reason_owned = reason.to_string();
+        self.execute_with_timeout(move |conn| {
+            let rows = conn.execute(
+                "UPDATE pending_downloads SET status = 'delivery_unknown', notified_at = CURRENT_TIMESTAMP, last_error = ?2, file_path = NULL, lease_token = NULL, lease_expires_at = NULL WHERE id = ?1 AND status IN ('uploading', 'downloaded')",
+                params![id_owned, reason_owned],
+            )?;
+            Ok(rows)
+        }).await.map_err(|e| anyhow::anyhow!("Failed to mark {} delivery unknown: {}", id, e))
     }
 
     /// Close a still-pending batch item without downloading it. Only `pending`
@@ -645,7 +868,7 @@ impl DatabasePool {
         let id_owned = id.to_string();
         self.execute_with_timeout(move |conn| {
             conn.execute(
-                "UPDATE pending_downloads SET status = 'completed', file_path = NULL WHERE id = ?1 AND status IN ('downloaded', 'downloading', 'pending', 'verified')",
+                "UPDATE pending_downloads SET status = 'completed', delivered_at = CURRENT_TIMESTAMP, file_path = NULL, lease_token = NULL, lease_expires_at = NULL WHERE id = ?1 AND status IN ('uploading', 'downloaded', 'downloading', 'claimed', 'pending', 'verified')",
                 params![id_owned],
             )
         })
@@ -699,7 +922,7 @@ impl DatabasePool {
         let batch_owned = batch_id.to_string();
         self.execute_with_timeout(move |conn| {
             let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM pending_downloads WHERE batch_id = ?1 AND batch_position < ?2 AND status IN ('pending', 'verified', 'downloading', 'downloaded')",
+                "SELECT COUNT(*) FROM pending_downloads WHERE batch_id = ?1 AND batch_position < ?2 AND status NOT IN ('completed', 'failed', 'expired', 'superseded', 'delivery_unknown')",
                 params![batch_owned, position],
                 |r| r.get(0),
             )?;
@@ -720,7 +943,7 @@ impl DatabasePool {
         let batch_owned = batch_id.to_string();
         self.execute_with_timeout(move |conn| {
             let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM pending_downloads WHERE batch_id = ?1 AND batch_position < ?2 AND status IN ('pending', 'verified', 'downloading')",
+                "SELECT COUNT(*) FROM pending_downloads WHERE batch_id = ?1 AND batch_position < ?2 AND status IN ('pending', 'verified', 'claimed', 'downloading')",
                 params![batch_owned, position],
                 |r| r.get(0),
             )?;
@@ -734,7 +957,7 @@ impl DatabasePool {
         let id_owned = id.to_string();
         self.execute_with_timeout(move |conn| {
             conn.execute(
-                "UPDATE pending_downloads SET status = 'downloading', job_started_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('pending', 'verified')",
+                "UPDATE pending_downloads SET status = 'downloading', job_started_at = CURRENT_TIMESTAMP, lease_expires_at = datetime('now', '+1800 seconds') WHERE id = ?1 AND status IN ('claimed', 'pending', 'verified')",
                 params![id_owned],
             )
         })
@@ -751,12 +974,81 @@ impl DatabasePool {
         let path_owned = file_path.to_string();
         self.execute_with_timeout(move |conn| {
             conn.execute(
-                "UPDATE pending_downloads SET status = 'downloaded', file_path = ?2 WHERE id = ?1",
+                "UPDATE pending_downloads SET status = 'downloaded', file_path = ?2, download_completed_at = CURRENT_TIMESTAMP, lease_token = NULL, lease_expires_at = NULL WHERE id = ?1 AND status IN ('downloading', 'claimed')",
                 params![id_owned, path_owned],
             )
         })
         .await
         .map_err(|e| anyhow::anyhow!("Failed to mark {} downloaded: {}", id, e))
+    }
+
+    /// Move a finished download into the upload phase. This is the last state
+    /// before the network send; only one job can hold it.
+    pub async fn mark_pending_uploading(&self, id: &str) -> Result<usize, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "UPDATE pending_downloads SET status = 'uploading', upload_started_at = CURRENT_TIMESTAMP, lease_expires_at = datetime('now', '+600 seconds') WHERE id = ?1 AND status = 'downloaded'",
+                params![id_owned],
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to mark {} uploading: {}", id, e))
+    }
+
+    /// Remember the chat message that carries the ad/premium/skip buttons, so
+    /// a resend can delete the stale keyboard. Only a still-pending row is
+    /// updated: a message that raced a verification/claim must not be stored.
+    pub async fn set_choice_message(
+        &self,
+        id: &str,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Result<bool, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let rows = conn.execute(
+                "UPDATE pending_downloads SET choice_chat_id = ?2, choice_message_id = ?3 WHERE id = ?1 AND status = 'pending'",
+                params![id_owned, chat_id, message_id],
+            )?;
+            Ok(rows > 0)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to store choice message for {}: {}", id, e))
+    }
+
+    /// Record the delivery and close the row in one transaction. The download
+    /// insert is idempotent on `pending_id`, so a retry cannot double-count.
+    /// Returns whether the pending row actually moved.
+    pub async fn complete_delivery(
+        &self,
+        bot_id: &str,
+        user_id: i64,
+        video_url: &str,
+        pending_id: &str,
+    ) -> Result<bool, anyhow::Error> {
+        let bot_owned = bot_id.to_string();
+        let url_owned = video_url.to_string();
+        let pending_owned = pending_id.to_string();
+        self.execute_with_timeout(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT OR IGNORE INTO users (bot_id, telegram_id) VALUES (?1, ?2)",
+                params![bot_owned, user_id],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO downloads (bot_id, user_telegram_id, video_url, pending_id) VALUES (?1, ?2, ?3, ?4)",
+                params![bot_owned, user_id, url_owned, pending_owned],
+            )?;
+            let updated = tx.execute(
+                "UPDATE pending_downloads SET status = 'completed', delivered_at = CURRENT_TIMESTAMP, file_path = NULL, lease_token = NULL, lease_expires_at = NULL WHERE id = ?1 AND status IN ('uploading', 'downloaded', 'downloading', 'claimed')",
+                params![pending_owned],
+            )?;
+            tx.commit()?;
+            Ok(updated > 0)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to complete delivery for {}: {}", pending_id, e))
     }
 
     pub async fn get_pending_file_path(&self, id: &str) -> Result<Option<String>, anyhow::Error> {
@@ -1152,6 +1444,7 @@ impl DatabasePool {
     /// and only the caller that flips exactly one row owns the delivery.
     pub async fn claim_verified_download(&self, id: &str) -> Result<(i64, String), anyhow::Error> {
         let id_owned = id.to_string();
+        let lease_token = uuid::Uuid::new_v4().to_string();
         self.execute_with_timeout(move |conn| {
             let (user_id, url): (i64, String) = conn.query_row(
                 "SELECT user_id, video_url FROM pending_downloads WHERE id = ?1 AND status = 'verified'",
@@ -1160,8 +1453,8 @@ impl DatabasePool {
             )?;
 
             let claimed = conn.execute(
-                "UPDATE pending_downloads SET status = 'completed' WHERE id = ?1 AND status = 'verified'",
-                params![id_owned],
+                "UPDATE pending_downloads SET status = 'claimed', claimed_at = CURRENT_TIMESTAMP, attempt_count = attempt_count + 1, lease_token = ?2, lease_expires_at = datetime('now', '+1800 seconds') WHERE id = ?1 AND status = 'verified'",
+                params![id_owned, lease_token],
             )?;
 
             if claimed == 0 {
@@ -1379,10 +1672,10 @@ impl DatabasePool {
                     &format!("SELECT COUNT(DISTINCT user_id) FROM pending_downloads WHERE date(created_at) = {day_sql}{excl_p} AND (?1 IS NULL OR bot_id = ?1)"),
                     params![bot_p], |r| r.get(0)).unwrap_or(0);
                 let ad_watched: i64 = conn.query_row(
-                    &format!("SELECT COUNT(DISTINCT user_id) FROM pending_downloads WHERE date(created_at) = {day_sql} AND status IN ('verified', 'completed'){excl_p} AND (?1 IS NULL OR bot_id = ?1)"),
+                    &format!("SELECT COUNT(DISTINCT user_id) FROM pending_downloads WHERE date(created_at) = {day_sql} AND verified_at IS NOT NULL{excl_p} AND (?1 IS NULL OR bot_id = ?1)"),
                     params![bot_p], |r| r.get(0)).unwrap_or(0);
                 let claimed: i64 = conn.query_row(
-                    &format!("SELECT COUNT(DISTINCT user_id) FROM pending_downloads WHERE date(created_at) = {day_sql} AND status = 'completed'{excl_p} AND (?1 IS NULL OR bot_id = ?1)"),
+                    &format!("SELECT COUNT(DISTINCT user_id) FROM pending_downloads WHERE date(claimed_at) = {day_sql} AND claimed_at IS NOT NULL{excl_p} AND (?1 IS NULL OR bot_id = ?1)"),
                     params![bot_p], |r| r.get(0)).unwrap_or(0);
                 let delivered: i64 = conn.query_row(
                     &format!("SELECT COUNT(DISTINCT user_telegram_id) FROM downloads WHERE date(download_date) = {day_sql}{excl_d} AND (?1 IS NULL OR bot_id = ?1)"),
@@ -1511,6 +1804,93 @@ impl DatabasePool {
         })
         .await
         .map_err(|e| anyhow::anyhow!("Failed to expire stale pending downloads: {}", e))
+    }
+
+    /// Reap every expired in-flight state, not just abandoned ad sessions.
+    /// Returns `(ymid, user_id, new_status, job_started)` so the caller can
+    /// wake the matching batch waiter. `verified` means the row is claimable
+    /// again and must not be treated as a failure.
+    pub async fn reap_stale_pending(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<(String, i64, String, bool)>, anyhow::Error> {
+        self.execute_with_timeout(move |conn| {
+            let lease_secs = SESSION_LEASE_SECS;
+            let candidates: Vec<(String, i64, String, bool, i64, i64)> = {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT id, user_id, status, job_started_at IS NOT NULL, attempt_count, max_attempts FROM pending_downloads WHERE ((status IN ('pending', 'verified') AND notified_at IS NULL AND COALESCE(lease_expires_at, datetime(created_at, '+{lease_secs} seconds')) < datetime('now')) OR (status IN ('claimed', 'downloading') AND COALESCE(lease_expires_at, datetime(created_at, '+{lease_secs} seconds')) < datetime('now')) OR (status = 'uploading' AND COALESCE(lease_expires_at, datetime(created_at, '+600 seconds')) < datetime('now')) OR (status = 'downloaded' AND COALESCE(download_completed_at, created_at) < datetime('now', '-600 seconds'))) ORDER BY created_at ASC LIMIT ?1"
+                ))?;
+                stmt.query_map(params![limit as i64], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })?
+                .filter_map(|row| row.ok())
+                .collect()
+            };
+            let mut reaped = Vec::new();
+            for (id, user_id, status, job_started, attempts, max_attempts) in candidates {
+                match status.as_str() {
+                    "pending" | "verified" => {
+                        let moved = conn.execute(
+                            &format!(
+                                "UPDATE pending_downloads SET status = 'expired', notified_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('pending', 'verified') AND notified_at IS NULL AND COALESCE(lease_expires_at, datetime(created_at, '+{lease_secs} seconds')) < datetime('now')"
+                            ),
+                            params![&id],
+                        )?;
+                        if moved == 1 {
+                            reaped.push((id, user_id, "expired".to_string(), job_started));
+                        }
+                    }
+                    "claimed" | "downloading" => {
+                        if attempts < max_attempts {
+                            let moved = conn.execute(
+                                "UPDATE pending_downloads SET status = 'verified', lease_token = NULL, lease_expires_at = NULL, last_error = 'lease expired; retry' WHERE id = ?1 AND status IN ('claimed', 'downloading')",
+                                params![&id],
+                            )?;
+                            if moved == 1 {
+                                reaped.push((id, user_id, "verified".to_string(), job_started));
+                            }
+                        } else {
+                            let moved = conn.execute(
+                                "UPDATE pending_downloads SET status = 'failed', failed_at = CURRENT_TIMESTAMP, notified_at = CURRENT_TIMESTAMP, last_error = 'lease expired; attempts exhausted', lease_token = NULL, lease_expires_at = NULL WHERE id = ?1 AND status IN ('claimed', 'downloading')",
+                                params![&id],
+                            )?;
+                            if moved == 1 {
+                                reaped.push((id, user_id, "failed".to_string(), job_started));
+                            }
+                        }
+                    }
+                    "uploading" => {
+                        let moved = conn.execute(
+                            "UPDATE pending_downloads SET status = 'delivery_unknown', notified_at = CURRENT_TIMESTAMP, last_error = 'upload lease expired', lease_token = NULL, lease_expires_at = NULL WHERE id = ?1 AND status = 'uploading'",
+                            params![&id],
+                        )?;
+                        if moved == 1 {
+                            reaped.push((id, user_id, "delivery_unknown".to_string(), job_started));
+                        }
+                    }
+                    "downloaded" => {
+                        let moved = conn.execute(
+                            "UPDATE pending_downloads SET status = 'failed', failed_at = CURRENT_TIMESTAMP, notified_at = CURRENT_TIMESTAMP, last_error = 'download sat unuploaded', file_path = NULL, lease_token = NULL, lease_expires_at = NULL WHERE id = ?1 AND status = 'downloaded'",
+                            params![&id],
+                        )?;
+                        if moved == 1 {
+                            reaped.push((id, user_id, "failed".to_string(), job_started));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(reaped)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to reap stale pending downloads: {}", e))
     }
 
     /// Broadcast recipients of one bot as (telegram_id, bot_id) pairs.
@@ -2650,7 +3030,7 @@ mod tests {
         let (pool, _file) = setup_test_db().await;
         pool.execute_with_timeout(|conn| {
             conn.execute(
-                "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('claimed-undelivered', 1, 'http://x', 'completed')",
+                "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('claimed-undelivered', 1, 'http://x', 'claimed')",
                 (),
             )?;
             conn.execute(
@@ -3105,7 +3485,7 @@ mod tests {
         assert!(pool.claim_if_ad_presented("gate-once").await.is_err());
         assert_eq!(
             pool.get_pending_download_status("gate-once").await.unwrap(),
-            Some("completed".to_string())
+            Some("claimed".to_string())
         );
     }
 
@@ -3134,7 +3514,7 @@ mod tests {
         assert_eq!(winners, 1, "exactly one of two concurrent claims must win");
         assert_eq!(
             pool.get_pending_download_status("gate-race").await.unwrap(),
-            Some("completed".to_string())
+            Some("claimed".to_string())
         );
     }
 

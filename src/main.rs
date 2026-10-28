@@ -11,6 +11,7 @@ use tiktokdownloader::BotCtx;
 use tiktokdownloader::build_handler;
 use tiktokdownloader::database::DatabasePool;
 use tiktokdownloader::handlers::broadcast::BroadcastState;
+use tiktokdownloader::handlers::link::{BatchOutcome, notify_batch_outcome};
 use tiktokdownloader::mtproto_uploader::MTProtoUploader;
 use tiktokdownloader::utils::task_manager::TaskManager;
 use tiktokdownloader::yt_dlp_interface::{YoutubeFetcher, ensure_binaries, is_executable_present};
@@ -458,25 +459,35 @@ async fn main() -> Result<(), Error> {
         loop {
             interval.tick().await;
             match sweep_db
-                .expire_stale_pending(tiktokdownloader::database::EXPIRY_BATCH_LIMIT)
+                .reap_stale_pending(tiktokdownloader::database::EXPIRY_BATCH_LIMIT)
                 .await
             {
                 Ok(stale) => {
-                    for (ymid, user_id, job_started) in stale {
+                    for (ymid, user_id, new_status, job_started) in stale {
                         // Silent on purpose. This used to message the user; the
                         // data showed it was wrong, because practically every
                         // expired session was one where NO ad was displayed -
                         // so it told people who never saw an ad to resend a link
-                        // that could not help. The row still becomes `expired`
+                        // that could not help. The row still becomes terminal
                         // so the funnel stays honest; only the notification is
                         // gone. Rows are kept, not deleted: that table is the
                         // record of what happened and costs ~3.5 MB.
                         log::warn!(
-                            "Expiring abandoned session {} for user {} (download started: {})",
+                            "Reaped {} for user {} (download started: {})",
                             ymid,
                             user_id,
                             job_started
                         );
+                        match new_status.as_str() {
+                            "expired" => {
+                                notify_batch_outcome(Some(ymid.as_str()), BatchOutcome::Skipped)
+                            }
+                            "failed" | "delivery_unknown" => {
+                                notify_batch_outcome(Some(ymid.as_str()), BatchOutcome::Failed)
+                            }
+                            // `verified` is retryable: leave the waiter alone.
+                            _ => {}
+                        }
                     }
                 }
                 Err(e) => log::error!("Expiry sweeper failed: {}", e),
