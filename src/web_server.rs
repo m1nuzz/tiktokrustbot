@@ -581,6 +581,7 @@ async fn spawn_download_job(
             ChatId(user_id),
             Some(lang),
             Some(ymid),
+            true,
             None,
         )
         .await

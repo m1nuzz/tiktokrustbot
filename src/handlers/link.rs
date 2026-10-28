@@ -808,6 +808,7 @@ pub async fn link_handler(
         msg.chat.id,
         Some(lang),
         None,
+        batch.as_ref().map_or(true, |b| b.position == 1),
         None,
     )
     .await
@@ -954,6 +955,7 @@ pub async fn process_video_request(
     chat_id: ChatId,
     lang: Option<String>,
     ymid: Option<String>,
+    show_starting: bool,
     quality_override: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // If this is a batch row, every exit path must wake the ad-choice waiter.
@@ -963,8 +965,13 @@ pub async fn process_video_request(
     // Acknowledge immediately so the user sees feedback while the burst is
     // still being collected / the job waits for its turn.
     let mut progress_bar = ProgressBar::new(bot.clone(), chat_id);
-    log::info!("Sending Starting... for user {}", user_id);
-    progress_bar.start("🎬 Starting...").await?;
+    let mut progress_started = show_starting;
+    if show_starting {
+        log::info!("Sending Starting... for user {}", user_id);
+        progress_bar.start("🎬 Starting...").await?;
+    } else {
+        log::info!("Prefetching in background for user {}", user_id);
+    }
 
     // A burst is delivered in message order even when several of its videos
     // are claimed at once: wait here until every earlier row of the same
@@ -1131,6 +1138,12 @@ pub async fn process_video_request(
                     }
                 }
             }
+        }
+
+        if !progress_started {
+            log::info!("Activating upload status for user {}", user_id);
+            let _ = progress_bar.start("📤 Uploading...").await;
+            progress_started = true;
         }
 
         if let Some(ymid) = ymid.as_deref() {
