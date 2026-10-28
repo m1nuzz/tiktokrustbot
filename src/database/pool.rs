@@ -641,6 +641,18 @@ impl DatabasePool {
     /// rows move: a `verified` row already has an ad impression and a
     /// `completed` row already has a delivery in flight, so skipping either
     /// would race the job. Notified immediately so the sweeper ignores it.
+    pub async fn mark_pending_completed(&self, id: &str) -> Result<usize, anyhow::Error> {
+        let id_owned = id.to_string();
+        self.execute_with_timeout(move |conn| {
+            conn.execute(
+                "UPDATE pending_downloads SET status = 'completed', file_path = NULL WHERE id = ?1 AND status IN ('downloaded', 'downloading', 'pending', 'verified')",
+                params![id_owned],
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to mark {} completed: {}", id, e))
+    }
+
     pub async fn mark_pending_skipped(&self, id: &str) -> Result<usize, anyhow::Error> {
         let id_owned = id.to_string();
         self.execute_with_timeout(move |conn| {

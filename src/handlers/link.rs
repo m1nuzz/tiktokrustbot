@@ -1116,6 +1116,9 @@ pub async fn process_video_request(
                 Ok(())
             }).await;
 
+            if let Some(id) = ymid.as_deref() {
+                let _ = db_pool.mark_pending_completed(id).await;
+            }
             notify_batch_outcome(ymid.as_deref(), BatchOutcome::Delivered);
             Ok(())
         }
