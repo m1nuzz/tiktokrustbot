@@ -916,6 +916,7 @@ pub async fn handle_yt_pick_callback(
         ChatId(pick.chat_id),
         pick.lang.clone(),
         None,
+        true,
         Some(quality),
     )
     .await
