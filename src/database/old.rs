@@ -1126,4 +1126,122 @@ mod tests {
             env::remove_var("DATABASE_PATH");
         }
     }
+
+    #[test]
+    #[serial]
+    fn test_pending_state_machine_migration_idempotent_and_indexed() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        unsafe {
+            env::set_var("DATABASE_PATH", db_path.to_str().unwrap());
+        }
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+                (),
+            )
+            .unwrap();
+            // Two pending rows with the same request key: migration must keep
+            // only the newest one pending and supersede the older duplicate.
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status, created_at) VALUES ('old', 7, 'http://dup', 'pending', datetime('now', '-2 minutes'))",
+                (),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status, created_at) VALUES ('new', 7, 'http://dup', 'pending', datetime('now', '-1 minute'))",
+                (),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('done', 7, 'http://done', 'completed')",
+                (),
+            )
+            .unwrap();
+        }
+
+        init_database().unwrap();
+        init_database().unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let cols = pending_columns(&conn);
+        for expected in [
+            "chat_id",
+            "request_key",
+            "verified_at",
+            "claimed_at",
+            "download_completed_at",
+            "upload_started_at",
+            "delivered_at",
+            "failed_at",
+            "superseded_at",
+            "attempt_count",
+            "max_attempts",
+            "last_error",
+            "lease_token",
+            "choice_chat_id",
+            "choice_message_id",
+            "replaced_by",
+            "bot_id",
+        ] {
+            assert!(
+                cols.contains(&expected.to_string()),
+                "missing column {expected}"
+            );
+        }
+
+        let pending_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_downloads WHERE request_key = 'primary:7:http://dup' AND status = 'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_count, 1);
+
+        let superseded_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_downloads WHERE request_key = 'primary:7:http://dup' AND status = 'superseded'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(superseded_count, 1);
+
+        let indexes: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_pending_request_pending', 'idx_pending_batch_order', 'idx_pending_lease')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 3);
+
+        let downloads_cols = downloads_columns(&conn);
+        assert!(downloads_cols.contains(&"pending_id".to_string()));
+
+        unsafe {
+            env::remove_var("DATABASE_PATH");
+        }
+    }
+}
+
+fn pending_columns(conn: &Connection) -> Vec<String> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(pending_downloads)")
+        .unwrap();
+    stmt.query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+}
+
+fn downloads_columns(conn: &Connection) -> Vec<String> {
+    let mut stmt = conn.prepare("PRAGMA table_info(downloads)").unwrap();
+    stmt.query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
 }

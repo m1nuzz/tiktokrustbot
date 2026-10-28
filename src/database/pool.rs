@@ -4364,4 +4364,29 @@ mod tests {
             .unwrap();
         assert_eq!(status, "delivery_unknown");
     }
+
+    #[tokio::test]
+    async fn stats_use_claimed_and_verified_timestamps() {
+        let (pool, _file) = setup_test_db().await;
+        pool.execute_with_timeout(|conn| {
+            conn.execute("INSERT INTO users (telegram_id) VALUES (1)", ())?;
+            conn.execute(
+                "INSERT INTO pending_downloads (id, user_id, video_url, status, verified_at, claimed_at, created_at) VALUES ('claimed-row', 1, 'http://x', 'claimed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                (),
+            )?;
+            conn.execute(
+                "INSERT INTO downloads (user_telegram_id, video_url, download_date) VALUES (1, 'http://x', CURRENT_TIMESTAMP)",
+                (),
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let stats = pool.get_funnel_stats(None, 7, &[]).await.unwrap();
+        let today = &stats[6];
+        assert_eq!(today.ad_watched, 1);
+        assert_eq!(today.claimed, 1);
+        assert_eq!(today.delivered, 1);
+    }
 }
