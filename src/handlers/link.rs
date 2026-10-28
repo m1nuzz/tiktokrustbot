@@ -1021,6 +1021,7 @@ pub async fn process_video_request(
             progress_bar
                 .update(85, Some("📤 Uploading (Large)..."))
                 .await?;
+            let upload_start = std::time::Instant::now();
             let upload_result = match timeout(UPLOAD_TIMEOUT, async {
                 if is_audio {
                     mtproto_uploader
@@ -1044,15 +1045,26 @@ pub async fn process_video_request(
 
             match upload_result {
                 Ok(()) => {
+                    log::info!(
+                        "Upload (large) completed in {:?} for {}",
+                        upload_start.elapsed(),
+                        path.display()
+                    );
                     progress_bar.update(100, Some("✅ Done!")).await?;
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     progress_bar.delete().await?;
                 }
                 Err(e) => {
+                    log::error!(
+                        "Upload (large) failed after {:?}: {}",
+                        upload_start.elapsed(),
+                        e
+                    );
                     return Err(e);
                 }
             }
         } else {
+            let upload_start = std::time::Instant::now();
             let send_res = match timeout(UPLOAD_TIMEOUT, async {
                 let mut retries = 0;
                 loop {
@@ -1099,8 +1111,18 @@ pub async fn process_video_request(
                 )),
             };
             if let Err(e) = send_res {
+                log::error!(
+                    "Upload (small) failed after {:?}: {}",
+                    upload_start.elapsed(),
+                    e
+                );
                 return Err(e);
             }
+            log::info!(
+                "Upload (small) completed in {:?} for {}",
+                upload_start.elapsed(),
+                path.display()
+            );
         }
         Ok::<(), anyhow::Error>(())
     };
