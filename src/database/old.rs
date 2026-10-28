@@ -426,6 +426,14 @@ pub fn init_database() -> Result<()> {
         "UPDATE pending_downloads SET chat_id = user_id WHERE chat_id IS NULL",
         (),
     )?;
+    // Collapse duplicates before backfilling request_key. A row inserted by an
+    // older code path may still have NULL request_key while an equivalent row
+    // already carries the derived key; grouping by the derived key keeps the
+    // newest row and avoids tripping the partial unique index during backfill.
+    conn.execute(
+        "UPDATE pending_downloads SET status = 'superseded', superseded_at = CURRENT_TIMESTAMP WHERE status = 'pending' AND rowid NOT IN (SELECT MAX(rowid) FROM pending_downloads WHERE status = 'pending' GROUP BY COALESCE(request_key, bot_id || ':' || COALESCE(chat_id, user_id) || ':' || video_url))",
+        (),
+    )?;
     conn.execute(
         "UPDATE pending_downloads SET request_key = bot_id || ':' || COALESCE(chat_id, user_id) || ':' || video_url WHERE request_key IS NULL",
         (),
@@ -474,7 +482,7 @@ pub fn init_database() -> Result<()> {
     // The unique pending index needs one row per request_key. Keep the newest
     // pending row and close older duplicates as superseded.
     conn.execute(
-        "UPDATE pending_downloads SET status = 'superseded', superseded_at = CURRENT_TIMESTAMP WHERE status = 'pending' AND rowid NOT IN (SELECT MAX(rowid) FROM pending_downloads WHERE status = 'pending' GROUP BY request_key)",
+        "UPDATE pending_downloads SET status = 'superseded', superseded_at = CURRENT_TIMESTAMP WHERE status = 'pending' AND rowid NOT IN (SELECT MAX(rowid) FROM pending_downloads WHERE status = 'pending' GROUP BY COALESCE(request_key, bot_id || ':' || COALESCE(chat_id, user_id) || ':' || video_url))",
         (),
     )?;
 
