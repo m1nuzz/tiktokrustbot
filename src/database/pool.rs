@@ -711,59 +711,63 @@ impl DatabasePool {
                 )
                 .optional()?;
 
-            let existing = match existing {
-                Some((id, status, choice_chat_id, choice_message_id, old_batch_id, old_position, old_total)) => {
-                    if status == "pending" {
-                        let old_batch = match (old_batch_id, old_position, old_total) {
-                            (Some(b), Some(p), Some(t)) => Some((b, p, t)),
-                            _ => None,
-                        };
-                        let effective_batch = match (batch_owned.clone(), position, total) {
-                            (Some(b), Some(p), Some(t)) => Some((b, p, t)),
-                            _ => old_batch.clone(),
-                        };
-                        let superseded = tx.execute(
-                            "UPDATE pending_downloads SET status = 'superseded', superseded_at = CURRENT_TIMESTAMP, replaced_by = ?2 WHERE id = ?1 AND status = 'pending'",
-                            params![id, new_id_owned],
-                        )?;
-                        if superseded == 0 {
-                            tx.rollback()?;
-                            return Ok(ReplacePendingOutcome::Active {
-                                status: "pending".to_string(),
-                            });
-                        }
-                        insert_replacement_row(
-                            &tx,
-                            &new_id_owned,
-                            &bot_owned,
-                            chat_id,
-                            user_id,
-                            &video_url_owned,
-                            &request_key,
-                            lease_secs,
-                            effective_batch.as_ref(),
-                        )?;
-                        tx.commit()?;
-                        return Ok(ReplacePendingOutcome::Replaced {
-                            new_id: new_id_owned,
-                            old_id: id,
-                            old_choice_chat_id: choice_chat_id,
-                            old_choice_message_id: choice_message_id,
-                            batch: effective_batch,
+            if let Some((
+                id,
+                status,
+                choice_chat_id,
+                choice_message_id,
+                old_batch_id,
+                old_position,
+                old_total,
+            )) = existing
+            {
+                if status == "pending" {
+                    let old_batch = match (old_batch_id, old_position, old_total) {
+                        (Some(b), Some(p), Some(t)) => Some((b, p, t)),
+                        _ => None,
+                    };
+                    let effective_batch = match (batch_owned.clone(), position, total) {
+                        (Some(b), Some(p), Some(t)) => Some((b, p, t)),
+                        _ => old_batch.clone(),
+                    };
+                    let superseded = tx.execute(
+                        "UPDATE pending_downloads SET status = 'superseded', superseded_at = CURRENT_TIMESTAMP, replaced_by = ?2 WHERE id = ?1 AND status = 'pending'",
+                        params![id, new_id_owned],
+                    )?;
+                    if superseded == 0 {
+                        tx.rollback()?;
+                        return Ok(ReplacePendingOutcome::Active {
+                            status: "pending".to_string(),
                         });
                     }
-                    if matches!(
-                        status.as_str(),
-                        "verified" | "claimed" | "downloading" | "downloaded" | "uploading"
-                    ) {
-                        tx.rollback()?;
-                        return Ok(ReplacePendingOutcome::Active { status });
-                    }
-                    None
+                    insert_replacement_row(
+                        &tx,
+                        &new_id_owned,
+                        &bot_owned,
+                        chat_id,
+                        user_id,
+                        &video_url_owned,
+                        &request_key,
+                        lease_secs,
+                        effective_batch.as_ref(),
+                    )?;
+                    tx.commit()?;
+                    return Ok(ReplacePendingOutcome::Replaced {
+                        new_id: new_id_owned,
+                        old_id: id,
+                        old_choice_chat_id: choice_chat_id,
+                        old_choice_message_id: choice_message_id,
+                        batch: effective_batch,
+                    });
                 }
-                None => None,
-            };
-            let _ = existing;
+                if matches!(
+                    status.as_str(),
+                    "verified" | "claimed" | "downloading" | "downloaded" | "uploading"
+                ) {
+                    tx.rollback()?;
+                    return Ok(ReplacePendingOutcome::Active { status });
+                }
+            }
 
             let effective_batch = match (batch_owned, position, total) {
                 (Some(b), Some(p), Some(t)) => Some((b, p, t)),
