@@ -930,7 +930,6 @@ pub async fn process_video_request(
                 )
                 .await?;
                 progress_bar.update(100, Some("✅ Done!")).await?;
-                tokio::time::sleep(Duration::from_millis(500)).await;
                 progress_bar.delete().await?;
                 return Ok::<(), anyhow::Error>(());
             }
@@ -1055,7 +1054,6 @@ pub async fn process_video_request(
                         notify_batch_outcome(Some(id), BatchOutcome::Delivered);
                     }
                     progress_bar.update(100, Some("✅ Done!")).await?;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
                     progress_bar.delete().await?;
                 }
                 Err(e) => {
