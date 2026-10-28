@@ -1407,7 +1407,7 @@ mod tests {
             db.get_pending_download_status("valued-pending")
                 .await
                 .unwrap(),
-            Some("completed".to_string())
+            Some("claimed".to_string())
         );
     }
 
@@ -1444,7 +1444,7 @@ mod tests {
         assert_eq!(deliveries, 1, "three valued postbacks, one delivery");
         assert_eq!(
             db.get_pending_download_status("retried").await.unwrap(),
-            Some("completed".to_string())
+            Some("claimed".to_string())
         );
     }
 
@@ -1478,7 +1478,7 @@ mod tests {
             db.get_pending_download_status("free-pending")
                 .await
                 .unwrap(),
-            Some("completed".to_string())
+            Some("claimed".to_string())
         );
     }
 
@@ -1579,7 +1579,7 @@ mod tests {
         ));
         assert_eq!(
             db.get_pending_download_status("click-first").await.unwrap(),
-            Some("completed".to_string())
+            Some("claimed".to_string())
         );
     }
 
@@ -1618,7 +1618,7 @@ mod tests {
             db.get_pending_download_status("already-done")
                 .await
                 .unwrap(),
-            Some("completed".to_string())
+            Some("claimed".to_string())
         );
         assert_eq!(
             db.get_pending_download_status("too-late").await.unwrap(),

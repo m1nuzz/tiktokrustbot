@@ -3155,7 +3155,7 @@ mod tests {
         pool.log_funnel_event("primary", 2, "text_no_link").await;
         pool.execute_with_timeout(|conn| {
             conn.execute(
-                "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('a', 1, 'http://x', 'completed')",
+                "INSERT INTO pending_downloads (id, user_id, video_url, status, verified_at, claimed_at) VALUES ('a', 1, 'http://x', 'completed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
                 (),
             )?;
             conn.execute(
@@ -3163,7 +3163,7 @@ mod tests {
                 (),
             )?;
             conn.execute(
-                "INSERT INTO pending_downloads (id, user_id, video_url, status) VALUES ('c', 999, 'http://z', 'completed')",
+                "INSERT INTO pending_downloads (id, user_id, video_url, status, verified_at, claimed_at) VALUES ('c', 999, 'http://z', 'completed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
                 (),
             )?;
             conn.execute(
@@ -3358,7 +3358,7 @@ mod tests {
             pool.get_pending_download_status("gate-valued")
                 .await
                 .unwrap(),
-            Some("completed".to_string())
+            Some("claimed".to_string())
         );
     }
 
@@ -3384,7 +3384,7 @@ mod tests {
             pool.get_pending_download_status("gate-fresh")
                 .await
                 .unwrap(),
-            Some("completed".to_string())
+            Some("claimed".to_string())
         );
     }
 
@@ -3421,7 +3421,7 @@ mod tests {
         assert_eq!(via, ClaimVia::Verified);
         assert_eq!(
             pool.get_pending_download_status("gate-free").await.unwrap(),
-            Some("completed".to_string())
+            Some("claimed".to_string())
         );
     }
 
