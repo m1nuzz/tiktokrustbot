@@ -935,9 +935,10 @@ impl DatabasePool {
         .map_err(|e| anyhow::anyhow!("Failed to check earlier batch rows for {}: {}", batch_id, e))
     }
 
-    /// Whether an earlier row of the same burst has not finished downloading
-    /// yet. Used by the download phase to start downloads in parallel while
-    /// keeping upload order.
+    /// Whether an earlier row of the same burst must finish its download phase
+    /// before this one can start. Up to two downloads may run in parallel, but
+    /// a later item never starts before an earlier item has begun downloading.
+    /// Used by the download phase to prefetch while keeping upload order.
     pub async fn earlier_downloads_unfinished(
         &self,
         batch_id: &str,
@@ -945,12 +946,20 @@ impl DatabasePool {
     ) -> Result<bool, anyhow::Error> {
         let batch_owned = batch_id.to_string();
         self.execute_with_timeout(move |conn| {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM pending_downloads WHERE batch_id = ?1 AND batch_position < ?2 AND status IN ('pending', 'verified', 'claimed', 'downloading')",
+            let not_started: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pending_downloads WHERE batch_id = ?1 AND batch_position < ?2 AND status IN ('pending', 'verified', 'claimed')",
+                params![batch_owned.clone(), position],
+                |r| r.get(0),
+            )?;
+            let downloading: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pending_downloads WHERE batch_id = ?1 AND batch_position < ?2 AND status = 'downloading'",
                 params![batch_owned, position],
                 |r| r.get(0),
             )?;
-            Ok(count > 0)
+            // Allow up to two downloads in flight for the same burst, but never
+            // start a later item before an earlier one has at least begun
+            // downloading. Upload/delivery order stays strictly serialized.
+            Ok(not_started > 0 || downloading >= 2)
         })
         .await
         .map_err(|e| anyhow::anyhow!("Failed to check earlier downloads for {}: {}", batch_id, e))
@@ -4388,5 +4397,66 @@ mod tests {
         assert_eq!(today.ad_watched, 1);
         assert_eq!(today.claimed, 1);
         assert_eq!(today.delivered, 1);
+    }
+
+    #[tokio::test]
+    async fn download_gate_allows_two_concurrent_downloads() {
+        let (pool, _file) = setup_test_db().await;
+        pool.execute_with_timeout(|conn| {
+            for (id, position) in [("g1", 1i64), ("g2", 2), ("g3", 3)] {
+                conn.execute(
+                    "INSERT INTO pending_downloads (id, user_id, video_url, status, batch_id, batch_position, batch_total) VALUES (?1, 1, 'http://v', 'pending', 'gate-batch', ?2, 3)",
+                    params![id, position],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // Two earlier downloads in flight: the third must wait.
+        for id in ["g1", "g2"] {
+            assert_eq!(pool.mark_pending_downloading(id).await.unwrap(), 1);
+        }
+        assert!(
+            pool.earlier_downloads_unfinished("gate-batch", 3)
+                .await
+                .unwrap()
+        );
+
+        // Once the first has finished downloading, the third may start while
+        // the second is still downloading: at most two downloads in flight.
+        assert_eq!(
+            pool.mark_pending_downloaded("g1", "output/g1.mp4")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            !pool
+                .earlier_downloads_unfinished("gate-batch", 3)
+                .await
+                .unwrap()
+        );
+
+        // An earlier row that has not started yet still blocks, even if two
+        // later rows are downloading.
+        assert_eq!(pool.mark_pending_downloading("g3").await.unwrap(), 1);
+        let (g1, g2, g3) = ("g1", "g2", "g3");
+        pool.execute_with_timeout(move |conn| {
+            conn.execute(
+                "UPDATE pending_downloads SET status = 'pending' WHERE id = ?1",
+                params![g2],
+            )?;
+            let _ = (g1, g3);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(
+            pool.earlier_downloads_unfinished("gate-batch", 3)
+                .await
+                .unwrap()
+        );
     }
 }
