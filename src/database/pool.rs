@@ -2458,7 +2458,7 @@ pub(crate) async fn setup_test_db() -> (DatabasePool, tempfile::NamedTempFile) {
             (),
         )?;
         conn.execute(
-            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, video_url TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL, job_started_at DATETIME DEFAULT NULL, entry_ymid TEXT DEFAULT NULL, ad_requested_at DATETIME DEFAULT NULL, bot_id TEXT NOT NULL DEFAULT 'primary', batch_id TEXT DEFAULT NULL, batch_position INTEGER DEFAULT NULL, batch_total INTEGER DEFAULT NULL, file_path TEXT)",
+            "CREATE TABLE pending_downloads (id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, chat_id BIGINT DEFAULT NULL, video_url TEXT NOT NULL, request_key TEXT DEFAULT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, notified_at DATETIME DEFAULT NULL, verified_at DATETIME DEFAULT NULL, claimed_at DATETIME DEFAULT NULL, download_completed_at DATETIME DEFAULT NULL, upload_started_at DATETIME DEFAULT NULL, delivered_at DATETIME DEFAULT NULL, failed_at DATETIME DEFAULT NULL, superseded_at DATETIME DEFAULT NULL, attempt_count INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 3, last_error TEXT DEFAULT NULL, lease_token TEXT DEFAULT NULL, choice_chat_id BIGINT DEFAULT NULL, choice_message_id BIGINT DEFAULT NULL, replaced_by TEXT DEFAULT NULL, lease_expires_at DATETIME DEFAULT NULL, job_started_at DATETIME DEFAULT NULL, entry_ymid TEXT DEFAULT NULL, ad_requested_at DATETIME DEFAULT NULL, bot_id TEXT NOT NULL DEFAULT 'primary', batch_id TEXT DEFAULT NULL, batch_position INTEGER DEFAULT NULL, batch_total INTEGER DEFAULT NULL, file_path TEXT)",
             (),
         )?;
         conn.execute(
@@ -2478,7 +2478,23 @@ pub(crate) async fn setup_test_db() -> (DatabasePool, tempfile::NamedTempFile) {
             (),
         )?;
         conn.execute(
-            "CREATE TABLE downloads (id INTEGER PRIMARY KEY, user_telegram_id BIGINT, video_url TEXT NOT NULL, download_date DATETIME DEFAULT CURRENT_TIMESTAMP, bot_id TEXT NOT NULL DEFAULT 'primary')",
+            "CREATE TABLE downloads (id INTEGER PRIMARY KEY, user_telegram_id BIGINT, video_url TEXT NOT NULL, download_date DATETIME DEFAULT CURRENT_TIMESTAMP, bot_id TEXT NOT NULL DEFAULT 'primary', pending_id TEXT DEFAULT NULL)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_pending_request_pending ON pending_downloads(request_key) WHERE status = 'pending'",
+            (),
+        )?;
+        conn.execute(
+            "CREATE INDEX idx_pending_batch_order ON pending_downloads(batch_id, batch_position, status)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE INDEX idx_pending_lease ON pending_downloads(status, lease_expires_at)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_downloads_pending_unique ON downloads(pending_id) WHERE pending_id IS NOT NULL",
             (),
         )?;
         Ok(())
@@ -4021,5 +4037,283 @@ mod tests {
         );
         let (_, total_after) = pool.get_admin_premium_grants("aaa", 10).await.unwrap();
         assert_eq!(total_after, 0);
+    }
+
+    #[tokio::test]
+    async fn replace_pending_download_supersedes_and_preserves_batch() {
+        let (pool, _file) = setup_test_db().await;
+        let first = pool
+            .replace_pending_download(
+                "primary",
+                2001,
+                2001,
+                "http://resend",
+                Some("batch-resend"),
+                Some(1),
+                Some(3),
+            )
+            .await
+            .unwrap();
+        let old_id = match first {
+            ReplacePendingOutcome::Created { new_id, batch } => {
+                assert_eq!(batch, Some(("batch-resend".to_string(), 1, 3)));
+                new_id
+            }
+            other => panic!("expected Created, got {:?}", other),
+        };
+        assert!(pool.set_choice_message(&old_id, 2001, 777).await.unwrap());
+
+        let second = pool
+            .replace_pending_download("primary", 2001, 2001, "http://resend", None, None, None)
+            .await
+            .unwrap();
+        let new_id = match second {
+            ReplacePendingOutcome::Replaced {
+                new_id,
+                old_id: replaced_id,
+                old_choice_chat_id,
+                old_choice_message_id,
+                batch,
+            } => {
+                assert_eq!(replaced_id, old_id);
+                assert_eq!(old_choice_chat_id, Some(2001));
+                assert_eq!(old_choice_message_id, Some(777));
+                assert_eq!(batch, Some(("batch-resend".to_string(), 1, 3)));
+                new_id
+            }
+            other => panic!("expected Replaced, got {:?}", other),
+        };
+        assert_ne!(new_id, old_id);
+
+        let (old_status, new_status, new_batch, replaced_by) = pool
+            .execute_with_timeout({
+                let new_id = new_id.clone();
+                move |conn| {
+                    conn.query_row(
+                        "SELECT (SELECT status FROM pending_downloads WHERE id = ?1), (SELECT status FROM pending_downloads WHERE id = ?2), (SELECT batch_id FROM pending_downloads WHERE id = ?2), (SELECT replaced_by FROM pending_downloads WHERE id = ?1)",
+                        params![old_id, new_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                            ))
+                        },
+                    )
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(old_status, "superseded");
+        assert_eq!(new_status, "pending");
+        assert_eq!(new_batch.as_deref(), Some("batch-resend"));
+        assert_eq!(replaced_by.as_deref(), Some(new_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn replace_pending_download_keeps_in_flight_row() {
+        let (pool, _file) = setup_test_db().await;
+        let id = match pool
+            .replace_pending_download("primary", 2002, 2002, "http://active", None, None, None)
+            .await
+            .unwrap()
+        {
+            ReplacePendingOutcome::Created { new_id, .. } => new_id,
+            other => panic!("expected Created, got {:?}", other),
+        };
+        pool.mark_as_verified_with_logging(&id).await.unwrap();
+        match pool
+            .replace_pending_download("primary", 2002, 2002, "http://active", None, None, None)
+            .await
+            .unwrap()
+        {
+            ReplacePendingOutcome::Active { status } => assert_eq!(status, "verified"),
+            other => panic!("expected Active verified, got {:?}", other),
+        }
+
+        pool.claim_verified_download(&id).await.unwrap();
+        match pool
+            .replace_pending_download("primary", 2002, 2002, "http://active", None, None, None)
+            .await
+            .unwrap()
+        {
+            ReplacePendingOutcome::Active { status } => assert_eq!(status, "claimed"),
+            other => panic!("expected Active claimed, got {:?}", other),
+        }
+
+        let request_key = "primary:2002:http://active".to_string();
+        let pending_count: i64 = pool
+            .execute_with_timeout(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pending_downloads WHERE request_key = ?1 AND status = 'pending'",
+                    params![request_key],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(pending_count, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_batch_row_unblocks_later_rows() {
+        let (pool, _file) = setup_test_db().await;
+        let first = pool
+            .create_pending_download_with_batch(
+                "primary",
+                2101,
+                "http://batch-1",
+                Some("batch-order"),
+                Some(1),
+                Some(2),
+            )
+            .await
+            .unwrap();
+        pool.create_pending_download_with_batch(
+            "primary",
+            2102,
+            "http://batch-2",
+            Some("batch-order"),
+            Some(2),
+            Some(2),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            pool.earlier_batch_rows_unfinished("batch-order", 2)
+                .await
+                .unwrap()
+        );
+        assert!(
+            pool.earlier_downloads_unfinished("batch-order", 2)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(pool.mark_pending_failed(&first).await.unwrap(), 1);
+        assert!(
+            !pool
+                .earlier_batch_rows_unfinished("batch-order", 2)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !pool
+                .earlier_downloads_unfinished("batch-order", 2)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn reaper_expires_pending_and_retries_claimed_until_attempts_exhausted() {
+        let (pool, _file) = setup_test_db().await;
+        let expired_id = pool
+            .create_pending_download("primary", 2201, "http://reap-expired")
+            .await
+            .unwrap();
+        let expired_owned = expired_id.clone();
+        pool.execute_with_timeout(move |conn| {
+            conn.execute(
+                "UPDATE pending_downloads SET lease_expires_at = datetime('now', '-1 minute') WHERE id = ?1",
+                params![expired_owned],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let reaped = pool.reap_stale_pending(10).await.unwrap();
+        assert!(
+            reaped
+                .iter()
+                .any(|(id, _, status, _)| id == &expired_id && status == "expired")
+        );
+
+        let claimed_id = pool
+            .create_pending_download("primary", 2202, "http://reap-claimed")
+            .await
+            .unwrap();
+        pool.mark_as_verified_with_logging(&claimed_id)
+            .await
+            .unwrap();
+        pool.claim_verified_download(&claimed_id).await.unwrap();
+        let claimed_owned = claimed_id.clone();
+        pool.execute_with_timeout(move |conn| {
+            conn.execute(
+                "UPDATE pending_downloads SET lease_expires_at = datetime('now', '-1 minute'), attempt_count = 0 WHERE id = ?1",
+                params![claimed_owned],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let reaped = pool.reap_stale_pending(10).await.unwrap();
+        assert!(
+            reaped
+                .iter()
+                .any(|(id, _, status, _)| id == &claimed_id && status == "verified")
+        );
+
+        let claimed_owned = claimed_id.clone();
+        pool.execute_with_timeout(move |conn| {
+            conn.execute(
+                "UPDATE pending_downloads SET status = 'claimed', attempt_count = 3, max_attempts = 3, lease_expires_at = datetime('now', '-1 minute') WHERE id = ?1",
+                params![claimed_owned],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let reaped = pool.reap_stale_pending(10).await.unwrap();
+        assert!(
+            reaped
+                .iter()
+                .any(|(id, _, status, _)| id == &claimed_id && status == "failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_delivery_records_download_and_finishes_pending_row() {
+        let (pool, _file) = setup_test_db().await;
+        let id = pool
+            .create_pending_download("primary", 2301, "http://deliver")
+            .await
+            .unwrap();
+        pool.mark_as_verified_with_logging(&id).await.unwrap();
+        pool.claim_verified_download(&id).await.unwrap();
+        assert_eq!(pool.mark_pending_downloading(&id).await.unwrap(), 1);
+        assert_eq!(
+            pool.mark_pending_downloaded(&id, "output/deliver.mp4")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(pool.mark_pending_uploading(&id).await.unwrap(), 1);
+        assert!(
+            pool.complete_delivery("primary", 2301, "http://deliver", &id)
+                .await
+                .unwrap()
+        );
+
+        let (status, downloads) = pool
+            .execute_with_timeout(move |conn| {
+                let status: String = conn.query_row(
+                    "SELECT status FROM pending_downloads WHERE id = ?1",
+                    params![id.clone()],
+                    |row| row.get(0),
+                )?;
+                let downloads: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM downloads WHERE pending_id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )?;
+                Ok((status, downloads))
+            })
+            .await
+            .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(downloads, 1);
     }
 }
