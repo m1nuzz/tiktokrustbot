@@ -479,8 +479,11 @@ async fn main() -> Result<(), Error> {
                             job_started
                         );
                         match new_status.as_str() {
+                            // An unanswered choice is not a "skip": end the
+                            // batch quietly instead of advancing to the next
+                            // video half an hour later.
                             "expired" => {
-                                notify_batch_outcome(Some(ymid.as_str()), BatchOutcome::Skipped)
+                                notify_batch_outcome(Some(ymid.as_str()), BatchOutcome::Expired)
                             }
                             "failed" | "delivery_unknown" => {
                                 notify_batch_outcome(Some(ymid.as_str()), BatchOutcome::Failed)

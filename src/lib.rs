@@ -18,7 +18,7 @@ use handlers::broadcast::BroadcastState;
 use handlers::broadcast::{
     BROADCAST_CANCEL, BROADCAST_CONFIRM, BROADCAST_SCOPE_ALL, BROADCAST_SCOPE_THIS,
 };
-use handlers::link::{BatchInfo, LinkJob};
+use handlers::link::{BatchInfo, BatchRuntime, LinkJob, LinkOutcome};
 pub use handlers::payments;
 use handlers::ui::{
     BTN_ADD_ADMIN, BTN_ADD_PREMIUM, BTN_ADMIN_LIST, BTN_ADMIN_MANAGEMENT, BTN_ADMIN_PANEL,
@@ -184,10 +184,24 @@ fn enqueue_link_job(job: LinkJob) {
     let _ = tx.send(job);
 }
 
-/// Drain one chat's queue. A burst is collected for 800 ms, sorted by
-/// `Message.message_id` (top message = smaller id), and processed one by one.
-/// The next link is not started until `link_handler` returns, which is what
-/// makes ad-choice messages appear in top-to-bottom order.
+/// Whether this burst will go through the ad mini-app. It only selects the
+/// execution shape: the ad flow runs strictly one item at a time, while
+/// premium/admin bursts download ahead in the background.
+async fn burst_uses_ads(job: &LinkJob) -> bool {
+    let is_admin = handlers::admin::is_admin(&job.msg).await;
+    handlers::link::ads_enabled_for(
+        job.db_pool.as_ref(),
+        job.ctx.bot_id.as_str(),
+        job.msg.chat.id.0,
+        is_admin,
+    )
+    .await
+}
+
+/// Drain one chat's queue. A burst is collected for 250 ms and sorted by
+/// `Message.message_id` (top message = smaller id). Every burst runs in its own
+/// supervisor task, so a burst waiting for an ad choice never blocks a link the
+/// user sends afterwards.
 async fn run_link_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<LinkJob>) {
     while let Some(first) = rx.recv().await {
         let collect_start = std::time::Instant::now();
@@ -213,49 +227,65 @@ async fn run_link_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<LinkJob>) {
         jobs.sort_by_key(|job| job.msg.id.0);
         let batch_id = Uuid::new_v4().to_string();
         let total = jobs.len() as i64;
+        let ads = burst_uses_ads(&jobs[0]).await;
 
-        let mut set = JoinSet::new();
-        for (index, job) in jobs.into_iter().enumerate() {
-            let dedupe_key = job.dedupe_key.clone();
-            // A lone link keeps the old single-link flow (no "1 of 1" header,
-            // no skip button, no wait). Only a real burst gets batch UI and
-            // waits for its item before showing the next one.
-            let batch = (total > 1).then(|| BatchInfo {
-                id: batch_id.clone(),
-                position: index as i64 + 1,
+        if total > 1 && !ads {
+            // Premium/admin burst: all items may download at once, but delivery
+            // is strictly top-to-bottom and only the first item speaks.
+            let runtime = BatchRuntime::new(
+                batch_id.clone(),
                 total,
-                source_message_id: job.msg.id.0 as i64,
-            });
-
-            set.spawn(async move {
-                let res = link_handler(job, batch).await;
-                PROCESSING.lock().await.remove(&dedupe_key);
-                res
-            });
-        }
-
-        // Spawn every item of the burst up front. Ad choices are still
-        // serialized by the per-item turnstile, but downloads can start as
-        // soon as the download gate allows, instead of waiting for the whole
-        // previous item to finish.
-        while !set.is_empty() {
-            tokio::select! {
-                Some(res) = set.join_next() => {
+                jobs[0].bot.clone(),
+                jobs[0].msg.chat.id,
+            );
+            tokio::spawn(async move {
+                let mut set = JoinSet::new();
+                for (index, job) in jobs.into_iter().enumerate() {
+                    let info = BatchInfo {
+                        id: batch_id.clone(),
+                        position: index as i64 + 1,
+                        total,
+                        source_message_id: job.msg.id.0 as i64,
+                    };
+                    let dedupe_key = job.dedupe_key.clone();
+                    let runtime = runtime.clone();
+                    set.spawn(async move {
+                        let res = link_handler(job, Some(info), Some(runtime)).await;
+                        PROCESSING.lock().await.remove(&dedupe_key);
+                        res
+                    });
+                }
+                while let Some(res) = set.join_next().await {
                     match res {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(_)) => {}
                         Ok(Err(e)) => log::error!("link_handler failed: {}", e),
                         Err(e) => log::error!("link_handler task failed: {}", e),
                     }
                 }
-                Some(new_job) = rx.recv() => {
-                    let new_dedupe_key = new_job.dedupe_key.clone();
-                    set.spawn(async move {
-                        let res = link_handler(new_job, None).await;
-                        PROCESSING.lock().await.remove(&new_dedupe_key);
-                        res
+                runtime.delete_status_message().await;
+            });
+        } else {
+            // Ad flow and single links: one item at a time, in message order.
+            // The choice message blocks until the user delivers or skips, which
+            // is exactly the "one button at a time" rule.
+            tokio::spawn(async move {
+                for (index, job) in jobs.into_iter().enumerate() {
+                    let info = (total > 1).then(|| BatchInfo {
+                        id: batch_id.clone(),
+                        position: index as i64 + 1,
+                        total,
+                        source_message_id: job.msg.id.0 as i64,
                     });
+                    let dedupe_key = job.dedupe_key.clone();
+                    let res = link_handler(job, info, None).await;
+                    PROCESSING.lock().await.remove(&dedupe_key);
+                    match res {
+                        Ok(LinkOutcome::Abandoned) => break,
+                        Ok(LinkOutcome::Done) => {}
+                        Err(e) => log::error!("link_handler failed: {}", e),
+                    }
                 }
-            }
+            });
         }
     }
 }

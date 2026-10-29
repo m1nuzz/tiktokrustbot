@@ -95,6 +95,177 @@ pub enum BatchOutcome {
     /// The old row was atomically superseded and a fresh choice message was
     /// sent, so this waiter must delete its stale message and exit quietly.
     Replaced,
+    /// The row's lease ran out before the user answered. The batch is over:
+    /// remove the keyboard instead of advancing to the next video.
+    Expired,
+}
+
+/// Where one item sits inside a burst, plus the shared in-memory pipeline that
+/// keeps premium deliveries in source order. The ad flow uses database rows
+/// instead: its choices are sequential by construction.
+#[derive(Clone)]
+pub struct DeliveryOrder {
+    pub position: i64,
+    pub total: i64,
+    pub runtime: Arc<BatchRuntime>,
+}
+
+/// Delivery cursor: the next position allowed to send, plus positions that
+/// ended without delivering (failed, deduped, subscription gate). Skipping
+/// them is what keeps one broken item from freezing the whole burst.
+struct DeliveryState {
+    next: i64,
+    abandoned: std::collections::HashSet<i64>,
+}
+
+/// One burst's ordering state. Position 1 owns the single status message; every
+/// other item is silent until it is actually delivered.
+pub struct BatchRuntime {
+    pub id: String,
+    pub total: i64,
+    bot: Bot,
+    chat_id: ChatId,
+    delivery: tokio::sync::Mutex<DeliveryState>,
+    turn: tokio::sync::Notify,
+    highest_download_start: tokio::sync::Mutex<i64>,
+    download_gate: tokio::sync::Notify,
+    status_message: tokio::sync::Mutex<Option<MessageId>>,
+}
+
+impl BatchRuntime {
+    pub fn new(id: String, total: i64, bot: Bot, chat_id: ChatId) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            total,
+            bot,
+            chat_id,
+            delivery: tokio::sync::Mutex::new(DeliveryState {
+                next: 1,
+                abandoned: std::collections::HashSet::new(),
+            }),
+            turn: tokio::sync::Notify::new(),
+            highest_download_start: tokio::sync::Mutex::new(0),
+            download_gate: tokio::sync::Notify::new(),
+            status_message: tokio::sync::Mutex::new(None),
+        })
+    }
+
+    /// Later items wait until the previous one has started downloading, so
+    /// permits are requested in source order and position 1 never loses the
+    /// race to a later item that skipped the status message.
+    pub async fn wait_download_order(&self, position: i64) {
+        if position <= 1 {
+            return;
+        }
+        loop {
+            let notified = self.download_gate.notified();
+            {
+                let highest = self.highest_download_start.lock().await;
+                if *highest >= position - 1 {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn mark_download_start(&self, position: i64) {
+        {
+            let mut highest = self.highest_download_start.lock().await;
+            if *highest < position {
+                *highest = position;
+            }
+        }
+        self.download_gate.notify_waiters();
+    }
+
+    /// Block until every earlier position has delivered or was skipped.
+    pub async fn wait_turn(&self, position: i64) {
+        loop {
+            let notified = self.turn.notified();
+            {
+                let mut state = self.delivery.lock().await;
+                loop {
+                    let current = state.next;
+                    if current < position && state.abandoned.remove(&current) {
+                        state.next = current + 1;
+                    } else {
+                        break;
+                    }
+                }
+                if state.next >= position {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// The item is done with its turn: advance the cursor if it owns it, or
+    /// remember it as skipped so later positions can move past it.
+    pub async fn release(&self, position: i64) {
+        {
+            let mut state = self.delivery.lock().await;
+            if state.next == position {
+                state.next += 1;
+                loop {
+                    let current = state.next;
+                    if state.abandoned.remove(&current) {
+                        state.next = current + 1;
+                    } else {
+                        break;
+                    }
+                }
+            } else if state.next < position {
+                state.abandoned.insert(position);
+            }
+        }
+        self.turn.notify_waiters();
+        self.mark_download_start(position).await;
+    }
+
+    pub async fn set_status_message(&self, id: MessageId) {
+        *self.status_message.lock().await = Some(id);
+    }
+
+    pub async fn delete_status_message(&self) {
+        let id = self.status_message.lock().await.take();
+        if let Some(id) = id {
+            let _ = self.bot.delete_message(self.chat_id, id).await;
+        }
+    }
+}
+
+/// Releases one burst item on every exit path: a delivered item advances the
+/// cursor, an item that never reached delivery is remembered as skipped, and
+/// either way the next download may start.
+pub struct BatchGuard {
+    runtime: Arc<BatchRuntime>,
+    position: i64,
+}
+
+impl BatchGuard {
+    pub fn new(runtime: Arc<BatchRuntime>, position: i64) -> Self {
+        Self { runtime, position }
+    }
+}
+
+impl Drop for BatchGuard {
+    fn drop(&mut self) {
+        let runtime = self.runtime.clone();
+        let position = self.position;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { runtime.release(position).await });
+        }
+    }
+}
+
+/// What a link job did with its burst. `Abandoned` tells the burst supervisor
+/// to stop: the waiting batch was replaced or expired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkOutcome {
+    Done,
+    Abandoned,
 }
 
 /// ymid -> waiter for the link handler that is currently blocked on the ad
@@ -402,7 +573,8 @@ pub async fn ads_enabled_for(
 pub async fn link_handler(
     job: LinkJob,
     batch: Option<BatchInfo>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    runtime: Option<Arc<BatchRuntime>>,
+) -> Result<LinkOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let LinkJob {
         bot,
         msg,
@@ -418,6 +590,13 @@ pub async fn link_handler(
     let user_id = msg.chat.id.0;
     let bot_id = ctx.bot_id.as_str();
 
+    // Every exit path of a burst item must let the next item through the
+    // download-order gate, including subscription or dedupe early returns.
+    let _batch_guard = runtime
+        .as_ref()
+        .zip(batch.as_ref())
+        .map(|(rt, info)| BatchGuard::new(rt.clone(), info.position));
+
     // Update user activity (per-bot row: identity is (bot_id, telegram_id)).
     let bot_id_owned = ctx.bot_id.clone();
     let _ = db_pool.execute_with_timeout(move |conn| {
@@ -428,11 +607,11 @@ pub async fn link_handler(
 
     let text = match msg.text() {
         Some(text) => text,
-        None => return Ok(()),
+        None => return Ok(LinkOutcome::Done),
     };
 
     if is_menu_button(text) {
-        return Ok(());
+        return Ok(LinkOutcome::Done);
     }
 
     // Effective locale: manual /language override wins, else Telegram tag.
@@ -459,7 +638,7 @@ pub async fn link_handler(
                 i18n::t(MsgKey::SendLinkGuide, Some(lang.as_str())),
             )
             .await?;
-            return Ok(());
+            return Ok(LinkOutcome::Done);
         }
     };
 
@@ -478,7 +657,7 @@ pub async fn link_handler(
             )
             .await?;
         }
-        return Ok(());
+        return Ok(LinkOutcome::Done);
     }
 
     // Deduplication is per (bot, chat, url): two different users sending the
@@ -492,7 +671,7 @@ pub async fn link_handler(
                 i18n::t(MsgKey::AlreadyProcessing, Some(lang.as_str())),
             )
             .await?;
-            return Ok(());
+            return Ok(LinkOutcome::Done);
         }
     };
 
@@ -553,7 +732,7 @@ pub async fn link_handler(
             )
             .reply_markup(InlineKeyboardMarkup::new(rows))
             .await?;
-            return Ok(());
+            return Ok(LinkOutcome::Done);
         }
         // Probe failed (private/live streams etc.): default download flow.
     }
@@ -561,44 +740,14 @@ pub async fn link_handler(
     // Mini App Ad invitation logic (single source of truth, shared with /api/ads-status)
     let ads_enabled = ads_enabled_for(&db_pool, bot_id, user_id as i64, is_user_admin).await;
 
-    // Keep ad choices in top-to-bottom order even when downloads are allowed
-    // to prefetch. This only gates the choice UI; it does not serialize the
-    // download phase.
-    if ads_enabled {
-        if let Some(batch_info) = batch.as_ref() {
-            if batch_info.position > 1 {
-                let notifier = batch_notifier(&batch_info.id);
-                let deadline = std::time::Instant::now() + Duration::from_secs(1800);
-                while db_pool
-                    .earlier_batch_rows_unfinished(&batch_info.id, batch_info.position)
-                    .await
-                    .unwrap_or(false)
-                {
-                    if std::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    let notified = notifier.notified();
-                    if !db_pool
-                        .earlier_batch_rows_unfinished(&batch_info.id, batch_info.position)
-                        .await
-                        .unwrap_or(false)
-                    {
-                        break;
-                    }
-                    tokio::select! {
-                        _ = notified => {}
-                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-                    }
-                }
-            }
-        }
-    }
-
+    // Ad choices are serialized by the burst supervisor itself: item N+1 is
+    // only started after item N is delivered or skipped, so there is no race
+    // between "check earlier rows" and "create my row".
     if ads_enabled {
         let webapp_url = std::env::var("WEBAPP_URL").unwrap_or_default();
         if !webapp_url.is_empty() {
             if let Ok(url_obj) = webapp_url.parse::<reqwest::Url>() {
-                let (ymid, effective_batch) = match db_pool
+                let (ymid, effective_batch, retired) = match db_pool
                     .replace_pending_download(
                         bot_id,
                         msg.chat.id.0,
@@ -610,39 +759,39 @@ pub async fn link_handler(
                     )
                     .await
                 {
-                    Ok(ReplacePendingOutcome::Created { new_id, batch }) => (new_id, batch),
+                    Ok(ReplacePendingOutcome::Created {
+                        new_id,
+                        batch,
+                        retired,
+                    }) => (new_id, batch, retired),
                     Ok(ReplacePendingOutcome::Replaced {
                         new_id,
-                        old_id,
-                        old_choice_chat_id,
-                        old_choice_message_id,
                         batch,
-                    }) => {
-                        // Delete the stale choice message before the old
-                        // waiter is woken: the old handler also deletes its
-                        // own `sent` message, and deleting twice is harmless.
-                        if let (Some(chat), Some(message)) =
-                            (old_choice_chat_id, old_choice_message_id)
-                        {
-                            let _ = bot
-                                .delete_message(ChatId(chat), MessageId(message as i32))
-                                .await;
-                        }
-                        notify_batch_outcome(Some(old_id.as_str()), BatchOutcome::Replaced);
-                        (new_id, batch)
-                    }
-                    Ok(ReplacePendingOutcome::Active { status }) => {
+                        retired,
+                        ..
+                    }) => (new_id, batch, retired),
+                    Ok(ReplacePendingOutcome::Active { status, retired }) => {
                         log::info!(
                             "Resend for {} kept the in-flight row (status {})",
                             url,
                             status
                         );
+                        // This video is already being delivered; the rest of
+                        // its waiting burst still gets retired by the resend.
+                        for row in retired {
+                            if let (Some(chat), Some(message)) = (row.chat_id, row.message_id) {
+                                let _ = bot
+                                    .delete_message(ChatId(chat), MessageId(message as i32))
+                                    .await;
+                            }
+                            notify_batch_outcome(Some(row.ymid.as_str()), BatchOutcome::Replaced);
+                        }
                         bot.send_message(
                             msg.chat.id,
                             i18n::t(MsgKey::AlreadyProcessing, Some(lang.as_str())),
                         )
                         .await?;
-                        return Ok(());
+                        return Ok(LinkOutcome::Done);
                     }
                     Err(e) => {
                         log::error!("Failed to create pending download: {}", e);
@@ -651,9 +800,21 @@ pub async fn link_handler(
                             i18n::t(MsgKey::ErrorInitDownload, Some(lang.as_str())),
                         )
                         .await?;
-                        return Ok(());
+                        return Ok(LinkOutcome::Done);
                     }
                 };
+
+                // The resend replaced whatever was still waiting: remove the
+                // old keyboards and wake their waiters, so the previous batch
+                // stops producing choices and cannot resurrect itself.
+                for row in retired {
+                    if let (Some(chat), Some(message)) = (row.chat_id, row.message_id) {
+                        let _ = bot
+                            .delete_message(ChatId(chat), MessageId(message as i32))
+                            .await;
+                    }
+                    notify_batch_outcome(Some(row.ymid.as_str()), BatchOutcome::Replaced);
+                }
 
                 if let Some((batch_id, _, _)) = effective_batch.as_ref() {
                     register_batch_ymid(&ymid, batch_id);
@@ -732,7 +893,7 @@ pub async fn link_handler(
                         // message is stale; delete it and do not wait.
                         let _ = bot.delete_message(sent.chat.id, sent.id).await;
                         remove_batch_waiter(&ymid);
-                        return Ok(());
+                        return Ok(LinkOutcome::Done);
                     }
                     Err(e) => log::warn!("Failed to store choice message for {}: {}", ymid, e),
                 }
@@ -745,7 +906,7 @@ pub async fn link_handler(
                     if status != "pending" {
                         let _ = bot.delete_message(sent.chat.id, sent.id).await;
                         remove_batch_waiter(&ymid);
-                        return Ok(());
+                        return Ok(LinkOutcome::Done);
                     }
                 }
 
@@ -758,23 +919,25 @@ pub async fn link_handler(
                     let outcome = match timeout(BATCH_WAIT_TIMEOUT, waiter).await {
                         Ok(Ok(outcome)) => outcome,
                         Ok(Err(_)) => BatchOutcome::Failed,
-                        Err(_) => {
-                            let _ = db_pool.mark_pending_skipped(&ymid).await;
-                            BatchOutcome::Skipped
-                        }
+                        // The user never answered. Do not mark the video
+                        // skipped and do not show the next one: quietly end
+                        // the batch (the row itself expires via the sweeper).
+                        Err(_) => BatchOutcome::Expired,
                     };
                     remove_batch_waiter(&ymid);
 
-                    if outcome == BatchOutcome::Replaced {
+                    // Replaced by a newer request, or abandoned: the burst is
+                    // over, so drop the keyboard instead of leaving "N of M".
+                    if matches!(outcome, BatchOutcome::Replaced | BatchOutcome::Expired) {
                         let _ = bot.delete_message(sent.chat.id, sent.id).await;
-                        return Ok(());
+                        return Ok(LinkOutcome::Abandoned);
                     }
 
                     let status_key = match outcome {
                         BatchOutcome::Delivered => MsgKey::BatchDelivered,
                         BatchOutcome::Skipped => MsgKey::BatchSkipped,
                         BatchOutcome::Failed => MsgKey::BatchFailed,
-                        BatchOutcome::Replaced => unreachable!(),
+                        BatchOutcome::Replaced | BatchOutcome::Expired => unreachable!(),
                     };
                     let status_text = batch_text(status_key, Some(lang.as_str()), position, total);
                     let _ = bot
@@ -784,12 +947,20 @@ pub async fn link_handler(
                     let _ = bot.edit_message_reply_markup(sent.chat.id, sent.id).await;
                 }
 
-                return Ok(());
+                return Ok(LinkOutcome::Done);
             }
         }
     }
 
     // Proceed to download
+    let delivery_order = match (runtime.as_ref(), batch.as_ref()) {
+        (Some(rt), Some(info)) => Some(DeliveryOrder {
+            position: info.position,
+            total: info.total,
+            runtime: rt.clone(),
+        }),
+        _ => None,
+    };
     process_video_request(
         bot,
         bot_id,
@@ -809,9 +980,11 @@ pub async fn link_handler(
         Some(lang),
         None,
         batch.as_ref().map_or(true, |b| b.position == 1),
+        delivery_order,
         None,
     )
-    .await
+    .await?;
+    Ok(LinkOutcome::Done)
 }
 
 /// Handle the per-item "Skip this video" button. Only a still-pending row can
@@ -917,6 +1090,7 @@ pub async fn handle_yt_pick_callback(
         pick.lang.clone(),
         None,
         true,
+        None,
         Some(quality),
     )
     .await
@@ -957,21 +1131,32 @@ pub async fn process_video_request(
     lang: Option<String>,
     ymid: Option<String>,
     show_starting: bool,
+    order: Option<DeliveryOrder>,
     quality_override: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // If this is a batch row, every exit path must wake the ad-choice waiter.
     // Success and fail_request notify first; this guard covers early `?` exits.
     let _batch_failure_guard = BatchFailureGuard(ymid.clone());
 
-    // Acknowledge immediately so the user sees feedback while the burst is
-    // still being collected / the job waits for its turn.
-    let mut progress_bar = ProgressBar::new(bot.clone(), chat_id);
-    let mut progress_started = show_starting;
-    if show_starting {
-        log::info!("Sending Starting... for user {}", user_id);
-        progress_bar.start("🎬 Starting...").await?;
+    // Only the first item of a burst speaks. Background items get a silent bar
+    // so they cannot create status bubbles of their own; ad-driven downloads
+    // stay silent too, because their choice message is the feedback.
+    let mut progress_bar = if show_starting {
+        ProgressBar::new(bot.clone(), chat_id)
     } else {
-        log::info!("Prefetching in background for user {}", user_id);
+        ProgressBar::silent()
+    };
+    let mut progress_started = false;
+    if order.is_some() {
+        // The batch owns this message and deletes it after the last video.
+        progress_bar.keep_message().await;
+    }
+
+    // Positions beyond the first wait until the previous download has started,
+    // so download permits are requested in source order and position 1 never
+    // loses the race to an item that skipped the status message.
+    if let Some(order) = order.as_ref() {
+        order.runtime.wait_download_order(order.position).await;
     }
 
     // A burst is delivered in message order even when several of its videos
@@ -1033,7 +1218,24 @@ pub async fn process_video_request(
         }
     }
 
-    progress_bar.update(5, Some("⬇️ Downloading...")).await?;
+    if let Some(order) = order.as_ref() {
+        order.runtime.mark_download_start(order.position).await;
+    }
+
+    // The acknowledgement is sent after the permit is taken, so it never
+    // delays the download itself.
+    if show_starting {
+        log::info!("Sending Starting... for user {}", user_id);
+        progress_bar.start("🎬 Starting...").await?;
+        progress_started = true;
+        if let Some(order) = order.as_ref() {
+            if let Some(id) = progress_bar.message_id().await {
+                order.runtime.set_status_message(id).await;
+            }
+        }
+    } else {
+        log::info!("Prefetching in background for user {}", user_id);
+    }
 
     // Whole-job budget (Tier 2): download attempts + upload must finish
     // within 30 minutes, otherwise the job is dropped and the user is told
@@ -1046,6 +1248,11 @@ pub async fn process_video_request(
         if url.contains("tiktok.com") {
             let meta = fetcher.probe_tikwm(&url).await;
             if !meta.images.is_empty() {
+                // A carousel is a delivery too: it must wait for its turn, or
+                // it would overtake the videos of the same burst.
+                if let Some(o) = order.as_ref() {
+                    o.runtime.wait_turn(o.position).await;
+                }
                 let stem = format!("output/{}", Uuid::new_v4());
                 crate::handlers::photo::handle_photo_post(
                     &bot,
@@ -1139,6 +1346,13 @@ pub async fn process_video_request(
                     }
                 }
             }
+        }
+
+        // Delivery turnstile: no video leaves this burst before every earlier
+        // one has been sent, whatever order the downloads finished in. The
+        // cursor is released by the item's BatchGuard when it returns.
+        if let Some(o) = order.as_ref() {
+            o.runtime.wait_turn(o.position).await;
         }
 
         if !progress_started {
@@ -1349,6 +1563,96 @@ mod tests {
     use rusqlite::params;
     use serial_test::serial;
     use tokio::time::{Duration, timeout};
+
+    /// The core promise: videos leave the bot top-to-bottom even when a later
+    /// download finished first.
+    #[tokio::test]
+    async fn batch_runtime_delivers_in_source_order() {
+        let rt = BatchRuntime::new("batch-order".to_string(), 3, Bot::new("dummy"), ChatId(1));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut set = tokio::task::JoinSet::new();
+        for position in 1..=3i64 {
+            let rt = rt.clone();
+            let tx = tx.clone();
+            set.spawn(async move {
+                rt.wait_turn(position).await;
+                tx.send(position).unwrap();
+                if position == 2 {
+                    // The second video's "download" finished first; it still
+                    // has to wait for the first one to be delivered.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                rt.release(position).await;
+            });
+        }
+        drop(tx);
+        while set.join_next().await.is_some() {}
+
+        let mut delivered = Vec::new();
+        while let Some(position) = rx.recv().await {
+            delivered.push(position);
+        }
+        assert_eq!(delivered, vec![1, 2, 3]);
+    }
+
+    /// Download permits are requested in source order, so position 1 never
+    /// loses the race to an item that skipped the status message.
+    #[tokio::test]
+    async fn batch_runtime_orders_download_starts() {
+        let rt = BatchRuntime::new(
+            "batch-download".to_string(),
+            3,
+            Bot::new("dummy"),
+            ChatId(1),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut set = tokio::task::JoinSet::new();
+        for position in 1..=3i64 {
+            let rt = rt.clone();
+            let tx = tx.clone();
+            set.spawn(async move {
+                rt.wait_download_order(position).await;
+                tx.send(position).unwrap();
+                rt.mark_download_start(position).await;
+            });
+        }
+        drop(tx);
+        while set.join_next().await.is_some() {}
+
+        let mut started = Vec::new();
+        while let Some(position) = rx.recv().await {
+            started.push(position);
+        }
+        assert_eq!(started, vec![1, 2, 3]);
+    }
+
+    /// A failed item must not freeze the burst: dropping its guard advances
+    /// both the download gate and the delivery cursor.
+    #[tokio::test]
+    async fn guards_release_the_burst_after_an_early_exit() {
+        let rt = BatchRuntime::new("batch-guard".to_string(), 2, Bot::new("dummy"), ChatId(1));
+        {
+            let _guard = BatchGuard::new(rt.clone(), 1);
+        }
+        timeout(Duration::from_secs(2), rt.wait_download_order(2))
+            .await
+            .expect("download gate did not open after the first item failed");
+        timeout(Duration::from_secs(2), rt.wait_turn(2))
+            .await
+            .expect("delivery turn did not advance after the first item failed");
+    }
+
+    /// A position that never reached delivery must be skipped, not waited for.
+    #[tokio::test]
+    async fn skipped_position_does_not_block_later_items() {
+        let rt = BatchRuntime::new("batch-skip".to_string(), 3, Bot::new("dummy"), ChatId(1));
+        // Item 2 gave up before its turn; item 1 delivered.
+        rt.release(2).await;
+        rt.release(1).await;
+        timeout(Duration::from_secs(2), rt.wait_turn(3))
+            .await
+            .expect("item 3 must proceed past a skipped item 2");
+    }
 
     #[tokio::test]
     async fn batch_notifier_wakes_on_notify() {

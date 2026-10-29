@@ -581,7 +581,10 @@ async fn spawn_download_job(
             ChatId(user_id),
             Some(lang),
             Some(ymid),
-            true,
+            // The ad choice message is this delivery's feedback: no extra
+            // "Starting..." bubble on top of it.
+            false,
+            None,
             None,
         )
         .await

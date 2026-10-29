@@ -115,22 +115,69 @@ pub struct WeeklyDayStats {
 
 /// One day of the conversion funnel. Drop-off reasons come from
 /// `pending_downloads` statuses; button-level steps from `funnel_events`.
+/// A pending row that a resend retired. The caller deletes its keyboard and
+/// wakes any in-memory waiter so the old batch stops producing more choices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredPendingRow {
+    pub ymid: String,
+    pub chat_id: Option<i64>,
+    pub message_id: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
 pub enum ReplacePendingOutcome {
     Created {
         new_id: String,
         batch: Option<(String, i64, i64)>,
+        retired: Vec<RetiredPendingRow>,
     },
     Replaced {
         new_id: String,
         old_id: String,
-        old_choice_chat_id: Option<i64>,
-        old_choice_message_id: Option<i64>,
         batch: Option<(String, i64, i64)>,
+        retired: Vec<RetiredPendingRow>,
     },
     Active {
         status: String,
+        retired: Vec<RetiredPendingRow>,
     },
+}
+
+/// Retire every still-waiting row of one burst in this chat. Used both by a
+/// replacement and by an "already in flight" resend, so the old batch can
+/// never keep its counter or its keyboards alive.
+fn retire_pending_batch(
+    tx: &rusqlite::Transaction<'_>,
+    batch_id: &str,
+    bot_id: &str,
+    chat_id: i64,
+    replaced_by: &str,
+) -> SqliteResult<Vec<RetiredPendingRow>> {
+    let rows: Vec<(String, Option<i64>, Option<i64>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, choice_chat_id, choice_message_id FROM pending_downloads WHERE batch_id = ?1 AND bot_id = ?2 AND chat_id = ?3 AND status = 'pending' ORDER BY batch_position ASC, rowid ASC",
+        )?;
+        let iter = stmt.query_map(params![batch_id, bot_id, chat_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        iter.collect::<SqliteResult<Vec<_>>>()?
+    };
+
+    let mut retired = Vec::new();
+    for (ymid, chat, message) in rows {
+        let superseded = tx.execute(
+            "UPDATE pending_downloads SET status = 'superseded', superseded_at = CURRENT_TIMESTAMP, replaced_by = ?2 WHERE id = ?1 AND status = 'pending'",
+            params![ymid, replaced_by],
+        )?;
+        if superseded > 0 {
+            retired.push(RetiredPendingRow {
+                ymid,
+                chat_id: chat,
+                message_id: message,
+            });
+        }
+    }
+    Ok(retired)
 }
 
 fn insert_replacement_row(
@@ -655,13 +702,18 @@ impl DatabasePool {
         }).await.map(|_| id).map_err(|e| anyhow::anyhow!("Failed to create pending download: {}", e))
     }
 
-    /// Create a row for a chat, or atomically replace the still-pending row
-    /// with the same `(bot, chat, url)` request key. The old row is moved to
-    /// `superseded` in the same transaction that inserts the new one, so the
-    /// partial unique index can never see two pending rows for one request.
+    /// Create a row for a chat, or atomically replace the request that is
+    /// still waiting for the user's ad choice.
+    ///
+    /// The new request defines the batch: a single resent link becomes a
+    /// standalone row (`batch = None`) even when it used to be the 2nd video of
+    /// a burst, and a resent burst starts at its own positions. Every waiting
+    /// row of the retired burst in this chat is moved to `superseded` in the
+    /// same transaction, so the old counter can never leak into the new reply
+    /// and the old keyboard is reported back to the caller for deletion.
     ///
     /// A row past `pending` (verified/claimed/downloading/downloaded/uploading)
-    /// is already in flight and is never replaced: the caller must keep the
+    /// is already in flight and is never replaced: the caller keeps the
     /// existing "already being processed" reply. Terminal rows are history and
     /// do not block a new request.
     pub async fn replace_pending_download(
@@ -679,99 +731,93 @@ impl DatabasePool {
         let bot_owned = bot_id.to_string();
         let video_url_owned = video_url.to_string();
         let request_key = format!("{}:{}:{}", bot_id, chat_id, video_url);
-        let batch_owned = batch_id.map(str::to_string);
         let lease_secs = SESSION_LEASE_SECS;
+        // The request the user just made defines the batch. A single resent
+        // link must never inherit the position of the burst it came from.
+        let incoming_batch = match (batch_id.map(str::to_string), position, total) {
+            (Some(b), Some(p), Some(t)) => Some((b, p, t)),
+            _ => None,
+        };
 
         self.execute_with_timeout(move |conn| {
-            let tx = conn.unchecked_transaction()?;
-            let existing: Option<(
-                String,
-                String,
-                Option<i64>,
-                Option<i64>,
-                Option<String>,
-                Option<i64>,
-                Option<i64>,
-            )> = tx
+            // Read-then-write: a deferred transaction is upgraded after another
+            // connection may have committed (WAL BUSY_SNAPSHOT). IMMEDIATE takes
+            // the write lock up front, where busy_timeout actually applies.
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+
+            // An in-flight row owns its delivery. Replacing it would duplicate
+            // or lose a video the user already paid for with an ad, but the
+            // rest of its waiting burst still has to go: the user replaced it.
+            let in_flight: Option<(String, Option<String>)> = tx
                 .query_row(
-                    "SELECT id, status, choice_chat_id, choice_message_id, batch_id, batch_position, batch_total FROM pending_downloads WHERE request_key = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    "SELECT status, batch_id FROM pending_downloads WHERE request_key = ?1 AND status IN ('verified', 'claimed', 'downloading', 'downloaded', 'uploading') ORDER BY created_at DESC, rowid DESC LIMIT 1",
                     params![request_key],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                            row.get(5)?,
-                            row.get(6)?,
-                        ))
-                    },
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((status, batch)) = in_flight {
+                let retired = match batch {
+                    Some(batch_id) => retire_pending_batch(
+                        &tx,
+                        &batch_id,
+                        &bot_owned,
+                        chat_id,
+                        &new_id_owned,
+                    )?,
+                    None => Vec::new(),
+                };
+                tx.commit()?;
+                return Ok(ReplacePendingOutcome::Active { status, retired });
+            }
+
+            // Retire this URL's waiting row and, when it belonged to a burst,
+            // every waiting row of that burst in this chat. The old batch must
+            // not keep its counter alive or show further choices after a
+            // resend replaced it.
+            let own: Option<(String, Option<String>)> = tx
+                .query_row(
+                    "SELECT id, batch_id FROM pending_downloads WHERE request_key = ?1 AND status = 'pending' ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    params![request_key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
 
-            if let Some((
-                id,
-                status,
-                choice_chat_id,
-                choice_message_id,
-                old_batch_id,
-                old_position,
-                old_total,
-            )) = existing
-            {
-                if status == "pending" {
-                    let old_batch = match (old_batch_id, old_position, old_total) {
-                        (Some(b), Some(p), Some(t)) => Some((b, p, t)),
-                        _ => None,
-                    };
-                    let effective_batch = match (batch_owned.clone(), position, total) {
-                        (Some(b), Some(p), Some(t)) => Some((b, p, t)),
-                        _ => old_batch.clone(),
-                    };
-                    let superseded = tx.execute(
-                        "UPDATE pending_downloads SET status = 'superseded', superseded_at = CURRENT_TIMESTAMP, replaced_by = ?2 WHERE id = ?1 AND status = 'pending'",
-                        params![id, new_id_owned],
-                    )?;
-                    if superseded == 0 {
-                        tx.rollback()?;
-                        return Ok(ReplacePendingOutcome::Active {
-                            status: "pending".to_string(),
-                        });
+            let mut retired: Vec<RetiredPendingRow> = Vec::new();
+            let mut old_id: Option<String> = None;
+            if let Some((id, old_batch)) = own {
+                retired = match old_batch {
+                    Some(batch_id) => {
+                        retire_pending_batch(&tx, &batch_id, &bot_owned, chat_id, &new_id_owned)?
                     }
-                    insert_replacement_row(
-                        &tx,
-                        &new_id_owned,
-                        &bot_owned,
-                        chat_id,
-                        user_id,
-                        &video_url_owned,
-                        &request_key,
-                        lease_secs,
-                        effective_batch.as_ref(),
-                    )?;
-                    tx.commit()?;
-                    return Ok(ReplacePendingOutcome::Replaced {
-                        new_id: new_id_owned,
-                        old_id: id,
-                        old_choice_chat_id: choice_chat_id,
-                        old_choice_message_id: choice_message_id,
-                        batch: effective_batch,
-                    });
-                }
-                if matches!(
-                    status.as_str(),
-                    "verified" | "claimed" | "downloading" | "downloaded" | "uploading"
-                ) {
-                    tx.rollback()?;
-                    return Ok(ReplacePendingOutcome::Active { status });
-                }
+                    None => {
+                        // A standalone waiting request has no siblings: retire
+                        // just its own row.
+                        let (chat, message): (Option<i64>, Option<i64>) = tx.query_row(
+                            "SELECT choice_chat_id, choice_message_id FROM pending_downloads WHERE id = ?1",
+                            params![id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )?;
+                        let superseded = tx.execute(
+                            "UPDATE pending_downloads SET status = 'superseded', superseded_at = CURRENT_TIMESTAMP, replaced_by = ?2 WHERE id = ?1 AND status = 'pending'",
+                            params![id, new_id_owned],
+                        )?;
+                        if superseded > 0 {
+                            vec![RetiredPendingRow {
+                                ymid: id.clone(),
+                                chat_id: chat,
+                                message_id: message,
+                            }]
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                };
+                old_id = Some(id);
             }
 
-            let effective_batch = match (batch_owned, position, total) {
-                (Some(b), Some(p), Some(t)) => Some((b, p, t)),
-                _ => None,
-            };
             insert_replacement_row(
                 &tx,
                 &new_id_owned,
@@ -781,12 +827,22 @@ impl DatabasePool {
                 &video_url_owned,
                 &request_key,
                 lease_secs,
-                effective_batch.as_ref(),
+                incoming_batch.as_ref(),
             )?;
             tx.commit()?;
-            Ok(ReplacePendingOutcome::Created {
-                new_id: new_id_owned,
-                batch: effective_batch,
+
+            Ok(match old_id {
+                Some(old_id) => ReplacePendingOutcome::Replaced {
+                    new_id: new_id_owned,
+                    old_id,
+                    batch: incoming_batch,
+                    retired,
+                },
+                None => ReplacePendingOutcome::Created {
+                    new_id: new_id_owned,
+                    batch: incoming_batch,
+                    retired,
+                },
             })
         })
         .await
@@ -4048,75 +4104,162 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replace_pending_download_supersedes_and_preserves_batch() {
+    async fn resending_one_link_replaces_the_whole_waiting_batch() {
         let (pool, _file) = setup_test_db().await;
-        let first = pool
-            .replace_pending_download(
-                "primary",
-                2001,
-                2001,
-                "http://resend",
-                Some("batch-resend"),
-                Some(1),
-                Some(3),
-            )
-            .await
-            .unwrap();
-        let old_id = match first {
-            ReplacePendingOutcome::Created { new_id, batch } => {
-                assert_eq!(batch, Some(("batch-resend".to_string(), 1, 3)));
-                new_id
-            }
-            other => panic!("expected Created, got {:?}", other),
-        };
-        assert!(pool.set_choice_message(&old_id, 2001, 777).await.unwrap());
+        let batch = "batch-replace";
+        let mut old_ids = Vec::new();
+        for (index, url) in ["http://one", "http://two", "http://three"]
+            .iter()
+            .enumerate()
+        {
+            let outcome = pool
+                .replace_pending_download(
+                    "primary",
+                    2001,
+                    2001,
+                    url,
+                    Some(batch),
+                    Some(index as i64 + 1),
+                    Some(3),
+                )
+                .await
+                .unwrap();
+            let id = match outcome {
+                ReplacePendingOutcome::Created { new_id, .. } => new_id,
+                other => panic!("expected Created, got {:?}", other),
+            };
+            assert!(
+                pool.set_choice_message(&id, 2001, 700 + index as i64)
+                    .await
+                    .unwrap()
+            );
+            old_ids.push(id);
+        }
 
-        let second = pool
-            .replace_pending_download("primary", 2001, 2001, "http://resend", None, None, None)
+        // The user comes back to download only the second video: a single link
+        // must become a standalone request, not "Video 2 of 3" again.
+        let outcome = pool
+            .replace_pending_download("primary", 2001, 2001, "http://two", None, None, None)
             .await
             .unwrap();
-        let new_id = match second {
+        let (new_id, retired) = match outcome {
             ReplacePendingOutcome::Replaced {
                 new_id,
-                old_id: replaced_id,
-                old_choice_chat_id,
-                old_choice_message_id,
                 batch,
+                retired,
+                ..
             } => {
-                assert_eq!(replaced_id, old_id);
-                assert_eq!(old_choice_chat_id, Some(2001));
-                assert_eq!(old_choice_message_id, Some(777));
-                assert_eq!(batch, Some(("batch-resend".to_string(), 1, 3)));
-                new_id
+                assert_eq!(batch, None, "a single resend must not inherit a batch");
+                (new_id, retired)
             }
             other => panic!("expected Replaced, got {:?}", other),
         };
-        assert_ne!(new_id, old_id);
 
-        let (old_status, new_status, new_batch, replaced_by) = pool
+        // Every waiting row of the old burst is retired, so the old counter can
+        // never continue and all three stale keyboards are reported back.
+        assert_eq!(retired.len(), 3);
+        let retired_ymids: Vec<&str> = retired.iter().map(|row| row.ymid.as_str()).collect();
+        for id in &old_ids {
+            assert!(
+                retired_ymids.contains(&id.as_str()),
+                "row {} not retired",
+                id
+            );
+        }
+        assert_eq!(
+            retired
+                .iter()
+                .filter(|row| row.message_id.is_some())
+                .count(),
+            3
+        );
+        assert_ne!(new_id, old_ids[1]);
+
+        let (superseded, new_batch): (i64, Option<String>) = pool
             .execute_with_timeout({
                 let new_id = new_id.clone();
                 move |conn| {
-                    conn.query_row(
-                        "SELECT (SELECT status FROM pending_downloads WHERE id = ?1), (SELECT status FROM pending_downloads WHERE id = ?2), (SELECT batch_id FROM pending_downloads WHERE id = ?2), (SELECT replaced_by FROM pending_downloads WHERE id = ?1)",
-                        params![old_id, new_id],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, Option<String>>(2)?,
-                                row.get::<_, Option<String>>(3)?,
-                            ))
-                        },
-                    )
+                    let superseded = conn.query_row(
+                        "SELECT COUNT(*) FROM pending_downloads WHERE batch_id = ?1 AND status = 'superseded'",
+                        params![batch],
+                        |row| row.get(0),
+                    )?;
+                    let new_batch = conn.query_row(
+                        "SELECT batch_id FROM pending_downloads WHERE id = ?1",
+                        params![new_id],
+                        |row| row.get(0),
+                    )?;
+                    Ok((superseded, new_batch))
                 }
             })
             .await
             .unwrap();
-        assert_eq!(old_status, "superseded");
-        assert_eq!(new_status, "pending");
-        assert_eq!(new_batch.as_deref(), Some("batch-resend"));
-        assert_eq!(replaced_by.as_deref(), Some(new_id.as_str()));
+        assert_eq!(superseded, 3);
+        assert_eq!(new_batch, None);
+    }
+
+    /// Resending one link while another video of the same burst is already
+    /// being delivered must not leave the old keyboards behind.
+    #[tokio::test]
+    async fn resend_retires_waiting_siblings_of_an_in_flight_row() {
+        let (pool, _file) = setup_test_db().await;
+        let batch = "batch-inflight";
+        let mut ids = Vec::new();
+        for (index, url) in ["http://a", "http://b", "http://c"].iter().enumerate() {
+            let outcome = pool
+                .replace_pending_download(
+                    "primary",
+                    3001,
+                    3001,
+                    url,
+                    Some(batch),
+                    Some(index as i64 + 1),
+                    Some(3),
+                )
+                .await
+                .unwrap();
+            let id = match outcome {
+                ReplacePendingOutcome::Created { new_id, .. } => new_id,
+                other => panic!("expected Created, got {:?}", other),
+            };
+            assert!(
+                pool.set_choice_message(&id, 3001, 900 + index as i64)
+                    .await
+                    .unwrap()
+            );
+            ids.push(id);
+        }
+        // The second video's ad was already watched: it is in flight now.
+        pool.mark_as_verified_with_logging(&ids[1]).await.unwrap();
+
+        let outcome = pool
+            .replace_pending_download("primary", 3001, 3001, "http://b", None, None, None)
+            .await
+            .unwrap();
+        match outcome {
+            ReplacePendingOutcome::Active { status, retired } => {
+                assert_eq!(status, "verified");
+                assert_eq!(
+                    retired.len(),
+                    2,
+                    "the other waiting rows of the burst must be retired"
+                );
+                assert!(retired.iter().all(|row| row.ymid != ids[1]));
+            }
+            other => panic!("expected Active, got {:?}", other),
+        }
+
+        let pending: i64 = pool
+            .execute_with_timeout(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pending_downloads WHERE batch_id = ?1 AND status = 'pending'",
+                    params![batch],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(pending, 0, "no waiting keyboard of the old burst survives");
     }
 
     #[tokio::test]
@@ -4136,7 +4279,7 @@ mod tests {
             .await
             .unwrap()
         {
-            ReplacePendingOutcome::Active { status } => assert_eq!(status, "verified"),
+            ReplacePendingOutcome::Active { status, .. } => assert_eq!(status, "verified"),
             other => panic!("expected Active verified, got {:?}", other),
         }
 
@@ -4146,7 +4289,7 @@ mod tests {
             .await
             .unwrap()
         {
-            ReplacePendingOutcome::Active { status } => assert_eq!(status, "claimed"),
+            ReplacePendingOutcome::Active { status, .. } => assert_eq!(status, "claimed"),
             other => panic!("expected Active claimed, got {:?}", other),
         }
 

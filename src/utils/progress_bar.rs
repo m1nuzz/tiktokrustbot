@@ -16,6 +16,12 @@ struct ProgressBarInner {
     message_id: Option<MessageId>,
     last_update: Option<Instant>,
     last_percentage: u8,
+    /// A silent bar never talks to Telegram: background batch items use it so
+    /// they cannot create status bubbles of their own.
+    enabled: bool,
+    /// Keep the message after the transfer finishes. Batch items share one
+    /// status message owned by the batch, not by the individual video.
+    keep_message: bool,
 }
 
 #[derive(Clone)]
@@ -25,14 +31,21 @@ pub struct ProgressBar {
 
 impl ProgressBar {
     pub fn new(bot: Bot, chat_id: ChatId) -> Self {
-        Self::create_progressbar_static(bot, chat_id)
+        Self::create_progressbar_static(bot, chat_id, true)
+    }
+
+    /// No-op bar: every update is dropped, `start`/`delete` never reach the
+    /// network. Used for background prefetch items and for deliveries whose
+    /// feedback already exists (the ad choice message).
+    pub fn silent() -> Self {
+        Self::create_progressbar_static(Bot::new("DUMMY_TOKEN"), ChatId(0), false)
     }
 
     pub fn new_silent() -> Self {
-        Self::create_progressbar_static(Bot::new("DUMMY_TOKEN"), ChatId(0))
+        Self::silent()
     }
 
-    fn create_progressbar_static(bot: Bot, chat_id: ChatId) -> Self {
+    fn create_progressbar_static(bot: Bot, chat_id: ChatId, enabled: bool) -> Self {
         ProgressBar {
             inner: Arc::new(Mutex::new(ProgressBarInner {
                 bot,
@@ -40,12 +53,27 @@ impl ProgressBar {
                 message_id: None,
                 last_update: None,
                 last_percentage: 0,
+                enabled,
+                keep_message: false,
             })),
         }
     }
 
+    /// The message stays in the chat when the transfer ends; whoever owns the
+    /// batch deletes it after the last item.
+    pub async fn keep_message(&mut self) {
+        self.inner.lock().await.keep_message = true;
+    }
+
+    pub async fn message_id(&self) -> Option<MessageId> {
+        self.inner.lock().await.message_id
+    }
+
     pub async fn start(&mut self, initial_text: &str) -> Result<(), anyhow::Error> {
         let mut inner = self.inner.lock().await;
+        if !inner.enabled {
+            return Ok(());
+        }
         let msg = inner.bot.send_message(inner.chat_id, initial_text).await?;
         inner.message_id = Some(msg.id);
         inner.last_update = Some(Instant::now());
@@ -58,6 +86,9 @@ impl ProgressBar {
         extrainfo: Option<&str>,
     ) -> Result<(), anyhow::Error> {
         let mut inner = self.inner.lock().await;
+        if !inner.enabled {
+            return Ok(());
+        }
         let now = Instant::now();
 
         // Check if an update is needed
@@ -114,10 +145,10 @@ impl ProgressBar {
                 }
             }
         } else {
-            // Create a new message
-            if let Ok(msg) = inner.bot.send_message(inner.chat_id, progresstext).await {
-                inner.message_id = Some(msg.id);
-            }
+            // Never create a message implicitly: only an explicit `start`
+            // owns one. A stray progress callback must not produce a second
+            // status bubble next to the batch's single one.
+            log::debug!("Progress update before start ignored: {}%", percentage);
         }
 
         Ok(())
@@ -147,13 +178,18 @@ impl ProgressBar {
 
     pub async fn delete(&mut self) -> Result<(), anyhow::Error> {
         let mut inner = self.inner.lock().await;
+        if !inner.enabled {
+            return Ok(());
+        }
         if let Some(message_id) = inner.message_id {
-            if let Err(e) = inner.bot.delete_message(inner.chat_id, message_id).await {
-                let error_str = e.to_string();
-                if !error_str.contains("MESSAGE_ID_INVALID")
-                    && !error_str.contains("message to delete not found")
-                {
-                    log::debug!("Failed to delete progress message: {}", e);
+            if !inner.keep_message {
+                if let Err(e) = inner.bot.delete_message(inner.chat_id, message_id).await {
+                    let error_str = e.to_string();
+                    if !error_str.contains("MESSAGE_ID_INVALID")
+                        && !error_str.contains("message to delete not found")
+                    {
+                        log::debug!("Failed to delete progress message: {}", e);
+                    }
                 }
             }
             inner.message_id = None;
