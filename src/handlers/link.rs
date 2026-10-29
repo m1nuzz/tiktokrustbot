@@ -140,7 +140,7 @@ pub struct BatchRuntime {
 impl BatchRuntime {
     pub fn new(id: String, total: i64, bot: Bot, chat_id: ChatId) -> Arc<Self> {
         let active_position = Arc::new(AtomicI64::new(1));
-        let bar = ProgressBar::batch(bot.clone(), chat_id, active_position.clone());
+        let bar = ProgressBar::batch(bot.clone(), chat_id, active_position.clone(), total);
         Arc::new(Self {
             id,
             total,
