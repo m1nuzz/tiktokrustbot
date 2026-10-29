@@ -244,7 +244,7 @@ impl BatchRuntime {
         // upload progress becomes the visible one.
         self.active_position.store(next, Ordering::Relaxed);
         let mut bar = self.bar.clone();
-        bar.reset().await;
+        bar.hand_over().await;
         self.turn.notify_waiters();
         self.mark_download_start(position).await;
     }
