@@ -262,7 +262,7 @@ async fn run_link_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<LinkJob>) {
                         Err(e) => log::error!("link_handler task failed: {}", e),
                     }
                 }
-                runtime.delete_status_message().await;
+                runtime.finish().await;
             });
         } else {
             // Ad flow and single links: one item at a time, in message order.

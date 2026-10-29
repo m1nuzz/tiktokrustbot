@@ -4,6 +4,7 @@ use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, Web
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::time::Instant;
 use tokio::time::{Duration, timeout};
@@ -129,11 +130,17 @@ pub struct BatchRuntime {
     turn: tokio::sync::Notify,
     highest_download_start: tokio::sync::Mutex<i64>,
     download_gate: tokio::sync::Notify,
-    status_message: tokio::sync::Mutex<Option<MessageId>>,
+    /// The single status message of the burst. Its bar follows the earliest
+    /// undelivered video, so the next item's download is visible instead of a
+    /// frozen 100% from the one already sent.
+    bar: ProgressBar,
+    active_position: Arc<AtomicI64>,
 }
 
 impl BatchRuntime {
     pub fn new(id: String, total: i64, bot: Bot, chat_id: ChatId) -> Arc<Self> {
+        let active_position = Arc::new(AtomicI64::new(1));
+        let bar = ProgressBar::batch(bot.clone(), chat_id, active_position.clone());
         Arc::new(Self {
             id,
             total,
@@ -146,8 +153,20 @@ impl BatchRuntime {
             turn: tokio::sync::Notify::new(),
             highest_download_start: tokio::sync::Mutex::new(0),
             download_gate: tokio::sync::Notify::new(),
-            status_message: tokio::sync::Mutex::new(None),
+            bar,
+            active_position,
         })
+    }
+
+    /// A handle for one position. Only the active position may draw.
+    pub fn bar_for(&self, position: i64) -> ProgressBar {
+        self.bar.for_position(position)
+    }
+
+    /// Delete the burst's status message after the last video.
+    pub async fn finish(&self) {
+        let mut bar = self.bar.clone();
+        let _ = bar.delete_now().await;
     }
 
     /// Later items wait until the previous one has started downloading, so
@@ -204,7 +223,7 @@ impl BatchRuntime {
     /// The item is done with its turn: advance the cursor if it owns it, or
     /// remember it as skipped so later positions can move past it.
     pub async fn release(&self, position: i64) {
-        {
+        let next = {
             let mut state = self.delivery.lock().await;
             if state.next == position {
                 state.next += 1;
@@ -219,20 +238,15 @@ impl BatchRuntime {
             } else if state.next < position {
                 state.abandoned.insert(position);
             }
-        }
+            state.next
+        };
+        // Hand the single status message to the next video: its download or
+        // upload progress becomes the visible one.
+        self.active_position.store(next, Ordering::Relaxed);
+        let mut bar = self.bar.clone();
+        bar.reset().await;
         self.turn.notify_waiters();
         self.mark_download_start(position).await;
-    }
-
-    pub async fn set_status_message(&self, id: MessageId) {
-        *self.status_message.lock().await = Some(id);
-    }
-
-    pub async fn delete_status_message(&self) {
-        let id = self.status_message.lock().await.take();
-        if let Some(id) = id {
-            let _ = self.bot.delete_message(self.chat_id, id).await;
-        }
     }
 }
 
@@ -1141,16 +1155,14 @@ pub async fn process_video_request(
     // Only the first item of a burst speaks. Background items get a silent bar
     // so they cannot create status bubbles of their own; ad-driven downloads
     // stay silent too, because their choice message is the feedback.
-    let mut progress_bar = if show_starting {
-        ProgressBar::new(bot.clone(), chat_id)
-    } else {
-        ProgressBar::silent()
+    // A burst item reports into the batch's single message and may only draw
+    // while it is the active video; a single link owns its own message.
+    let mut progress_bar = match order.as_ref() {
+        Some(o) => o.runtime.bar_for(o.position),
+        None if show_starting => ProgressBar::new(bot.clone(), chat_id),
+        None => ProgressBar::silent(),
     };
     let mut progress_started = false;
-    if order.is_some() {
-        // The batch owns this message and deletes it after the last video.
-        progress_bar.keep_message().await;
-    }
 
     // Positions beyond the first wait until the previous download has started,
     // so download permits are requested in source order and position 1 never
@@ -1228,11 +1240,6 @@ pub async fn process_video_request(
         log::info!("Sending Starting... for user {}", user_id);
         progress_bar.start("🎬 Starting...").await?;
         progress_started = true;
-        if let Some(order) = order.as_ref() {
-            if let Some(id) = progress_bar.message_id().await {
-                order.runtime.set_status_message(id).await;
-            }
-        }
     } else {
         log::info!("Prefetching in background for user {}", user_id);
     }

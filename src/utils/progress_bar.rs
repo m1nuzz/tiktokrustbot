@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use teloxide::{
     prelude::*,
     requests::Requester,
@@ -22,30 +23,69 @@ struct ProgressBarInner {
     /// Keep the message after the transfer finishes. Batch items share one
     /// status message owned by the batch, not by the individual video.
     keep_message: bool,
+    /// Batch only: the position whose progress may be drawn right now. A
+    /// shared bar follows the earliest undelivered video, so the next item's
+    /// download progress is visible while the previous one is still sending.
+    active_position: Option<Arc<AtomicI64>>,
 }
 
 #[derive(Clone)]
 pub struct ProgressBar {
     inner: Arc<Mutex<ProgressBarInner>>,
+    /// Which batch position this handle reports for. Zero for single links.
+    position: i64,
+    /// Whether updates must match `active_position`.
+    gated: bool,
 }
 
 impl ProgressBar {
     pub fn new(bot: Bot, chat_id: ChatId) -> Self {
-        Self::create_progressbar_static(bot, chat_id, true)
+        Self::create(bot, chat_id, true, false, 0, false, None)
     }
 
     /// No-op bar: every update is dropped, `start`/`delete` never reach the
     /// network. Used for background prefetch items and for deliveries whose
     /// feedback already exists (the ad choice message).
     pub fn silent() -> Self {
-        Self::create_progressbar_static(Bot::new("DUMMY_TOKEN"), ChatId(0), false)
+        Self::create(
+            Bot::new("DUMMY_TOKEN"),
+            ChatId(0),
+            false,
+            false,
+            0,
+            false,
+            None,
+        )
     }
 
     pub fn new_silent() -> Self {
         Self::silent()
     }
 
-    fn create_progressbar_static(bot: Bot, chat_id: ChatId, enabled: bool) -> Self {
+    /// The one status message of a burst. Position 1 draws it; every later
+    /// item gets a gated handle that only draws while it is the active video.
+    pub fn batch(bot: Bot, chat_id: ChatId, active_position: Arc<AtomicI64>) -> Self {
+        Self::create(bot, chat_id, true, true, 1, true, Some(active_position))
+    }
+
+    pub fn for_position(&self, position: i64) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            position,
+            gated: self.gated,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create(
+        bot: Bot,
+        chat_id: ChatId,
+        enabled: bool,
+        keep_message: bool,
+        position: i64,
+        gated: bool,
+        active_position: Option<Arc<AtomicI64>>,
+    ) -> Self {
         ProgressBar {
             inner: Arc::new(Mutex::new(ProgressBarInner {
                 bot,
@@ -54,24 +94,32 @@ impl ProgressBar {
                 last_update: None,
                 last_percentage: 0,
                 enabled,
-                keep_message: false,
+                keep_message,
+                active_position,
             })),
+            position,
+            gated,
         }
-    }
-
-    /// The message stays in the chat when the transfer ends; whoever owns the
-    /// batch deletes it after the last item.
-    pub async fn keep_message(&mut self) {
-        self.inner.lock().await.keep_message = true;
     }
 
     pub async fn message_id(&self) -> Option<MessageId> {
         self.inner.lock().await.message_id
     }
 
+    /// Hand the shared message to another video: the next update must render
+    /// even though its percentage is lower than the previous video's 100%.
+    pub async fn reset(&mut self) {
+        let mut inner = self.inner.lock().await;
+        inner.last_update = None;
+        inner.last_percentage = 0;
+    }
+
     pub async fn start(&mut self, initial_text: &str) -> Result<(), anyhow::Error> {
         let mut inner = self.inner.lock().await;
         if !inner.enabled {
+            return Ok(());
+        }
+        if inner.message_id.is_some() {
             return Ok(());
         }
         let msg = inner.bot.send_message(inner.chat_id, initial_text).await?;
@@ -88,6 +136,13 @@ impl ProgressBar {
         let mut inner = self.inner.lock().await;
         if !inner.enabled {
             return Ok(());
+        }
+        if self.gated {
+            if let Some(active) = &inner.active_position {
+                if active.load(Ordering::Relaxed) != self.position {
+                    return Ok(());
+                }
+            }
         }
         let now = Instant::now();
 
@@ -181,19 +236,34 @@ impl ProgressBar {
         if !inner.enabled {
             return Ok(());
         }
-        if let Some(message_id) = inner.message_id {
-            if !inner.keep_message {
-                if let Err(e) = inner.bot.delete_message(inner.chat_id, message_id).await {
-                    let error_str = e.to_string();
-                    if !error_str.contains("MESSAGE_ID_INVALID")
-                        && !error_str.contains("message to delete not found")
-                    {
-                        log::debug!("Failed to delete progress message: {}", e);
-                    }
+        // A batch message outlives each individual video.
+        if inner.keep_message {
+            return Ok(());
+        }
+        self.remove_locked(&mut inner).await;
+        Ok(())
+    }
+
+    /// Delete the batch's single status message after the last video.
+    pub async fn delete_now(&mut self) -> Result<(), anyhow::Error> {
+        let mut inner = self.inner.lock().await;
+        if !inner.enabled {
+            return Ok(());
+        }
+        self.remove_locked(&mut inner).await;
+        Ok(())
+    }
+
+    async fn remove_locked(&self, inner: &mut ProgressBarInner) {
+        if let Some(message_id) = inner.message_id.take() {
+            if let Err(e) = inner.bot.delete_message(inner.chat_id, message_id).await {
+                let error_str = e.to_string();
+                if !error_str.contains("MESSAGE_ID_INVALID")
+                    && !error_str.contains("message to delete not found")
+                {
+                    log::debug!("Failed to delete progress message: {}", e);
                 }
             }
-            inner.message_id = None;
         }
-        Ok(())
     }
 }
