@@ -34,8 +34,6 @@ struct ProgressBarInner {
     /// a progress event that may never come (small clips finish downloading
     /// before their turn).
     last_by_position: HashMap<i64, (u8, String)>,
-    /// Size of the burst this message belongs to; 0 for a single link.
-    batch_total: i64,
 }
 
 #[derive(Clone)]
@@ -49,7 +47,7 @@ pub struct ProgressBar {
 
 impl ProgressBar {
     pub fn new(bot: Bot, chat_id: ChatId) -> Self {
-        Self::create(bot, chat_id, true, false, 0, false, None, 0)
+        Self::create(bot, chat_id, true, false, 0, false, None)
     }
 
     /// No-op bar: every update is dropped, `start`/`delete` never reach the
@@ -64,7 +62,6 @@ impl ProgressBar {
             0,
             false,
             None,
-            0,
         )
     }
 
@@ -74,17 +71,8 @@ impl ProgressBar {
 
     /// The one status message of a burst. Position 1 draws it; every later
     /// item gets a gated handle that only draws while it is the active video.
-    pub fn batch(bot: Bot, chat_id: ChatId, active_position: Arc<AtomicI64>, total: i64) -> Self {
-        Self::create(
-            bot,
-            chat_id,
-            true,
-            true,
-            1,
-            true,
-            Some(active_position),
-            total,
-        )
+    pub fn batch(bot: Bot, chat_id: ChatId, active_position: Arc<AtomicI64>) -> Self {
+        Self::create(bot, chat_id, true, true, 1, true, Some(active_position))
     }
 
     pub fn for_position(&self, position: i64) -> Self {
@@ -104,7 +92,6 @@ impl ProgressBar {
         position: i64,
         gated: bool,
         active_position: Option<Arc<AtomicI64>>,
-        batch_total: i64,
     ) -> Self {
         ProgressBar {
             inner: Arc::new(Mutex::new(ProgressBarInner {
@@ -117,7 +104,6 @@ impl ProgressBar {
                 keep_message,
                 active_position,
                 last_by_position: HashMap::new(),
-                batch_total,
             })),
             position,
             gated,
@@ -145,27 +131,12 @@ impl ProgressBar {
         else {
             return;
         };
-        // Past the last video the message is about to be deleted.
-        if inner.batch_total > 0 && active > inner.batch_total {
+        let Some((percentage, text)) = inner.last_by_position.get(&active).cloned() else {
             return;
-        }
+        };
         let Some(message_id) = inner.message_id else {
             return;
         };
-        // No progress recorded yet: the next video is still downloading (small
-        // clips finish between two samples), so say so instead of freezing on
-        // the previous video's 100%.
-        let (percentage, text) =
-            inner
-                .last_by_position
-                .get(&active)
-                .cloned()
-                .unwrap_or_else(|| {
-                    (
-                        0,
-                        ProgressBar::create_progress_bar_text(0, Some("⬇️ Downloading...")),
-                    )
-                });
         if inner
             .bot
             .edit_message_text(inner.chat_id, message_id, &text)

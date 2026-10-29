@@ -1070,16 +1070,6 @@ impl YoutubeFetcher {
         );
 
         if output.status.success() {
-            // Small clips finish between two progress samples, so record a
-            // final 100% explicitly: a queued batch video otherwise has no
-            // state to show when the status message is handed over to it.
-            progress_bar
-                .update(
-                    scale_to_range(100.0, start_pct, span),
-                    Some("⬇️ Downloading: 100%"),
-                )
-                .await?;
-
             let parent = self.output_dir.clone();
             let stem = PathBuf::from(filename_stem);
 
