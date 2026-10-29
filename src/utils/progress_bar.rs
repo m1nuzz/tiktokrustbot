@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use teloxide::{
@@ -27,6 +28,12 @@ struct ProgressBarInner {
     /// shared bar follows the earliest undelivered video, so the next item's
     /// download progress is visible while the previous one is still sending.
     active_position: Option<Arc<AtomicI64>>,
+    /// Batch only: the last rendered text of every video, including videos
+    /// that were downloading silently. When the message is handed over, the
+    /// next video's last known state is drawn at once instead of waiting for
+    /// a progress event that may never come (small clips finish downloading
+    /// before their turn).
+    last_by_position: HashMap<i64, (u8, String)>,
 }
 
 #[derive(Clone)]
@@ -96,6 +103,7 @@ impl ProgressBar {
                 enabled,
                 keep_message,
                 active_position,
+                last_by_position: HashMap::new(),
             })),
             position,
             gated,
@@ -106,12 +114,39 @@ impl ProgressBar {
         self.inner.lock().await.message_id
     }
 
-    /// Hand the shared message to another video: the next update must render
-    /// even though its percentage is lower than the previous video's 100%.
-    pub async fn reset(&mut self) {
+    /// Hand the shared message to the next video. Its last known state is
+    /// drawn immediately — a clip that finished downloading while another was
+    /// sending would otherwise show nothing until its upload starts.
+    pub async fn hand_over(&mut self) {
         let mut inner = self.inner.lock().await;
         inner.last_update = None;
         inner.last_percentage = 0;
+        if !inner.enabled {
+            return;
+        }
+        let Some(active) = inner
+            .active_position
+            .as_ref()
+            .map(|active| active.load(Ordering::Relaxed))
+        else {
+            return;
+        };
+        let Some((percentage, text)) = inner.last_by_position.get(&active).cloned() else {
+            return;
+        };
+        let Some(message_id) = inner.message_id else {
+            return;
+        };
+        if inner
+            .bot
+            .edit_message_text(inner.chat_id, message_id, &text)
+            .await
+            .is_ok()
+        {
+            log::info!("Progress handed over to video {} ({}%)", active, percentage);
+            inner.last_percentage = percentage;
+            inner.last_update = Some(Instant::now());
+        }
     }
 
     pub async fn start(&mut self, initial_text: &str) -> Result<(), anyhow::Error> {
@@ -120,6 +155,10 @@ impl ProgressBar {
             return Ok(());
         }
         if inner.message_id.is_some() {
+            // A batch already owns the message. Starting the upload phase is a
+            // new stage, so let its (lower) percentage render right away.
+            inner.last_update = None;
+            inner.last_percentage = 0;
             return Ok(());
         }
         let msg = inner.bot.send_message(inner.chat_id, initial_text).await?;
@@ -137,7 +176,13 @@ impl ProgressBar {
         if !inner.enabled {
             return Ok(());
         }
-        if self.gated {
+        let progresstext = ProgressBar::create_progress_bar_text(percentage, extrainfo);
+        if self.gated && self.position > 0 {
+            // Record even while this video is not allowed to draw: its state
+            // is shown the moment the message is handed over to it.
+            inner
+                .last_by_position
+                .insert(self.position, (percentage, progresstext.clone()));
             if let Some(active) = &inner.active_position {
                 if active.load(Ordering::Relaxed) != self.position {
                     return Ok(());
@@ -163,8 +208,6 @@ impl ProgressBar {
 
         inner.last_update = Some(now);
         inner.last_percentage = percentage;
-
-        let progresstext = ProgressBar::create_progress_bar_text(percentage, extrainfo);
 
         if let Some(message_id) = inner.message_id {
             let result = inner
