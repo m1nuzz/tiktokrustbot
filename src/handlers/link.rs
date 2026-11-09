@@ -7,10 +7,9 @@ use std::fs;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::time::Instant;
-use tokio::time::{Duration, timeout};
+use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
-use crate::BotCtx;
 use crate::database::{DatabasePool, ReplacePendingOutcome};
 use crate::handlers::admin::{is_admin, is_admin_id};
 use crate::handlers::subscription::check_subscription;
@@ -24,6 +23,7 @@ use crate::utils::progress_bar::ProgressBar;
 use crate::utils::task_manager::TaskManager;
 use crate::utils::temp_file::TempFileGuard;
 use crate::yt_dlp_interface::YoutubeFetcher;
+use crate::BotCtx;
 
 // To track active link processing and avoid double-triggering
 lazy_static::lazy_static! {
@@ -445,6 +445,25 @@ impl Drop for UrlProcessingGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         urls.remove(&self.key);
+    }
+}
+
+/// Pull the first https:// URL out of a tool error string; returns it only
+/// when it is a TikTok /photo/ link (the photo-post rescue path). Case is
+/// preserved on purpose: TikTok paths are case-sensitive.
+fn extract_photo_url(err_text: &str) -> Option<String> {
+    let idx = err_text.find("https://")?;
+    let rest = &err_text[idx..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+        .unwrap_or(rest.len());
+    let candidate = rest[..end]
+        .trim_end_matches([')', ']', '>', ','])
+        .to_string();
+    if candidate.contains("/photo/") {
+        Some(candidate)
+    } else {
+        None
     }
 }
 
@@ -1294,6 +1313,40 @@ pub async fn process_video_request(
                     remove_attempt_partials(&file_stem).await;
                     retries += 1;
                     if retries >= 3 {
+                        // Photo-post rescue: some /photo/ short links slip
+                        // past the tikwm probe above (tikwm occasionally
+                        // answers without images), and yt-dlp then rejects
+                        // them with "Unsupported URL ... /photo/...". The
+                        // correct /photo/ URL is right there in the error,
+                        // so re-probe tikwm with it and deliver via the
+                        // photo flow instead of giving up.
+                        let err_text = format!("{:#}", e);
+                        if let Some(photo_url) = extract_photo_url(&err_text) {
+                            log::info!(
+                                "Video flow failed on a /photo/ URL; re-probing tikwm for the photo flow"
+                            );
+                            let meta = fetcher.probe_tikwm(&photo_url).await;
+                            if !meta.images.is_empty() {
+                                if let Some(o) = order.as_ref() {
+                                    o.runtime.wait_turn(o.position).await;
+                                }
+                                let stem = format!("output/{}", Uuid::new_v4());
+                                crate::handlers::photo::handle_photo_post(
+                                    &bot,
+                                    chat_id,
+                                    &fetcher,
+                                    &meta,
+                                    &stem,
+                                    is_audio,
+                                    &mut progress_bar,
+                                )
+                                .await?;
+                                progress_bar.update(100, Some("✅ Done!")).await?;
+                                progress_bar.delete().await?;
+                                return Ok::<(), anyhow::Error>(());
+                            }
+                            log::warn!("Photo-post rescue probe came back empty for {}", photo_url);
+                        }
                         return Err(e);
                     }
                     tokio::time::sleep(Duration::from_millis(1000 * 2_u64.pow(retries - 1))).await;
@@ -1569,7 +1622,7 @@ mod tests {
     use super::*;
     use rusqlite::params;
     use serial_test::serial;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{timeout, Duration};
 
     /// The core promise: videos leave the bot top-to-bottom even when a later
     /// download finished first.
