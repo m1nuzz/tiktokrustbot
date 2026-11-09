@@ -53,6 +53,33 @@ impl MTProtoUploader {
         caption: &str,
         progress_bar: &mut ProgressBar,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Fast path: Bot API (HTTPS multipart) for files within the bot
+        // upload limit. Bypasses MTProto entirely, so it is immune to
+        // flagged/stalled MTProto sessions (2026-11-09 incident: uploads
+        // crawled at KB/s while HTTP API ran at ~9 MB/s). Falls back to
+        // the MTProto path on any HTTP error; larger files keep using it.
+        const BOT_API_MAX_BYTES: u64 = 45 * 1024 * 1024; // 5 MB margin under the 50 MB API cap
+        let file_size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+        if file_size > 0 && file_size <= BOT_API_MAX_BYTES {
+            log::info!(
+                "File is {} bytes (<= {}): using Bot API (HTTPS) upload path",
+                file_size,
+                BOT_API_MAX_BYTES
+            );
+            match self
+                .upload_video_via_bot_api(chat_id, file_path, caption, progress_bar)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    log::warn!(
+                        "Bot API upload failed, falling back to MTProto uploader: {:?}",
+                        e
+                    );
+                }
+            }
+        }
+
         // Create temporary faststart file with guard
         let (video_path, _video_guard) = if file_path.extension().map_or(false, |ext| ext == "mp4")
         {
@@ -137,6 +164,116 @@ impl MTProtoUploader {
             e
         })?;
 
+        Ok(())
+    }
+
+    /// Send a video via the HTTP Bot API (sendVideo, multipart POST).
+    /// Reuses the same faststart remux / metadata / thumbnail pipeline as
+    /// the MTProto flow so both paths produce identical messages.
+    async fn upload_video_via_bot_api(
+        &self,
+        chat_id: i64,
+        file_path: &Path,
+        caption: &str,
+        progress_bar: &mut ProgressBar,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Faststart remux so playback starts instantly, same as MTProto flow
+        let (video_path, _video_guard) = if file_path.extension().map_or(false, |ext| ext == "mp4")
+        {
+            match self.ensure_faststart_video(file_path).await {
+                Ok(temp_path) => {
+                    let guard = TempFileGuard::new(temp_path.clone());
+                    (temp_path, Some(guard))
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to remux video with faststart, proceeding with original: {:?}",
+                        e
+                    );
+                    (file_path.to_path_buf(), None)
+                }
+            }
+        } else {
+            (file_path.to_path_buf(), None)
+        };
+
+        let video_metadata =
+            get_video_metadata(self.ffprobe_path.to_string_lossy().as_ref(), &video_path)
+                .await
+                .map_err(|e| {
+                    log::error!("Failed to get video metadata for {:?}: {:?}", file_path, e);
+                    e
+                })?;
+
+        let thumbnail_path = file_path.with_extension("jpg");
+        generate_thumbnail(&self.ffmpeg_path, file_path, &thumbnail_path)
+            .await
+            .map_err(|e| {
+                log::error!("Failed to generate thumbnail for {:?}: {:?}", file_path, e);
+                e
+            })?;
+        let _thumbnail_guard = TempFileGuard::new(thumbnail_path.clone());
+
+        let url = format!("https://api.telegram.org/bot{}/sendVideo", self.bot_token);
+
+        let video_part = reqwest::multipart::Part::file(&video_path)
+            .await?
+            .file_name("video.mp4")
+            .mime_str("video/mp4")?;
+
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("video", video_part)
+            .text("supports_streaming", "true");
+
+        if !caption.is_empty() {
+            form = form.text("caption", caption.to_string());
+        }
+
+        if video_metadata.duration > 0.0 {
+            form = form.text(
+                "duration",
+                format!("{}", video_metadata.duration.round() as i64),
+            );
+        }
+        if video_metadata.width > 0 {
+            form = form.text("width", format!("{}", video_metadata.width));
+        }
+        if video_metadata.height > 0 {
+            form = form.text("height", format!("{}", video_metadata.height));
+        }
+
+        if std::path::Path::new(&thumbnail_path).exists() {
+            let thumb_part = reqwest::multipart::Part::file(&thumbnail_path)
+                .await?
+                .file_name("thumb.jpg")
+                .mime_str("image/jpeg")?;
+            form = form.part("thumbnail", thumb_part);
+        }
+
+        progress_bar.update(90, Some("uploading")).await?;
+
+        // A per-call client is fine here: uploads are a few per minute at
+        // most and each is a single request.
+        let http = reqwest::Client::new();
+        let resp = http.post(&url).multipart(form).send().await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+
+        if !status.is_success() || !body.contains("\"ok\":true") {
+            return Err(anyhow!(
+                "Bot API sendVideo failed: http {} body {}",
+                status,
+                &body.chars().take(300).collect::<String>()
+            )
+            .into());
+        }
+
+        progress_bar.update(100, Some("done")).await?;
+        log::info!(
+            "Video sent via Bot API ({} bytes)",
+            std::fs::metadata(&video_path).map(|m| m.len()).unwrap_or(0)
+        );
         Ok(())
     }
 }
