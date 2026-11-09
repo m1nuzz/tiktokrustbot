@@ -98,18 +98,25 @@ impl MTProtoUploader {
         // Wrap the client in Arc<Mutex<>> for reconnection capability
         let client = Arc::new(Mutex::new(client));
 
-        // Run keep-alive ping in a separate task. Frequent pings keep NAT /
-        // middleboxes from killing the idle TCP connection (which used to
-        // cause a full reconnect storm). A full reconnect replaces the live
-        // client and kills in-flight uploads, so it only happens after
-        // several consecutive ping failures, not on a single blip.
+        // Keep-alive ping with jitter and exponential backoff. All uploaders
+        // used to start together and tick on the exact same 120 s boundary, so
+        // a single DC-side connection close made all six reconnect (and log)
+        // in the same second. Stagger the phase per client, jitter every
+        // cycle, and back off while the link stays unhealthy instead of
+        // reconnecting at a fixed rate forever.
         let client_keepalive = client.clone();
         let keepalive_token = bot_token.to_string();
         let keepalive_session = session_file.clone();
         tokio::spawn(async move {
-            // Frequent enough to keep idle connections alive through NAT.
-            let mut interval = tokio::time::interval(Duration::from_secs(120));
+            const PING_BASE: Duration = Duration::from_secs(120);
+            const JITTER_MS: u64 = 25_000;
+            const MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+            // Random start phase: the six clients no longer share a tick.
+            tokio::time::sleep(Duration::from_millis(rand::random::<u64>() % 60_000)).await;
+
             let mut consecutive_failures: u32 = 0;
+            let mut backoff_level: u32 = 0;
             // Self-heal bookkeeping: on a healthy link a reconnect is rare.
             // A burst of reconnects where each fresh connection dies again
             // means the session's auth key is flagged server-side (observed
@@ -120,7 +127,21 @@ impl MTProtoUploader {
             let mut recent_reconnects: VecDeque<Instant> = VecDeque::new();
             let mut last_heal: Option<Instant> = None;
             loop {
-                interval.tick().await;
+                let jitter = Duration::from_millis(rand::random::<u64>() % JITTER_MS);
+                // Extra backoff is zero on a healthy link, so a normal ping
+                // still happens every ~120-145 s. While the link is dead it
+                // grows 30s -> 60s -> 120s -> 240s (capped at 300s).
+                let backoff = if backoff_level == 0 {
+                    Duration::ZERO
+                } else {
+                    std::cmp::min(
+                        Duration::from_secs(
+                            30u64.saturating_mul(1u64 << (backoff_level - 1).min(3)),
+                        ),
+                        MAX_BACKOFF,
+                    )
+                };
+                tokio::time::sleep(PING_BASE + jitter + backoff).await;
 
                 // Try to execute ping
                 let result = {
@@ -132,29 +153,50 @@ impl MTProtoUploader {
 
                 match result {
                     Ok(_) => {
+                        if backoff_level > 0 {
+                            log::info!(
+                                "MTProto link recovered (was at backoff level {})",
+                                backoff_level
+                            );
+                        }
                         consecutive_failures = 0;
+                        backoff_level = 0;
                         log::debug!("Keep-alive ping successful")
                     }
                     Err(e) => {
-                        // Fast re-check instead of waiting a full 120 s tick
-                        // per strike: a dead connection is confirmed in ~10 s
-                        // while still requiring 3 consecutive failures before
-                        // any reconnect happens.
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        // Retry quickly at first, then double the delay while
+                        // the link stays dead (5s -> 10s -> 20s -> ... 300s).
+                        let retry_delay = std::cmp::min(
+                            Duration::from_secs(5u64.saturating_mul(1u64 << backoff_level.min(6))),
+                            MAX_BACKOFF,
+                        );
+                        tokio::time::sleep(retry_delay).await;
                         consecutive_failures += 1;
                         if consecutive_failures < 3 {
-                            log::warn!(
-                                "Keep-alive ping failed ({}/3): {:?}, retrying before reconnecting...",
+                            log::debug!(
+                                "Keep-alive ping failed ({}/3): {:?}, retrying in {:?}",
                                 consecutive_failures,
-                                e
+                                e,
+                                retry_delay
                             );
                             continue;
                         }
                         consecutive_failures = 0;
-                        log::error!(
-                            "Keep-alive ping failed 3 times in a row: {:?}, reconnecting...",
-                            e
-                        );
+                        let next_level = (backoff_level + 1).min(6);
+                        let escalated = next_level != backoff_level;
+                        // Only log on escalation: a permanently dead link
+                        // otherwise produced hundreds of identical lines/hour.
+                        if escalated {
+                            log::warn!(
+                                "MTProto link unhealthy (backoff level {} -> {}): {:?}",
+                                backoff_level,
+                                next_level,
+                                e
+                            );
+                        } else {
+                            log::debug!("Reconnecting MTProto client: {:?}", e);
+                        }
+                        backoff_level = next_level;
 
                         // Reconnection attempt. Note: replacing the client
                         // drops the old one (grammers disconnects on drop),
@@ -166,9 +208,13 @@ impl MTProtoUploader {
                         )
                         .await
                         {
-                            log::error!("Reconnection failed: {:?}", reconnect_err);
+                            if escalated {
+                                log::warn!("Reconnection failed: {:?}", reconnect_err);
+                            } else {
+                                log::debug!("Reconnection failed: {:?}", reconnect_err);
+                            }
                         } else {
-                            log::info!("Client reconnected successfully");
+                            log::debug!("Client reconnected successfully");
 
                             // Self-heal: 3+ reconnects within 10 minutes
                             // (throttled to one heal per 10 minutes) means

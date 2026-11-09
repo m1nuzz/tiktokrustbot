@@ -7,14 +7,14 @@ use tokio::sync::Mutex;
 
 use teloxide::dispatching::dialogue;
 use teloxide::dptree;
-use tiktokdownloader::BotCtx;
 use tiktokdownloader::build_handler;
 use tiktokdownloader::database::DatabasePool;
 use tiktokdownloader::handlers::broadcast::BroadcastState;
-use tiktokdownloader::handlers::link::{BatchOutcome, notify_batch_outcome};
+use tiktokdownloader::handlers::link::{notify_batch_outcome, BatchOutcome};
 use tiktokdownloader::mtproto_uploader::MTProtoUploader;
 use tiktokdownloader::utils::task_manager::TaskManager;
-use tiktokdownloader::yt_dlp_interface::{YoutubeFetcher, ensure_binaries, is_executable_present};
+use tiktokdownloader::yt_dlp_interface::{ensure_binaries, is_executable_present, YoutubeFetcher};
+use tiktokdownloader::BotCtx;
 
 // For deduplication
 lazy_static::lazy_static! {
@@ -174,9 +174,16 @@ async fn prune_stale_output_files(output_dir: std::path::PathBuf) {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     // 1. Initialize logger IMMEDIATELY
+    // grammers emits INFO-level chatter on every future-salt refresh and
+    // sender reset. On an unhealthy MTProto link that is hundreds of lines
+    // per hour, so keep those crates at WARN while our own logs stay INFO.
+    // An explicit RUST_LOG from the environment still wins.
     if std::env::var("RUST_LOG").is_err() {
         unsafe {
-            std::env::set_var("RUST_LOG", "info");
+            std::env::set_var(
+                "RUST_LOG",
+                "info,grammers_mtproto=warn,grammers_mtsender=warn,grammers_client=warn,grammers_session=warn",
+            );
         }
     }
     pretty_env_logger::init();
