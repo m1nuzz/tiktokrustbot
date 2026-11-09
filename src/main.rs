@@ -7,14 +7,14 @@ use tokio::sync::Mutex;
 
 use teloxide::dispatching::dialogue;
 use teloxide::dptree;
+use tiktokdownloader::BotCtx;
 use tiktokdownloader::build_handler;
 use tiktokdownloader::database::DatabasePool;
 use tiktokdownloader::handlers::broadcast::BroadcastState;
-use tiktokdownloader::handlers::link::{notify_batch_outcome, BatchOutcome};
+use tiktokdownloader::handlers::link::{BatchOutcome, notify_batch_outcome};
 use tiktokdownloader::mtproto_uploader::MTProtoUploader;
 use tiktokdownloader::utils::task_manager::TaskManager;
-use tiktokdownloader::yt_dlp_interface::{ensure_binaries, is_executable_present, YoutubeFetcher};
-use tiktokdownloader::BotCtx;
+use tiktokdownloader::yt_dlp_interface::{YoutubeFetcher, ensure_binaries, is_executable_present};
 
 // For deduplication
 lazy_static::lazy_static! {
@@ -187,6 +187,16 @@ async fn main() -> Result<(), Error> {
         }
     }
     pretty_env_logger::init();
+
+    // grammers 0.12 emits `tracing` events instead of `log` records. Route
+    // them through the same RUST_LOG filter, otherwise WARN/ERROR from the
+    // MTProto stack would be invisible while INFO chatter stays suppressed.
+    {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
+
     log::info!("Starting TikTok downloader bot...");
     let start_time = std::time::Instant::now();
 
