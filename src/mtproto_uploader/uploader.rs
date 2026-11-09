@@ -1,10 +1,11 @@
 use grammers_client::client::InitParams;
 use grammers_client::{Client, Config};
 use grammers_session::Session;
+use std::collections::VecDeque;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::mtproto_uploader::constants::SESSION_FILE;
@@ -109,6 +110,15 @@ impl MTProtoUploader {
             // Frequent enough to keep idle connections alive through NAT.
             let mut interval = tokio::time::interval(Duration::from_secs(120));
             let mut consecutive_failures: u32 = 0;
+            // Self-heal bookkeeping: on a healthy link a reconnect is rare.
+            // A burst of reconnects where each fresh connection dies again
+            // means the session's auth key is flagged server-side (observed
+            // 2026-11-09: Telegram started resetting known bot MTProto
+            // sessions; reconnecting with the same key loops forever).
+            // Archiving the session file and reconnecting forces a
+            // brand-new auth key and heals the uploader.
+            let mut recent_reconnects: VecDeque<Instant> = VecDeque::new();
+            let mut last_heal: Option<Instant> = None;
             loop {
                 interval.tick().await;
 
@@ -126,6 +136,11 @@ impl MTProtoUploader {
                         log::debug!("Keep-alive ping successful")
                     }
                     Err(e) => {
+                        // Fast re-check instead of waiting a full 120 s tick
+                        // per strike: a dead connection is confirmed in ~10 s
+                        // while still requiring 3 consecutive failures before
+                        // any reconnect happens.
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                         consecutive_failures += 1;
                         if consecutive_failures < 3 {
                             log::warn!(
@@ -154,6 +169,44 @@ impl MTProtoUploader {
                             log::error!("Reconnection failed: {:?}", reconnect_err);
                         } else {
                             log::info!("Client reconnected successfully");
+
+                            // Self-heal: 3+ reconnects within 10 minutes
+                            // (throttled to one heal per 10 minutes) means
+                            // the auth key itself is being rejected; archive
+                            // the session and re-auth with a fresh key.
+                            let now = Instant::now();
+                            recent_reconnects.push_back(now);
+                            while let Some(front) = recent_reconnects.front() {
+                                if now.duration_since(*front) <= Duration::from_secs(600) {
+                                    break;
+                                }
+                                recent_reconnects.pop_front();
+                            }
+                            let throttle_ok = match last_heal {
+                                Some(t) => now.duration_since(t) >= Duration::from_secs(600),
+                                None => true,
+                            };
+                            if recent_reconnects.len() >= 3 && throttle_ok {
+                                let burst = recent_reconnects.len();
+                                recent_reconnects.clear();
+                                last_heal = Some(now);
+                                log::warn!(
+                                    "🚑 {} reconnects in 10 minutes: MTProto session looks \
+                                     flagged server-side; recreating session (fresh auth key)",
+                                    burst
+                                );
+                                if let Err(heal_err) = MTProtoUploader::recreate_session(
+                                    &client_keepalive,
+                                    &keepalive_token,
+                                    &keepalive_session,
+                                )
+                                .await
+                                {
+                                    log::error!("Session recreation failed: {:?}", heal_err);
+                                } else {
+                                    log::info!("✅ Session recreated with a fresh auth key");
+                                }
+                            }
                         }
                     }
                 }
@@ -222,6 +275,41 @@ impl MTProtoUploader {
         }
 
         Ok(())
+    }
+
+    /// The session's auth key is suspected flagged server-side: every
+    /// reconnect re-uses the same key and the fresh connection dies again
+    /// within seconds (keep-alive pings reset). Archive the session file
+    /// and reconnect from scratch so Telegram issues a brand-new auth key.
+    /// Rate limiting is handled by the caller (at most one heal per 10 min).
+    async fn recreate_session(
+        client: &Arc<Mutex<Client>>,
+        bot_token: &str,
+        session_file: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Ok(meta) = std::fs::metadata(session_file) {
+            if meta.len() > 0 {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let backup = session_file.with_extension(format!("session.bad-{}", stamp));
+                match std::fs::rename(session_file, &backup) {
+                    Ok(()) => log::warn!("Archived flagged session to {}", backup.display()),
+                    Err(e) => {
+                        log::error!(
+                            "Could not archive session {}: {:?}; removing it instead",
+                            session_file.display(),
+                            e
+                        );
+                        let _ = std::fs::remove_file(session_file);
+                    }
+                }
+            }
+        }
+        // load_file_or_create now mints a fresh session; bot_sign_in runs
+        // inside reconnect_client when the new session is unauthorized.
+        Self::reconnect_client(client, bot_token, session_file).await
     }
 
     pub async fn with_reconnect_retry<T, F, Fut>(
