@@ -1268,14 +1268,21 @@ pub async fn process_video_request(
     // to retry. Per-attempt DOWNLOAD_TIMEOUT / UPLOAD_TIMEOUT still apply.
     let mut upload_started = false;
     let job = async {
+        let pos = order.as_ref().map(|o| o.position).unwrap_or(0);
         // TikTok photo posts (carousels): yt-dlp rejects /photo/ URLs, so
         // probe tikwm once first (it also resolves vt/vM short links).
         // Instagram/YouTube skip the probe and go straight to yt-dlp.
         if url.contains("tiktok.com") {
+            log::info!("pos {}: probing tikwm for carousel check", pos);
             let meta = fetcher.probe_tikwm(&url).await;
+            log::info!("pos {}: probe done ({} images)", pos, meta.images.len());
             if !meta.images.is_empty() {
                 // A carousel is a delivery too: it must wait for its turn, or
-                // it would overtake the videos of the same burst.
+                // it would overtake the videos of the same burst. The download
+                // slot is released first: the photo holds it across the whole
+                // delivery wait otherwise, pinning one of the two download
+                // permits and stalling the rest of the burst behind it.
+                drop(download_permit);
                 if let Some(o) = order.as_ref() {
                     o.runtime.wait_turn(o.position).await;
                 }
@@ -1327,6 +1334,9 @@ pub async fn process_video_request(
                             );
                             let meta = fetcher.probe_tikwm(&photo_url).await;
                             if !meta.images.is_empty() {
+                                // Same rule as the probe branch above: free the
+                                // download slot before waiting at the turnstile.
+                                drop(download_permit);
                                 if let Some(o) = order.as_ref() {
                                     o.runtime.wait_turn(o.position).await;
                                 }
@@ -1364,6 +1374,11 @@ pub async fn process_video_request(
 
         let _guard = TempFileGuard::new(path.clone());
         let file_size = fs::metadata(&path)?.len();
+        log::info!(
+            "pos {}: download finished, {} bytes, entering upload phase",
+            pos,
+            file_size
+        );
 
         // Mark download finished so the next batch item can start downloading
         // while this one uploads.
@@ -1412,7 +1427,9 @@ pub async fn process_video_request(
         // one has been sent, whatever order the downloads finished in. The
         // cursor is released by the item's BatchGuard when it returns.
         if let Some(o) = order.as_ref() {
+            log::info!("pos {}: waiting for delivery turn", pos);
             o.runtime.wait_turn(o.position).await;
+            log::info!("pos {}: got delivery turn", pos);
         }
 
         if !progress_started {
@@ -1429,11 +1446,33 @@ pub async fn process_video_request(
             }
         }
 
-        // Acquire upload permit
-        let _upload_permit = upload_semaphore
-            .acquire()
-            .await
-            .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
+        // Acquire upload permit. A plain acquire().await would hang silently
+        // if both permits leak; poll with a watchdog so a leak is visible in
+        // the log instead of a frozen batch.
+        let acquire_started = std::time::Instant::now();
+        let _upload_permit = loop {
+            match timeout(Duration::from_secs(10), upload_semaphore.acquire()).await {
+                Ok(Ok(permit)) => break permit,
+                Ok(Err(e)) => return Err(anyhow::anyhow!("Semaphore error: {}", e)),
+                Err(_) => {
+                    log::warn!(
+                        "pos {}: upload permit still not available after {:?} (available: {})",
+                        pos,
+                        acquire_started.elapsed(),
+                        upload_semaphore.available_permits()
+                    );
+                }
+            }
+        };
+        let acquire_elapsed = acquire_started.elapsed();
+        if acquire_elapsed >= Duration::from_secs(10) {
+            log::warn!(
+                "pos {}: upload permit acquired after {:?} (leak suspected)",
+                pos,
+                acquire_elapsed
+            );
+        }
+        log::info!("pos {}: got upload permit", pos);
         upload_started = true;
 
         if file_size > TELEGRAM_BOT_API_FILE_LIMIT {
@@ -1483,6 +1522,7 @@ pub async fn process_video_request(
             }
         } else {
             let upload_start = std::time::Instant::now();
+            log::info!("pos {}: sending via Bot API", pos);
             let send_res = match timeout(UPLOAD_TIMEOUT, async {
                 let mut retries = 0;
                 loop {
