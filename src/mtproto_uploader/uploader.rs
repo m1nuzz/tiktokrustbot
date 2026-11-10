@@ -50,6 +50,23 @@ fn unix_stamp() -> u64 {
         .unwrap_or(0)
 }
 
+/// grammers 0.12 keeps MTProto sessions in a libsql SQLite database while the
+/// application database uses rusqlite. Both link the same sqlite3 C symbols
+/// and therefore share SQLite's global state. libsql calls
+/// `sqlite3_config(SQLITE_CONFIG_SERIALIZED)` from a `Once` the first time a
+/// database is opened, but SQLite only accepts that call before it has been
+/// initialized. If `init_database()` (rusqlite) runs first, the later
+/// `SqliteSession::open()` panics with SQLITE_MISUSE (21) and takes the whole
+/// process down.
+///
+/// Opening one throwaway in-memory session runs that `Once` before any other
+/// SQLite call and leaves no file behind. `main()` must call this before
+/// anything else; see `tests/sqlite_startup_tests.rs`.
+pub async fn prime_session_storage() -> Result<(), BoxError> {
+    let _ = SqliteSession::open(":memory:").await?;
+    Ok(())
+}
+
 /// grammers 0.12 stores sessions in SQLite; <=0.11 wrote a custom binary
 /// format into the very same file. libsql cannot open those, so archive the
 /// legacy file and let `bot_sign_in` mint a fresh auth key.

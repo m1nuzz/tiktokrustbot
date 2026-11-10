@@ -173,6 +173,18 @@ async fn prune_stale_output_files(output_dir: std::path::PathBuf) {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    // Must run before ANY SQLite use in this process. grammers 0.12 sessions
+    // are backed by libsql, the app database by rusqlite, and both share the
+    // same sqlite3 C symbols. libsql needs to set SQLITE_CONFIG_SERIALIZED
+    // while SQLite is still uninitialized; otherwise the first MTProto session
+    // panics with SQLITE_MISUSE (21). See tests/sqlite_startup_tests.rs.
+    if let Err(e) = tiktokdownloader::mtproto_uploader::prime_session_storage().await {
+        return Err(anyhow::anyhow!(
+            "failed to prime grammers session storage: {}",
+            e
+        ));
+    }
+
     // 1. Initialize logger IMMEDIATELY
     // grammers emits INFO-level chatter on every future-salt refresh and
     // sender reset. On an unhealthy MTProto link that is hundreds of lines

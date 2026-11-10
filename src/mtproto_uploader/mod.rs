@@ -8,4 +8,4 @@ pub mod uploader;
 pub mod video_metadata;
 pub mod video_upload;
 
-pub use uploader::MTProtoUploader;
+pub use uploader::{MTProtoUploader, prime_session_storage};
