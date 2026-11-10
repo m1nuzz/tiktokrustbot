@@ -1,7 +1,6 @@
 use grammers_client::Client;
 use grammers_client::sender::{ConnectionParams, SenderPool};
 use grammers_session::Session;
-use grammers_session::storages::SqliteSession;
 use std::collections::VecDeque;
 use std::env;
 use std::num::NonZeroUsize;
@@ -11,6 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::mtproto_uploader::session::DbSession;
 use crate::mtproto_uploader::constants::SESSION_FILE;
 
 // Add import for tl functions
@@ -43,51 +43,14 @@ fn is_test_mode() -> bool {
         .eq_ignore_ascii_case("true")
 }
 
-fn unix_stamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// grammers 0.12 keeps MTProto sessions in a libsql SQLite database while the
-/// application database uses rusqlite. Both link the same sqlite3 C symbols
-/// and therefore share SQLite's global state. libsql calls
-/// `sqlite3_config(SQLITE_CONFIG_SERIALIZED)` from a `Once` the first time a
-/// database is opened, but SQLite only accepts that call before it has been
-/// initialized. If `init_database()` (rusqlite) runs first, the later
-/// `SqliteSession::open()` panics with SQLITE_MISUSE (21) and takes the whole
-/// process down.
-///
-/// Opening one throwaway in-memory session runs that `Once` before any other
-/// SQLite call and leaves no file behind. `main()` must call this before
-/// anything else; see `tests/sqlite_startup_tests.rs`.
-pub async fn prime_session_storage() -> Result<(), BoxError> {
-    let _ = SqliteSession::open(":memory:").await?;
-    Ok(())
-}
-
-/// grammers 0.12 stores sessions in SQLite; <=0.11 wrote a custom binary
-/// format into the very same file. libsql cannot open those, so archive the
-/// legacy file and let `bot_sign_in` mint a fresh auth key.
-async fn open_session(session_file: &Path) -> Result<SqliteSession, BoxError> {
-    match SqliteSession::open(session_file).await {
-        Ok(session) => Ok(session),
-        Err(e) => {
-            log::warn!(
-                "MTProto session {} is not a SQLite session ({}); archiving it and starting fresh",
-                session_file.display(),
-                e
-            );
-            if session_file.exists() {
-                let backup =
-                    session_file.with_extension(format!("session.legacy-{}", unix_stamp()));
-                std::fs::rename(session_file, &backup)?;
-                log::warn!("Archived legacy session to {}", backup.display());
-            }
-            Ok(SqliteSession::open(session_file).await?)
-        }
-    }
+/// Session storage key for a bot, derived from the historic session file name
+/// (`lib/telegram-<bot id>.session`). One key per bot so six uploaders never
+/// share auth keys.
+fn session_key(session_file: &Path) -> String {
+    session_file
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "telegram".to_string())
 }
 
 async fn build_client(
@@ -96,7 +59,7 @@ async fn build_client(
     api_id: i32,
     api_hash: &str,
 ) -> Result<BuiltClient, BoxError> {
-    let session = Arc::new(open_session(session_file).await?);
+    let session = Arc::new(DbSession::open(session_key(session_file))?);
 
     // 0.12 removed InitParams::server_addr. Override the home DC address in
     // the session instead; the pool reads DcOption when it opens a connection.
@@ -136,24 +99,16 @@ async fn build_client(
     Ok(BuiltClient { client, runner })
 }
 
-/// Archive a session we no longer trust, including libsql journal sidecars.
-fn archive_session_file(session_file: &Path) {
-    if let Ok(meta) = std::fs::metadata(session_file) {
-        if meta.len() > 0 {
-            let backup = session_file.with_extension(format!("session.bad-{}", unix_stamp()));
-            match std::fs::rename(session_file, &backup) {
-                Ok(()) => log::warn!("Archived flagged session to {}", backup.display()),
-                Err(e) => {
-                    log::error!(
-                        "Could not archive session {}: {:?}; removing it instead",
-                        session_file.display(),
-                        e
-                    );
-                    let _ = std::fs::remove_file(session_file);
-                }
-            }
-        }
+/// Drop the persisted session state of a bot whose auth key is suspected
+/// flagged server-side. The next `build_client` starts from a fresh key and
+/// `bot_sign_in` mints a brand-new one.
+fn purge_session_storage(session_file: &Path) {
+    let key = session_key(session_file);
+    match DbSession::purge(&key) {
+        Ok(()) => log::warn!("Purged MTProto session state for {}", key),
+        Err(e) => log::error!("Could not purge MTProto session state for {}: {:?}", key, e),
     }
+    // Leftovers from the grammers 0.7 / libsql era are dead weight now.
     for suffix in ["-wal", "-shm"] {
         let sidecar = PathBuf::from(format!("{}{}", session_file.to_string_lossy(), suffix));
         if sidecar.exists() {
@@ -416,8 +371,8 @@ impl MTProtoUploader {
         if let Some(old) = runner.lock().await.take() {
             old.abort();
         }
-        archive_session_file(session_file);
-        // SqliteSession::open mints a fresh database; bot_sign_in runs inside
+        purge_session_storage(session_file);
+        // DbSession::purge removed the stored auth key; bot_sign_in runs inside
         // reconnect_client when the new session is unauthorized.
         Self::reconnect_client(client, runner, bot_token, session_file).await
     }

@@ -711,6 +711,46 @@ pub fn init_database() -> Result<()> {
         "INSERT OR IGNORE INTO bots (bot_id, username) VALUES ('primary', '(legacy)')",
         (),
     )?;
+
+    // grammers 0.12 MTProto session state, one key per bot. Storing it here
+    // keeps the process down to a single SQLite engine: grammers' own
+    // `SqliteSession` is backed by libsql, which statically links a second
+    // SQLite amalgamation that collides with rusqlite's bundled one (duplicate
+    // `sqlite3_*` symbols, and a SQLITE_MISUSE panic when libsql calls
+    // `sqlite3_config` after this database initialized SQLite). Auth keys are
+    // the only thing that must survive a restart; the peer cache is rebuilt.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS mtproto_sessions (
+            bot_id TEXT PRIMARY KEY,
+            home_dc INTEGER NOT NULL DEFAULT 2,
+            pts INTEGER NOT NULL DEFAULT 0,
+            qts INTEGER NOT NULL DEFAULT 0,
+            date INTEGER NOT NULL DEFAULT 0,
+            seq INTEGER NOT NULL DEFAULT 0
+        )",
+        (),
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS mtproto_dc_options (
+            bot_id TEXT NOT NULL,
+            dc_id INTEGER NOT NULL,
+            ipv4 TEXT NOT NULL,
+            ipv6 TEXT NOT NULL,
+            auth_key BLOB,
+            PRIMARY KEY (bot_id, dc_id)
+        )",
+        (),
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS mtproto_channel_states (
+            bot_id TEXT NOT NULL,
+            channel_id INTEGER NOT NULL,
+            pts INTEGER NOT NULL,
+            PRIMARY KEY (bot_id, channel_id)
+        )",
+        (),
+    )?;
+
     Ok(())
 }
 

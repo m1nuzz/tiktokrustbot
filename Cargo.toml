@@ -21,7 +21,13 @@ tar = "0.4"
 xz2 = "0.1.7"
 sevenz-rust2 = "0.20.0"
 grammers-client = "0.12.0"
-grammers-session = "0.12.0"
+# Disable the default `sqlite-storage` feature: it pulls in libsql, which
+# statically links its own SQLite amalgamation and collides with the bundled
+# one rusqlite brings in (duplicate sqlite3_* symbols, plus a runtime
+# SQLITE_MISUSE panic when libsql calls sqlite3_config after rusqlite
+# initialized SQLite). Sessions are stored in our own database instead; see
+# mtproto_uploader::session.
+grammers-session = { version = "0.12.0", default-features = false }
 grammers-tl-types = "0.12.0"
 tokio-util = { version = "0.7.18", features = ["io"] }
 rand = { version = "0.9.2", features = ["os_rng"] }
