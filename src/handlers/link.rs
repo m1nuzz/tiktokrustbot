@@ -1112,26 +1112,41 @@ pub async fn handle_yt_pick_callback(
         quality
     );
 
-    process_video_request(
-        bot,
-        &pick.bot_id,
-        pick.user_id,
-        pick.url.clone(),
-        fetcher,
-        mtproto_uploader,
-        db_pool,
-        task_manager,
-        upload_semaphore,
-        download_semaphore,
-        pick.username.clone(),
-        ChatId(pick.chat_id),
-        pick.lang.clone(),
-        None,
-        true,
-        None,
-        Some(quality),
-    )
-    .await
+    // The pipeline takes minutes for a large file, and this handler runs
+    // inside a teloxide 0.17 dptree callback. teloxide routes every update of
+    // one chat through a single sequential worker, so awaiting the pipeline
+    // here froze the whole chat: new links queued silently for the entire
+    // download+upload (a 1.9 GB delivery blocked its chat for ~9 minutes) and
+    // never reached the burst collector - the journal showed nothing at all.
+    // Spawn instead: the callback returns immediately and the pipeline
+    // competes for the download semaphore like every other job.
+    tokio::spawn(async move {
+        if let Err(e) = process_video_request(
+            bot,
+            &pick.bot_id,
+            pick.user_id,
+            pick.url.clone(),
+            fetcher,
+            mtproto_uploader,
+            db_pool,
+            task_manager,
+            upload_semaphore,
+            download_semaphore,
+            pick.username.clone(),
+            ChatId(pick.chat_id),
+            pick.lang.clone(),
+            None,
+            true,
+            None,
+            Some(quality),
+        )
+        .await
+        {
+            log::error!("YT download failed for user {}: {}", pick.user_id, e);
+        }
+    });
+
+    Ok(())
 }
 
 /// Delete partial files of one failed download attempt. Stems are per-attempt
