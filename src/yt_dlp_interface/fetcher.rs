@@ -1016,14 +1016,35 @@ impl YoutubeFetcher {
                     match line {
                         Ok(Some(line)) => {
                             log::trace!("yt-dlp stdout: {}", line);
-                            if let Some((percentage, total_size)) = parse_progress_line(&line) {
-                                if percentage > last_percentage {
+                            if line.contains("[download] Destination:") {
+                                // A new stream starts and its percentages
+                                // restart from 0; without the reset the
+                                // audio stream could never pass
+                                // `percentage > last_percentage` after the
+                                // video stream reached 100%.
+                                last_percentage = 0.0;
+                            }
+                            if let Some((percentage, total_size, estimated)) = parse_progress_line(&line) {
+                                // The first fragment line of an estimated
+                                // stream reports 100.0% (its bytes match the
+                                // initial ~712 B estimate); taking it froze
+                                // the bar at "100.0% (10.0 MB)" for the
+                                // whole download. An estimated 100% is never
+                                // completion - only exact lines say that.
+                                let done_estimate = estimated && percentage >= 100.0;
+                                if !done_estimate && percentage > last_percentage {
                                     let now = std::time::Instant::now();
                                     if now.duration_since(last_update_time) >= MIN_UPDATE_INTERVAL {
                                         last_percentage = percentage;
                                         last_update_time = now;
                                         let overall = scale_to_range(percentage, start_pct, span);
-                                        let info = format!("⬇️ Downloading: {:.1}% ({:.1} MB)", percentage, total_size as f64 / 1_048_576.0);
+                                        let info = match total_size {
+                                            Some(total) => {
+                                                let downloaded = (percentage / 100.0) * total as f64;
+                                                format!("⬇️ Downloading: {:.1}% ({:.1} / {:.1} MB)", percentage, downloaded / 1_048_576.0, total as f64 / 1_048_576.0)
+                                            }
+                                            None => format!("⬇️ Downloading: {:.1}%", percentage),
+                                        };
                                         progress_bar.update(overall, Some(&info)).await?;
                                     }
                                 }
@@ -1039,14 +1060,35 @@ impl YoutubeFetcher {
                             stderr_collected.push_str(&line);
                             stderr_collected.push('\n');
                             log::trace!("yt-dlp stderr: {}", line);
-                            if let Some((percentage, total_size)) = parse_progress_line(&line) {
-                                if percentage > last_percentage {
+                            if line.contains("[download] Destination:") {
+                                // A new stream starts and its percentages
+                                // restart from 0; without the reset the
+                                // audio stream could never pass
+                                // `percentage > last_percentage` after the
+                                // video stream reached 100%.
+                                last_percentage = 0.0;
+                            }
+                            if let Some((percentage, total_size, estimated)) = parse_progress_line(&line) {
+                                // The first fragment line of an estimated
+                                // stream reports 100.0% (its bytes match the
+                                // initial ~712 B estimate); taking it froze
+                                // the bar at "100.0% (10.0 MB)" for the
+                                // whole download. An estimated 100% is never
+                                // completion - only exact lines say that.
+                                let done_estimate = estimated && percentage >= 100.0;
+                                if !done_estimate && percentage > last_percentage {
                                     let now = std::time::Instant::now();
                                     if now.duration_since(last_update_time) >= MIN_UPDATE_INTERVAL {
                                         last_percentage = percentage;
                                         last_update_time = now;
                                         let overall = scale_to_range(percentage, start_pct, span);
-                                        let info = format!("⬇️ Downloading: {:.1}% ({:.1} MB)", percentage, total_size as f64 / 1_048_576.0);
+                                        let info = match total_size {
+                                            Some(total) => {
+                                                let downloaded = (percentage / 100.0) * total as f64;
+                                                format!("⬇️ Downloading: {:.1}% ({:.1} / {:.1} MB)", percentage, downloaded / 1_048_576.0, total as f64 / 1_048_576.0)
+                                            }
+                                            None => format!("⬇️ Downloading: {:.1}%", percentage),
+                                        };
                                         progress_bar.update(overall, Some(&info)).await?;
                                     }
                                 }
@@ -1229,29 +1271,39 @@ async fn file_has_audio(ffprobe_path: &Path, file_path: &Path) -> Result<bool> {
     probe_stream_present(ffprobe_path, "a", file_path).await
 }
 
-fn parse_progress_line(line: &str) -> Option<(f64, u64)> {
+/// Parses one yt-dlp progress line into `(percentage, total_size, estimated)`.
+///
+/// Two real shapes (captured from production yt-dlp output):
+///   exact size: `[download]  45.2% of    1.39GiB at    9.12MiB/s ETA 00:59`
+///   fragmented: `[download]   0.2% of ~  768.32KiB at    8.55KiB/s ... (frag 1/2210)`
+/// The `~` estimated total is right-aligned with spaces between `~` and the
+/// number; the old regex required digits directly after `~`, missed every
+/// fragmented line and fell back to a hardcoded 10 MiB - which is how a
+/// 1.5 GB video displayed "(10.0 MB)" for its whole download. Lines without
+/// any size still parse, but report `total_size: None` instead of inventing
+/// one; `estimated` marks `~` sizes (unreliable - fragment 0 can claim 100%).
+fn parse_progress_line(line: &str) -> Option<(f64, Option<u64>, bool)> {
     let clean_line = remove_ansi_codes(line);
-    let patterns = [
-        r"\[download\]\s+(\d+\.?\d*)%\s+of\s+(\d+\.?\d*[KMGT]?i?B)",
-        r"\[download\]\s+(\d+\.?\d*)%\s+of\s+~(\d+\.?\d*[KMGT]?i?B)",
-        r"(\d+\.?\d*)%",
+    let patterns: [(&str, bool); 2] = [
+        (r"\[download\]\s+(\d+\.?\d*)%\s+of\s+~\s*(\d+\.?\d*[KMGT]?i?B)", true),
+        (r"\[download\]\s+(\d+\.?\d*)%\s+of\s+(\d+\.?\d*[KMGT]?i?B)", false),
     ];
 
-    for pattern in patterns {
+    for (pattern, estimated) in patterns {
         if let Ok(re) = Regex::new(pattern) {
             if let Some(caps) = re.captures(&clean_line) {
                 if let Ok(percentage) = caps[1].parse::<f64>() {
-                    let total_size = if caps.len() > 2 {
-                        parse_size_string(&caps[2])
-                    } else {
-                        10_485_760
-                    };
-                    return Some((percentage, total_size));
+                    return Some((percentage, Some(parse_size_string(&caps[2])), estimated));
                 }
             }
         }
     }
-    None
+    // Bare percentage without a size: keep driving the bar, but do not
+    // invent a size for it.
+    let re = Regex::new(r"\[download\]\s+(\d+\.?\d*)%").ok()?;
+    let caps = re.captures(&clean_line)?;
+    let percentage = caps[1].parse::<f64>().ok()?;
+    Some((percentage, None, false))
 }
 
 fn remove_ansi_codes(text: &str) -> String {
@@ -1261,18 +1313,24 @@ fn remove_ansi_codes(text: &str) -> String {
 
 fn parse_size_string(s: &str) -> u64 {
     let s_clean = s.trim().to_lowercase();
-    let (number_str, multiplier) = if s_clean.ends_with("mib") {
-        (s_clean.trim_end_matches("mib"), 1_024 * 1_024) // Mebibyte (1024^2)
-    } else if s_clean.ends_with("mb") {
-        (s_clean.trim_end_matches("mb"), 1_000 * 1_000) // Megabyte (1000^2)
+    let (number_str, multiplier) = if s_clean.ends_with("kib") {
+        (s_clean.trim_end_matches("kib"), 1024.0)
+    } else if s_clean.ends_with("mib") {
+        (s_clean.trim_end_matches("mib"), 1024.0 * 1024.0)
     } else if s_clean.ends_with("gib") {
-        (s_clean.trim_end_matches("gib"), 1_024 * 1_024 * 1_024) // Gibibyte (1024^3)
+        (s_clean.trim_end_matches("gib"), 1024.0 * 1024.0 * 1024.0)
+    } else if s_clean.ends_with("kb") {
+        (s_clean.trim_end_matches("kb"), 1000.0)
+    } else if s_clean.ends_with("mb") {
+        (s_clean.trim_end_matches("mb"), 1000.0 * 1000.0)
     } else if s_clean.ends_with("gb") {
-        (s_clean.trim_end_matches("gb"), 1_000 * 1_000 * 1_000) // Gigabyte (1000^3)
+        (s_clean.trim_end_matches("gb"), 1000.0 * 1000.0 * 1000.0)
     } else {
-        (s_clean.trim_end_matches("b"), 1) // For plain bytes
+        (s_clean.trim_end_matches('b'), 1.0) // For plain bytes
     };
-    number_str.parse::<f64>().unwrap_or(1.0) as u64 * multiplier
+    // Multiply in f64: casting the number before the multiply truncated the
+    // fraction, so "1.39GiB" became exactly 1 GiB and "24.79MiB" became 24.
+    (number_str.parse::<f64>().unwrap_or(0.0) * multiplier) as u64
 }
 
 #[cfg(test)]
@@ -1334,9 +1392,38 @@ mod tests {
         let line = "[download]  50.0% of 10.00MiB";
         let result = parse_progress_line(line);
         assert!(result.is_some());
-        let (percentage, total_size) = result.unwrap();
+        let (percentage, total_size, estimated) = result.unwrap();
         assert_eq!(percentage, 50.0);
-        assert_eq!(total_size, 10_485_760); // 10 MiB
+        assert_eq!(total_size, Some(10_485_760)); // 10 MiB
+        assert!(!estimated);
+    }
+
+    #[test]
+    fn test_parse_progress_line_fragment_estimate_with_spaces() {
+        // Real production line: tilde, spaces after it, KiB size, frag marker.
+        let line = "[download]   0.2% of ~  768.32KiB at    8.55KiB/s ETA Unknown (frag 1/2210)";
+        let (percentage, total_size, estimated) = parse_progress_line(line).unwrap();
+        assert_eq!(percentage, 0.2);
+        assert_eq!(total_size, Some(786_759)); // 768.32 * 1024
+        assert!(estimated);
+    }
+
+    #[test]
+    fn test_parse_progress_line_gib_keeps_fraction() {
+        // The fraction must survive: 1.39 GiB is not 1 GiB.
+        let line = "[download]  45.2% of    1.39GiB at    9.12MiB/s ETA 00:59";
+        let (percentage, total_size, estimated) = parse_progress_line(line).unwrap();
+        assert_eq!(percentage, 45.2);
+        assert_eq!(total_size, Some(1_492_501_135)); // 1.39 * 1024^3
+        assert!(!estimated);
+    }
+
+    #[test]
+    fn test_parse_progress_line_bare_percent_has_no_size() {
+        let line = "[download]  50.0%";
+        let (percentage, total_size, _) = parse_progress_line(line).unwrap();
+        assert_eq!(percentage, 50.0);
+        assert!(total_size.is_none());
     }
 
     #[test]
