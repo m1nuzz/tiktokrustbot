@@ -33,6 +33,12 @@ lazy_static::lazy_static! {
     /// In-memory only: a restart drops pending menus (the user just re-sends
     /// the link), and nothing in pending_downloads is reserved for them.
     static ref YT_PICKS: Mutex<HashMap<String, YtPick>> = Mutex::new(HashMap::new());
+    /// Chosen YouTube quality per pending row: ymid -> (quality, stored_at).
+    /// The mini-app claim arrives on the web server, which knows only the
+    /// ymid - this carries the tapped quality to `spawn_download_job`. Rows
+    /// are taken exactly once; stale entries are pruned on access (the row
+    /// lease is 30 min, so nothing older than 2 h can ever be claimed).
+    static ref YT_QUALITY_BY_YMID: Mutex<HashMap<String, (String, Instant)>> = Mutex::new(HashMap::new());
 }
 
 /// One outstanding YouTube quality menu. `quality_override` semantics live in
@@ -280,6 +286,17 @@ impl Drop for BatchGuard {
 pub enum LinkOutcome {
     Done,
     Abandoned,
+}
+
+/// Take the YouTube quality chosen for a pending row, if one was stored.
+/// Called by the web server's claim path exactly once per row; TikTok rows
+/// never store anything here and keep the user's saved preference.
+pub fn take_yt_quality_for(ymid: &str) -> Option<String> {
+    let mut map = YT_QUALITY_BY_YMID
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.retain(|_, (_, stored_at)| stored_at.elapsed() < Duration::from_secs(2 * 3600));
+    map.remove(ymid).map(|(quality, _)| quality)
 }
 
 /// ymid -> waiter for the link handler that is currently blocked on the ad
@@ -1111,6 +1128,153 @@ pub async fn handle_yt_pick_callback(
         pick.url,
         quality
     );
+
+    // Product flow for YouTube now matches TikTok: quality picker first, then
+    // the mini-app ad button. The claim arrives on the web server, which knows
+    // only the ymid - carry the tapped quality to spawn_download_job through
+    // YT_QUALITY_BY_YMID.
+    let lang = match pick.lang.clone() {
+        Some(l) if !l.is_empty() => l,
+        _ => {
+            let l = db_pool
+                .get_effective_lang(&pick.bot_id, pick.user_id, None)
+                .await;
+            if l.is_empty() {
+                "en".to_string()
+            } else {
+                l
+            }
+        }
+    };
+    let is_user_admin = is_admin_id(pick.user_id);
+    let ads_enabled = ads_enabled_for(&db_pool, &pick.bot_id, pick.user_id, is_user_admin).await;
+    let webapp_url = std::env::var("WEBAPP_URL").unwrap_or_default();
+    if ads_enabled && !webapp_url.is_empty() {
+        if let Ok(mut webapp) = webapp_url.parse::<reqwest::Url>() {
+            match db_pool
+                .replace_pending_download(
+                    &pick.bot_id,
+                    pick.chat_id,
+                    pick.user_id,
+                    &pick.url,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            {
+                Ok(ReplacePendingOutcome::Created { new_id, retired, .. })
+                | Ok(ReplacePendingOutcome::Replaced { new_id, retired, .. }) => {
+                    // The resend replaced whatever was still waiting: remove
+                    // the old keyboards and wake their waiters (same as the
+                    // TikTok flow).
+                    for row in retired {
+                        if let (Some(chat), Some(message)) = (row.chat_id, row.message_id) {
+                            let _ = bot
+                                .delete_message(ChatId(chat), MessageId(message as i32))
+                                .await;
+                        }
+                        notify_batch_outcome(Some(row.ymid.as_str()), BatchOutcome::Replaced);
+                    }
+
+                    webapp.query_pairs_mut().append_pair("ymid", &new_id);
+                    webapp.query_pairs_mut().append_pair("lang", &lang);
+                    YT_QUALITY_BY_YMID
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(new_id.clone(), (quality.clone(), Instant::now()));
+
+                    let rows = vec![
+                        vec![InlineKeyboardButton::web_app(
+                            i18n::t(MsgKey::AdButton, Some(lang.as_str())),
+                            WebAppInfo { url: webapp },
+                        )],
+                        vec![InlineKeyboardButton::callback(
+                            i18n::t(MsgKey::PremiumButton, Some(lang.as_str())),
+                            "buy_premium",
+                        )],
+                    ];
+                    let sent = match bot
+                        .send_message(
+                            ChatId(pick.chat_id),
+                            i18n::t(MsgKey::ChoiceText, Some(lang.as_str())),
+                        )
+                        .reply_markup(InlineKeyboardMarkup::new(rows))
+                        .await
+                    {
+                        Ok(sent) => sent,
+                        Err(e) => {
+                            YT_QUALITY_BY_YMID
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .remove(&new_id);
+                            return Err(e.into());
+                        }
+                    };
+                    match db_pool
+                        .set_choice_message(&new_id, pick.chat_id, sent.id.0 as i64)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            // The row left `pending` between the insert and
+                            // the send; the message is stale.
+                            let _ = bot.delete_message(sent.chat.id, sent.id).await;
+                            YT_QUALITY_BY_YMID
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .remove(&new_id);
+                            return Ok(());
+                        }
+                        Err(e) => log::warn!(
+                            "Failed to store choice message for {}: {}",
+                            new_id,
+                            e
+                        ),
+                    }
+                    // The claim triggers the download on the web server; the
+                    // choice message is the delivery's feedback (same as
+                    // TikTok singles - no extra "Starting..." bubble).
+                    return Ok(());
+                }
+                Ok(ReplacePendingOutcome::Active { status, retired }) => {
+                    for row in retired {
+                        if let (Some(chat), Some(message)) = (row.chat_id, row.message_id) {
+                            let _ = bot
+                                .delete_message(ChatId(chat), MessageId(message as i32))
+                                .await;
+                        }
+                        notify_batch_outcome(Some(row.ymid.as_str()), BatchOutcome::Replaced);
+                    }
+                    log::info!(
+                        "YT pick for {} kept the in-flight row (status {})",
+                        pick.url,
+                        status
+                    );
+                    let _ = bot
+                        .send_message(
+                            ChatId(pick.chat_id),
+                            i18n::t(MsgKey::AlreadyProcessing, Some(lang.as_str())),
+                        )
+                        .await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::error!("Failed to create pending download for YT pick: {}", e);
+                    let _ = bot
+                        .send_message(
+                            ChatId(pick.chat_id),
+                            i18n::t(MsgKey::ErrorInitDownload, Some(lang.as_str())),
+                        )
+                        .await;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Ads off (premium, module disabled, no webapp URL): download directly
+    // with the tapped quality, exactly as before.
 
     // The pipeline takes minutes for a large file, and this handler runs
     // inside a teloxide 0.17 dptree callback. teloxide routes every update of

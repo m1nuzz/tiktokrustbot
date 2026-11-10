@@ -565,6 +565,9 @@ async fn spawn_download_job(
     // through the same primary fallback as before (bot_for falls back to the
     // first configured bot for unmapped ids).
     let bot = state.bot_for(&row_bot_id);
+    // A YouTube pick stores the tapped quality for its row; TikTok rows have
+    // none and keep the user's saved preference.
+    let quality_override = crate::handlers::link::take_yt_quality_for(&ymid);
     tokio::spawn(async move {
         if let Err(e) = crate::handlers::link::process_video_request(
             bot,
@@ -585,7 +588,7 @@ async fn spawn_download_job(
             // "Starting..." bubble on top of it.
             false,
             None,
-            None,
+            quality_override,
         )
         .await
         {
