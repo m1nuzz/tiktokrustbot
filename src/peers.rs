@@ -26,6 +26,7 @@ pub async fn resolve_peer(
         let res = actual_client
             .invoke(&tl::functions::contacts::ResolveUsername {
                 username: un.to_string(),
+                referer: None,
             })
             .await
             .map_err(|e| anyhow!("contacts.resolveUsername failed for @{}: {:?}", un, e))?;

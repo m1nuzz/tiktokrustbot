@@ -174,12 +174,29 @@ async fn prune_stale_output_files(output_dir: std::path::PathBuf) {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     // 1. Initialize logger IMMEDIATELY
+    // grammers emits INFO-level chatter on every future-salt refresh and
+    // sender reset. On an unhealthy MTProto link that is hundreds of lines
+    // per hour, so keep those crates at WARN while our own logs stay INFO.
+    // An explicit RUST_LOG from the environment still wins.
     if std::env::var("RUST_LOG").is_err() {
         unsafe {
-            std::env::set_var("RUST_LOG", "info");
+            std::env::set_var(
+                "RUST_LOG",
+                "info,grammers_mtproto=warn,grammers_mtsender=warn,grammers_client=warn,grammers_session=warn",
+            );
         }
     }
     pretty_env_logger::init();
+
+    // grammers 0.12 emits `tracing` events instead of `log` records. Route
+    // them through the same RUST_LOG filter, otherwise WARN/ERROR from the
+    // MTProto stack would be invisible while INFO chatter stays suppressed.
+    {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
+
     log::info!("Starting TikTok downloader bot...");
     let start_time = std::time::Instant::now();
 

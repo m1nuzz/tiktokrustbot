@@ -85,6 +85,8 @@ impl MTProtoUploader {
                 force_file: false,
                 attributes: vec![audio_attr],
                 stickers: Some(Vec::new()),
+                video_cover: None,
+                video_timestamp: None,
                 ttl_seconds: None,
             });
 
@@ -97,6 +99,7 @@ impl MTProtoUploader {
             clear_draft: false,
             noforwards: false,
             update_stickersets_order: false,
+            allow_paid_floodskip: false,
             peer: input_peer,
             reply_to: None,
             media,
@@ -105,10 +108,13 @@ impl MTProtoUploader {
             reply_markup: None,
             entities: Some(Vec::new()),
             schedule_date: None,
+            schedule_repeat_period: None,
             send_as: None,
             effect: None,
+            allow_paid_stars: None,
             invert_media: false,
             quick_reply_shortcut: None,
+            suggested_post: None,
         };
 
         client.invoke(&request).await.map_err(|e| {

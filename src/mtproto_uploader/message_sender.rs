@@ -53,6 +53,7 @@ pub async fn send_media_with_retry(
         h: height as i32,
         preload_prefix_size: None,
         video_start_ts: None,
+        video_codec: None,
     });
 
     // Create input thumbnail - use InputFile::File for single-part files, InputFile::Big for multi-part
@@ -101,6 +102,8 @@ pub async fn send_media_with_retry(
         force_file: false,
         attributes: vec![video_attr],
         stickers: None,
+        video_cover: None,
+        video_timestamp: None,
         ttl_seconds: None,
     });
 
@@ -118,6 +121,7 @@ pub async fn send_media_with_retry(
                     clear_draft: false,
                     noforwards: false,
                     update_stickersets_order: false,
+                    allow_paid_floodskip: false,
                     peer: input_peer.clone(), // Clone input_peer for retries
                     reply_to: None,
                     media: media.clone(), // Clone media for retries
@@ -126,10 +130,13 @@ pub async fn send_media_with_retry(
                     reply_markup: None,
                     entities: Some(Vec::new()),
                     schedule_date: None,
+                    schedule_repeat_period: None,
                     send_as: None,
                     effect: None,
+                    allow_paid_stars: None,
                     invert_media: false,
                     quick_reply_shortcut: None,
+                    suggested_post: None,
                 })
                 .await
         } {
