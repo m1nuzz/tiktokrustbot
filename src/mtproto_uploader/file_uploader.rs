@@ -5,6 +5,7 @@ use rand;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::mtproto_uploader::uploader::MTProtoUploader;
 use crate::utils::progress_bar::ProgressBar;
@@ -62,6 +63,13 @@ pub async fn upload_file_in_parts(
 
     let file_id: i64 = rand::random();
 
+    // The progress bar edits a Telegram message, which never reaches the
+    // server journal - a 1.9 GB upload otherwise logs nothing for minutes and
+    // looks like a hang. Emit a journal line at most every 15 s plus a final
+    // summary with the effective throughput.
+    let upload_started = Instant::now();
+    let mut last_logged = upload_started;
+
     // Uploading file in parts
     for part in 0..total_parts {
         let mut buf = vec![0; part_size];
@@ -118,6 +126,25 @@ pub async fn upload_file_in_parts(
             file_type, uploaded, total_parts
         );
         let _ = progress_bar.update(overall.min(99), Some(&info)).await;
+
+        // Journal-side progress: at most one line per 15 s, plus the final
+        // summary. `done` clamps to the file size because the last part is
+        // usually short.
+        let now = Instant::now();
+        if now.duration_since(last_logged) >= Duration::from_secs(15) || uploaded == total_parts {
+            last_logged = now;
+            let done = ((uploaded as u64) * (part_size as u64)).min(file_size as u64);
+            let secs = now.duration_since(upload_started).as_secs().max(1);
+            log::info!(
+                "MTProto {} upload: part {}/{}, {} / {} MiB, {} MiB/s",
+                file_type,
+                uploaded,
+                total_parts,
+                done / (1024 * 1024),
+                file_size / (1024 * 1024),
+                (done / 1024) / secs
+            );
+        }
     }
 
     Ok((file_id, total_parts as i32))
