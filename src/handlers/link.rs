@@ -394,7 +394,12 @@ fn is_youtube_url(url: &str) -> bool {
 }
 
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes per download attempt
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes per upload attempt
+// Per-upload-attempt ceiling. 300 s capped MTProto at ~2 GB per job at the
+// observed ~7.4 MB/s (a real 1.9 GB upload finished in 257 s, 43 s before the
+// deadline - one bigger file or a slower link would have failed). 900 s keeps
+// per-attempt bounded while leaving headroom; the whole-job JOB_BUDGET below
+// still bounds the total pipeline, so this cannot hang a job forever.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(900);
 /// Wall-clock ceiling for one download+upload job. It must end strictly
 /// before the session lease window (`SESSION_LEASE_SECS`), so a job that is
 /// going to fail fails on its own terms while its row is still unambiguous,
@@ -1107,26 +1112,41 @@ pub async fn handle_yt_pick_callback(
         quality
     );
 
-    process_video_request(
-        bot,
-        &pick.bot_id,
-        pick.user_id,
-        pick.url.clone(),
-        fetcher,
-        mtproto_uploader,
-        db_pool,
-        task_manager,
-        upload_semaphore,
-        download_semaphore,
-        pick.username.clone(),
-        ChatId(pick.chat_id),
-        pick.lang.clone(),
-        None,
-        true,
-        None,
-        Some(quality),
-    )
-    .await
+    // The pipeline takes minutes for a large file, and this handler runs
+    // inside a teloxide 0.17 dptree callback. teloxide routes every update of
+    // one chat through a single sequential worker, so awaiting the pipeline
+    // here froze the whole chat: new links queued silently for the entire
+    // download+upload (a 1.9 GB delivery blocked its chat for ~9 minutes) and
+    // never reached the burst collector - the journal showed nothing at all.
+    // Spawn instead: the callback returns immediately and the pipeline
+    // competes for the download semaphore like every other job.
+    tokio::spawn(async move {
+        if let Err(e) = process_video_request(
+            bot,
+            &pick.bot_id,
+            pick.user_id,
+            pick.url.clone(),
+            fetcher,
+            mtproto_uploader,
+            db_pool,
+            task_manager,
+            upload_semaphore,
+            download_semaphore,
+            pick.username.clone(),
+            ChatId(pick.chat_id),
+            pick.lang.clone(),
+            None,
+            true,
+            None,
+            Some(quality),
+        )
+        .await
+        {
+            log::error!("YT download failed for user {}: {}", pick.user_id, e);
+        }
+    });
+
+    Ok(())
 }
 
 /// Delete partial files of one failed download attempt. Stems are per-attempt
@@ -1233,11 +1253,24 @@ pub async fn process_video_request(
     let fingerprint = crate::handlers::fingerprint::get_current_fingerprint(db_pool.clone()).await;
     let is_audio = quality_preference == "audio";
 
-    // Acquire download permit
+    // Acquire download permit. A wait here is otherwise completely silent -
+    // the "Starting..." acknowledgement is only sent after the permit lands,
+    // so a queued user sees nothing. Measure the wait and say so when it was
+    // long enough to notice (the upload permit has the same watchdog).
+    let download_wait_started = std::time::Instant::now();
     let download_permit = download_semaphore
         .acquire()
         .await
         .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
+    let download_wait = download_wait_started.elapsed();
+    if download_wait >= Duration::from_secs(1) {
+        log::info!(
+            "User {} waited {:?} for a download slot ({} free after acquiring)",
+            user_id,
+            download_wait,
+            download_semaphore.available_permits()
+        );
+    }
     if let Some(ymid) = ymid.as_deref() {
         match db_pool.mark_pending_downloading(ymid).await {
             Ok(0) => {

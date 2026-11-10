@@ -411,8 +411,12 @@ async fn main() -> Result<(), Error> {
         }
     }
     let task_manager = Arc::new(tokio::sync::Mutex::new(TaskManager::new(2)));
-    let upload_semaphore = Arc::new(tokio::sync::Semaphore::new(2));
-    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    // Three concurrent slots each: one long MTProto upload (a 1.9 GB file
+    // runs ~4 min at ~7.4 MB/s) must not wedge every other user behind the
+    // second slot. RAM check for the 2 vCPU / 2 GB VDS: three concurrent
+    // yt-dlp children peak ~600 MB, leaving headroom for the bot (~500 MB).
+    let upload_semaphore = Arc::new(tokio::sync::Semaphore::new(3));
+    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(3));
 
     // --- Web Server Configuration ---
     // One map entry per configured bot. The first entry doubles as the
