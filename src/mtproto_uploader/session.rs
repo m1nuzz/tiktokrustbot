@@ -12,12 +12,13 @@
 //! This module therefore implements `Session` directly on top of the one
 //! SQLite engine the process already has. All persisted state lives in typed
 //! columns (no JSON), every write goes through SQLite transactions, and auth
-//! keys survive a restart. The peer cache is memory-only on purpose:
-//! `Client::is_authorized()` checks the auth key via a network
-//! `updates.getState` call and never consults it.
+//! keys survive a restart. Peers are persisted too (`mtproto_peers`): MTProto
+//! `sendMedia` needs the peer's access hash, grammers caches peers only when
+//! the app drains the updates stream, and a restart without persisted peers
+//! made every large delivery fail with "Cannot resolve peer".
 
 use grammers_session::types::{
-    ChannelState, DcOption, PeerId, PeerInfo, UpdateState, UpdatesState,
+    ChannelKind, ChannelState, DcOption, PeerAuth, PeerId, PeerInfo, UpdateState, UpdatesState,
 };
 use grammers_session::{BoxFuture, Session, SessionData};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -150,6 +151,47 @@ impl DbSession {
             }
         }
 
+        {
+            let mut stmt = conn.prepare(
+                "SELECT kind, peer_id, auth, flags FROM mtproto_peers WHERE bot_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![key], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (kind, id, auth, flags) = row?;
+                let auth = auth.map(PeerAuth::from_hash);
+                let flags = flags.unwrap_or(0);
+                let info = match kind.as_str() {
+                    "user" => PeerInfo::User {
+                        id,
+                        auth,
+                        bot: Some(flags & 1 != 0),
+                        is_self: Some(flags & 2 != 0),
+                    },
+                    "chat" => PeerInfo::Chat { id },
+                    "channel" => PeerInfo::Channel {
+                        id,
+                        auth,
+                        kind: match flags & 15 {
+                            1 => Some(ChannelKind::Broadcast),
+                            2 => Some(ChannelKind::Megagroup),
+                            4 => Some(ChannelKind::Gigagroup),
+                            8 => Some(ChannelKind::Community),
+                            _ => None,
+                        },
+                    },
+                    _ => continue,
+                };
+                data.peer_infos.insert(info.id(), info);
+            }
+        }
+
         Ok(Self {
             key,
             inner: Mutex::new(Inner { conn, data }),
@@ -165,6 +207,7 @@ impl DbSession {
             "mtproto_sessions",
             "mtproto_dc_options",
             "mtproto_channel_states",
+            "mtproto_peers",
         ] {
             conn.execute(&format!("DELETE FROM {table} WHERE bot_id = ?1"), params![key])?;
         }
@@ -291,6 +334,43 @@ impl Session for DbSession {
                 .entry(peer.id())
                 .or_insert_with(|| peer.clone())
                 .extend_info(&peer);
+
+            // Persist the peer so a restart keeps MTProto sends resolvable:
+            // sendMedia needs the peer's access hash and nothing else can
+            // provide it for a bot (dialogs are forbidden for bots).
+            let (kind, peer_id, auth, flags): (&str, i64, Option<i64>, Option<i64>) = match &peer {
+                PeerInfo::User { id, auth, bot, is_self } => {
+                    let mut flags = 0i64;
+                    if bot.unwrap_or(false) {
+                        flags |= 1;
+                    }
+                    if is_self.unwrap_or(false) {
+                        flags |= 2;
+                    }
+                    ("user", *id, auth.map(|a| a.hash()), Some(flags))
+                }
+                PeerInfo::Chat { id } => ("chat", *id, None, None),
+                PeerInfo::Channel { id, auth, kind } => {
+                    let mut flags = 0i64;
+                    match kind {
+                        Some(ChannelKind::Broadcast) => flags |= 1,
+                        Some(ChannelKind::Megagroup) => flags |= 2,
+                        Some(ChannelKind::Gigagroup) => flags |= 4,
+                        Some(ChannelKind::Community) => flags |= 8,
+                        None => {}
+                    }
+                    ("channel", *id, auth.map(|a| a.hash()), Some(flags))
+                }
+            };
+            inner.conn.execute(
+                "INSERT INTO mtproto_peers (bot_id, kind, peer_id, auth, flags, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)
+                 ON CONFLICT(bot_id, kind, peer_id) DO UPDATE SET
+                     auth = excluded.auth,
+                     flags = excluded.flags,
+                     updated_at = CURRENT_TIMESTAMP",
+                params![self.key, kind, peer_id, auth, flags],
+            )?;
             Ok(())
         })
     }

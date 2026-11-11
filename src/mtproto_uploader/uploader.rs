@@ -1,5 +1,5 @@
 use grammers_client::Client;
-use grammers_client::sender::{ConnectionParams, SenderPool};
+use grammers_client::sender::{ConnectionParams, SenderPool, UpdatesConfiguration};
 use grammers_session::Session;
 use std::collections::VecDeque;
 use std::env;
@@ -82,7 +82,7 @@ async fn build_client(
         ..Default::default()
     };
 
-    let SenderPool { runner, handle, .. } =
+    let SenderPool { runner, handle, updates, .. } =
         SenderPool::with_configuration(Arc::clone(&session), api_id, params);
 
     // The runner drives network I/O in the background. Unlike 0.7 this keeps
@@ -95,6 +95,37 @@ async fn build_client(
     if !client.is_authorized().await? {
         client.bot_sign_in(bot_token, api_hash).await?;
     }
+
+    // grammers caches a peer only when the application consumes the updates
+    // stream (build_peer_map runs inside UpdateStream::next). Dropping the
+    // receiver - as this code did before - meant the cache never filled, and
+    // every MTProto sendMedia failed with "Cannot resolve peer ... as bot
+    // without username; dialogs are forbidden for bots" once a restart wiped
+    // the in-memory cache (15 failed large deliveries on 2026-11-11). Drain
+    // the stream for the lifetime of this client: each update caches its
+    // peers into the session (memory + mtproto_peers), and the update state
+    // syncs periodically so a restart resumes cleanly.
+    let drain_client = client.clone();
+    tokio::spawn(async move {
+        match drain_client
+            .stream_updates(updates, UpdatesConfiguration::default())
+            .await
+        {
+            Ok(mut stream) => {
+                let mut since_sync: u64 = 0;
+                while let Ok(_update) = stream.next().await {
+                    since_sync += 1;
+                    if since_sync % 200 == 0 {
+                        if let Err(e) = stream.sync_update_state().await {
+                            log::warn!("MTProto update-state sync failed: {e:?}");
+                        }
+                    }
+                }
+                log::warn!("MTProto updates stream ended");
+            }
+            Err(e) => log::error!("MTProto updates stream unavailable: {e:?}"),
+        }
+    });
 
     Ok(BuiltClient { client, runner })
 }

@@ -750,6 +750,24 @@ pub fn init_database() -> Result<()> {
         )",
         (),
     )?;
+    // Persisted MTProto peer cache. Without it every restart empties the
+    // in-memory peers and `messages.sendMedia` fails with "Cannot resolve
+    // peer ... as bot without username" for any user whose updates were not
+    // replayed after the restart (15 failed large deliveries on 2026-11-11).
+    // flags: bit0 user.bot, bit1 user.is_self, bit2 channel.broadcast,
+    // bit3 channel.megagroup.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS mtproto_peers (
+            bot_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            peer_id INTEGER NOT NULL,
+            auth INTEGER,
+            flags INTEGER,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (bot_id, kind, peer_id)
+        )",
+        (),
+    )?;
 
     Ok(())
 }
