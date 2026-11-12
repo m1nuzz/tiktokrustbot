@@ -145,6 +145,7 @@ impl MTProtoUploader {
         // Send the media with retry logic
         send_media_with_retry(
             &self.client, // Pass the Arc<Mutex<Client>> directly
+            &crate::mtproto_uploader::uploader::session_key(&self.session_file),
             chat_id,
             username,
             file_id,
