@@ -46,7 +46,7 @@ fn is_test_mode() -> bool {
 /// Session storage key for a bot, derived from the historic session file name
 /// (`lib/telegram-<bot id>.session`). One key per bot so six uploaders never
 /// share auth keys.
-fn session_key(session_file: &Path) -> String {
+pub(crate) fn session_key(session_file: &Path) -> String {
     session_file
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
