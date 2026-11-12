@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use grammers_client::Client;
 use grammers_tl_types as tl;
+use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -8,6 +9,7 @@ pub async fn resolve_peer(
     client: &Arc<Mutex<Client>>,
     chat_id: i64,
     username: Option<&str>,
+    session_key: &str,
 ) -> Result<tl::enums::InputPeer> {
     // Access the actual client through the mutex
     let actual_client = client.lock().await;
@@ -72,6 +74,36 @@ pub async fn resolve_peer(
             un
         ));
     }
+
+    // 3) No username (a private-chat user): fall back to the persisted peer
+    // cache (mtproto_peers). Most private-chat users have no @username, and
+    // their access hash is already stored there by the updates-stream drain;
+    // without this fallback every large delivery to such a user failed with
+    // "Cannot resolve peer ... as bot without username".
+    match Connection::open(crate::database::get_database_path()) {
+        Ok(conn) => {
+            let cached = conn
+                .query_row(
+                    "SELECT auth FROM mtproto_peers
+                     WHERE bot_id = ?1 AND kind = 'user' AND peer_id = ?2 AND auth IS NOT NULL",
+                    params![session_key, chat_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional();
+            match cached {
+                Ok(Some(access_hash)) => {
+                    return Ok(tl::enums::InputPeer::User(tl::types::InputPeerUser {
+                        user_id: chat_id,
+                        access_hash,
+                    }));
+                }
+                Ok(None) => {}
+                Err(e) => log::warn!("Peer cache lookup failed for {}: {:?}", chat_id, e),
+            }
+        }
+        Err(e) => log::warn!("Peer cache unavailable for {}: {:?}", chat_id, e),
+    }
+
     Err(anyhow!(
         "Cannot resolve peer {} as bot without username; dialogs are forbidden for bots",
         chat_id

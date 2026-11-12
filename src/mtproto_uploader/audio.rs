@@ -33,11 +33,12 @@ impl MTProtoUploader {
         // Access the actual client through the mutex
         let client = self.client.lock().await;
 
-        let input_peer = resolve_peer(&self.client, chat_id, username.as_deref())
-            .await
-            .map_err(|e| {
-                log::error!("Failed to resolve peer: {:?}", e);
-                e
+        let input_peer =
+            resolve_peer(&self.client, chat_id, username.as_deref(), &crate::mtproto_uploader::uploader::session_key(&self.session_file))
+                .await
+                .map_err(|e| {
+                    log::error!("Failed to resolve peer: {:?}", e);
+                    e
             })?;
 
         let input_file = tl::enums::InputFile::Big(tl::types::InputFileBig {

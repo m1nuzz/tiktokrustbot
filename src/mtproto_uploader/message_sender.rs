@@ -8,6 +8,7 @@ use crate::peers::resolve_peer;
 
 pub async fn send_media_with_retry(
     client: &Arc<Mutex<Client>>,
+    session_key: &str,
     chat_id: i64,
     username: Option<String>,
     file_id: i64,
@@ -22,7 +23,7 @@ pub async fn send_media_with_retry(
     caption: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Get input peer
-    let input_peer = resolve_peer(client, chat_id, username.as_deref())
+    let input_peer = resolve_peer(client, chat_id, username.as_deref(), session_key)
         .await
         .map_err(|e| {
             log::error!("Failed to resolve peer for chat_id {}: {:?}", chat_id, e);
