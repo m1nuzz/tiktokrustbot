@@ -35,6 +35,13 @@ pub struct AppState {
     pub bots: HashMap<String, BotInfo>,
     pub fetcher: Arc<YoutubeFetcher>,
     pub mtproto_uploader: Arc<MTProtoUploader>,
+    /// Every configured bot's own MTProto uploader, keyed by bot id. Ad-flow
+    /// deliveries must upload through the OWNING bot's session: a peer access
+    /// hash cached by bot A's session is not guaranteed to resolve under
+    /// bot B's key (the critic flagged PEER_ID_INVALID as the concrete risk),
+    /// and until now every web-triggered delivery ran on the primary uploader
+    /// regardless of which bot the row belonged to.
+    pub uploaders: HashMap<String, Arc<MTProtoUploader>>,
     pub task_manager: Arc<tokio::sync::Mutex<TaskManager>>,
     pub upload_semaphore: Arc<tokio::sync::Semaphore>,
     pub download_semaphore: Arc<tokio::sync::Semaphore>,
@@ -54,6 +61,19 @@ impl AppState {
                     .map(|info| info.bot.clone())
                     .expect("AppState built with no bots")
             })
+    }
+
+    /// The delivering bot's own MTProto uploader, falling back to the primary
+    /// one (same fallback contract as `bot_for`). This is the primary fix from
+    /// the peer-routing review: deliveries for a non-primary bot's rows stop
+    /// piggybacking on the primary session, so the row's bot has usually
+    /// cached the peer itself and the cross-bot DB fallback stays a true
+    /// last resort.
+    pub fn uploader_for(&self, bot_id: &str) -> Arc<MTProtoUploader> {
+        self.uploaders
+            .get(bot_id)
+            .cloned()
+            .unwrap_or_else(|| self.mtproto_uploader.clone())
     }
 }
 
@@ -568,6 +588,9 @@ async fn spawn_download_job(
     // A YouTube pick stores the tapped quality for its row; TikTok rows have
     // none and keep the user's saved preference.
     let quality_override = crate::handlers::link::take_yt_quality_for(&ymid);
+    // Resolved before the spawn: the closure partial-moves `state`, so the
+    // selector must not borrow it from inside.
+    let uploader = state.uploader_for(&row_bot_id);
     tokio::spawn(async move {
         if let Err(e) = crate::handlers::link::process_video_request(
             bot,
@@ -575,7 +598,10 @@ async fn spawn_download_job(
             user_id,
             url,
             state.fetcher,
-            state.mtproto_uploader,
+            // Upload through the row's OWNING bot session, not the primary
+            // one: the peer was most likely cached by that bot's updates
+            // drain, and its access hash is only guaranteed under that key.
+            uploader,
             state.db,
             state.task_manager,
             state.upload_semaphore,
