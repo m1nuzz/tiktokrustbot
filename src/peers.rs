@@ -80,13 +80,21 @@ pub async fn resolve_peer(
     // their access hash is already stored there by the updates-stream drain;
     // without this fallback every large delivery to such a user failed with
     // "Cannot resolve peer ... as bot without username".
+    //
+    // Prefer the delivering bot's own row, then any bot's: ad-flow deliveries
+    // always run on the primary uploader while the user may have interacted
+    // with any of the six bots, so the freshest cached hash often lives under
+    // a different session key. A user's access hash is the same value for
+    // every bot, so a cross-bot row is a valid InputPeer here.
     match Connection::open(crate::database::get_database_path()) {
         Ok(conn) => {
             let cached = conn
                 .query_row(
                     "SELECT auth FROM mtproto_peers
-                     WHERE bot_id = ?1 AND kind = 'user' AND peer_id = ?2 AND auth IS NOT NULL",
-                    params![session_key, chat_id],
+                     WHERE kind = 'user' AND peer_id = ?1 AND auth IS NOT NULL
+                     ORDER BY CASE WHEN bot_id = ?2 THEN 0 ELSE 1 END, updated_at DESC
+                     LIMIT 1",
+                    params![chat_id, session_key],
                     |row| row.get::<_, i64>(0),
                 )
                 .optional();
