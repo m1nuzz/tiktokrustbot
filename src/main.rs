@@ -442,11 +442,18 @@ async fn main() -> Result<(), Error> {
         .first()
         .map(|cfg| cfg.uploader.clone())
         .expect("at least one bot is configured");
+    // Per-bot uploader map: web-triggered deliveries route through the row's
+    // OWNING bot session, so its peer cache is the one that matters.
+    let uploaders: std::collections::HashMap<String, Arc<MTProtoUploader>> = configured
+        .iter()
+        .map(|cfg| (cfg.id.clone(), cfg.uploader.clone()))
+        .collect();
     let web_server_state = tiktokdownloader::web_server::AppState {
         db: db_pool.clone(),
         bots,
         fetcher: fetcher.clone(),
         mtproto_uploader: primary_uploader,
+        uploaders,
         task_manager: task_manager.clone(),
         upload_semaphore: upload_semaphore.clone(),
         download_semaphore: download_semaphore.clone(),

@@ -81,17 +81,18 @@ pub async fn resolve_peer(
     // without this fallback every large delivery to such a user failed with
     // "Cannot resolve peer ... as bot without username".
     //
-    // Prefer the delivering bot's own row, then any bot's: ad-flow deliveries
-    // always run on the primary uploader while the user may have interacted
-    // with any of the six bots, so the freshest cached hash often lives under
-    // a different session key. A user's access hash is the same value for
-    // every bot, so a cross-bot row is a valid InputPeer here.
+    // Prefer the delivering bot's own row, then any bot's: even with per-bot
+    // uploader routing, a delivery can still land on the primary uploader
+    // (unknown ymid fallback), so a cross-bot row remains a valid last resort.
+    // auth = 0 is filtered out: some updates carry a stub peer without an
+    // access hash, which cache_peer persists as zero, and a zero hash sent
+    // back to Telegram fails with PEER_ID_INVALID.
     match Connection::open(crate::database::get_database_path()) {
         Ok(conn) => {
             let cached = conn
                 .query_row(
                     "SELECT auth FROM mtproto_peers
-                     WHERE kind = 'user' AND peer_id = ?1 AND auth IS NOT NULL
+                     WHERE kind = 'user' AND peer_id = ?1 AND auth IS NOT NULL AND auth != 0
                      ORDER BY CASE WHEN bot_id = ?2 THEN 0 ELSE 1 END, updated_at DESC
                      LIMIT 1",
                     params![chat_id, session_key],
