@@ -4,10 +4,28 @@ use crate::utils::temp_file::TempFileGuard;
 use reqwest::multipart::{Form, Part};
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::Duration;
 use teloxide::types::ChatId;
 use tokio::fs::File;
 use tokio::process::Command;
 use tokio_util::io::ReaderStream;
+
+/// One client for every Bot API upload. Building a fresh client per delivery
+/// discards the TLS pool, so every video pays for a new handshake to
+/// api.telegram.org - painful on a link that is already flaky.
+static BOTAPI_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn botapi_client() -> &'static reqwest::Client {
+    BOTAPI_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(240))
+            .connect_timeout(Duration::from_secs(15))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .expect("failed to build Bot API HTTP client")
+    })
+}
 
 async fn ensure_faststart_video(
     ffmpeg_path: &PathBuf,
@@ -74,7 +92,15 @@ pub async fn send_video_with_progress_botapi(
     });
     let ffprobe_path_str = ffprobe_path.to_string_lossy();
 
+    // Show a distinct state while the local preprocessing runs. Without
+    // this the user keeps staring at the download percentage until the
+    // first byte reaches Telegram, even if ffmpeg takes tens of seconds.
+    let _ = progress_bar
+        .update(78, Some("🔧 Preparing video..."))
+        .await;
+
     // First, remux with faststart
+    let remux_started = std::time::Instant::now();
     let (video_path, _video_guard) = if file_path.extension().map_or(false, |ext| ext == "mp4") {
         match ensure_faststart_video(&ffmpeg_path, file_path).await {
             Ok(temp_path) => (temp_path.clone(), Some(TempFileGuard::new(temp_path))),
@@ -89,8 +115,14 @@ pub async fn send_video_with_progress_botapi(
     } else {
         (file_path.to_path_buf(), None)
     };
+    log::info!(
+        "Bot API prep: faststart remux/selection took {:?} for {:?}",
+        remux_started.elapsed(),
+        file_path
+    );
 
     // Get video metadata
+    let meta_started = std::time::Instant::now();
     let meta = get_video_metadata(&ffprobe_path_str, &video_path)
         .await
         .map_err(|e| {
@@ -102,8 +134,10 @@ pub async fn send_video_with_progress_botapi(
             height: 0,
             duration: 0.0,
         });
+    log::info!("Bot API prep: ffprobe took {:?}", meta_started.elapsed());
 
     // Generate thumbnail
+    let thumbnail_started = std::time::Instant::now();
     let thumbnail_path = video_path.with_extension("jpg");
     let thumbnail_result = crate::mtproto_uploader::thumbnail::generate_thumbnail(
         &ffmpeg_path,
@@ -116,6 +150,11 @@ pub async fn send_video_with_progress_botapi(
     } else {
         None
     };
+    log::info!(
+        "Bot API prep: thumbnail took {:?} (ok={})",
+        thumbnail_started.elapsed(),
+        thumbnail_result.is_ok()
+    );
 
     let file = File::open(&video_path).await?;
     let len = file.metadata().await?.len();
@@ -174,11 +213,18 @@ pub async fn send_video_with_progress_botapi(
     }
 
     let url = format!("https://api.telegram.org/bot{}/sendVideo", bot_token);
-    let resp = reqwest::Client::new()
+    let network_started = std::time::Instant::now();
+    let resp = botapi_client()
         .post(&url)
         .multipart(form)
         .send()
         .await?;
+    log::info!(
+        "Bot API network: sendVideo took {:?} for {} bytes (status {})",
+        network_started.elapsed(),
+        len,
+        resp.status()
+    );
 
     if !resp.status().is_success() {
         return Err(anyhow::anyhow!(
@@ -259,11 +305,18 @@ pub async fn send_audio_with_progress_botapi(
     }
 
     let url = format!("https://api.telegram.org/bot{}/sendAudio", bot_token);
-    let resp = reqwest::Client::new()
+    let network_started = std::time::Instant::now();
+    let resp = botapi_client()
         .post(&url)
         .multipart(form)
         .send()
         .await?;
+    log::info!(
+        "Bot API network: sendAudio took {:?} for {} bytes (status {})",
+        network_started.elapsed(),
+        len,
+        resp.status()
+    );
 
     if !resp.status().is_success() {
         return Err(anyhow::anyhow!(

@@ -111,9 +111,30 @@ impl YoutubeFetcher {
     /// Query the tikwm public API once and extract carousel/music metadata.
     /// Never fails: empty metadata means "regular video, or tikwm is down",
     /// and the caller falls back to the yt-dlp flow.
+    /// Fast carousel check that runs while the user is still looking at
+    /// "Starting...". A slow tikwm must not hold that status for 20 seconds,
+    /// so the common path gets a short deadline. The /photo/ rescue path can
+    /// explicitly ask for more time via `probe_tikwm_with_timeout`.
     pub async fn probe_tikwm(&self, url: &str) -> TikwmMeta {
+        self.probe_tikwm_with_timeout(url, 6).await
+    }
+
+    pub async fn probe_tikwm_with_timeout(&self, url: &str, timeout_secs: u64) -> TikwmMeta {
+        let started = std::time::Instant::now();
+        let meta = self.probe_tikwm_inner(url, timeout_secs).await;
+        log::info!(
+            "tikwm probe finished in {:?} with {} image(s) for {}",
+            started.elapsed(),
+            meta.images.len(),
+            url
+        );
+        meta
+    }
+
+    async fn probe_tikwm_inner(&self, url: &str, timeout_secs: u64) -> TikwmMeta {
         let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .connect_timeout(std::time::Duration::from_secs(3))
             .build()
         {
             Ok(c) => c,

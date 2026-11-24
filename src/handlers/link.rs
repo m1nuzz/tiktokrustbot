@@ -1471,8 +1471,14 @@ pub async fn process_video_request(
         // Instagram/YouTube skip the probe and go straight to yt-dlp.
         if url.contains("tiktok.com") {
             log::info!("pos {}: probing tikwm for carousel check", pos);
+            let probe_started = std::time::Instant::now();
             let meta = fetcher.probe_tikwm(&url).await;
-            log::info!("pos {}: probe done ({} images)", pos, meta.images.len());
+            log::info!(
+                "pos {}: probe done ({} images) in {:?}",
+                pos,
+                meta.images.len(),
+                probe_started.elapsed()
+            );
             if !meta.images.is_empty() {
                 // A carousel is a delivery too: it must wait for its turn, or
                 // it would overtake the videos of the same burst. The download
@@ -1529,7 +1535,12 @@ pub async fn process_video_request(
                             log::info!(
                                 "Video flow failed on a /photo/ URL; re-probing tikwm for the photo flow"
                             );
-                            let meta = fetcher.probe_tikwm(&photo_url).await;
+                            // This is the last chance to recognise a
+                            // carousel, so allow a longer deadline here than
+                            // the fast pre-download probe.
+                            let meta = fetcher
+                                .probe_tikwm_with_timeout(&photo_url, 15)
+                                .await;
                             if !meta.images.is_empty() {
                                 // Same rule as the probe branch above: free the
                                 // download slot before waiting at the turnstile.
